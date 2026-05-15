@@ -114,6 +114,62 @@ private:
     ComPtr<ID3D12Resource>               m_tlasScratchBuffer;
     ComPtr<ID3D12Resource>               m_tlasInstanceDescs;      // upload heap, N_objects descs
 
+    // ============ ANIMATED OBJECT (cluster templates + per-frame instantiation) ============
+    // One additional object whose Cluster BLAS is rebuilt every frame from
+    // pre-built cluster templates. CPU computes new positions per frame from a
+    // pulsating-sphere formula; INSTANTIATE_CLUSTER_TEMPLATES turns the
+    // templates + fresh positions into CLAS; BUILD_BLAS_FROM_CLAS rebuilds the
+    // BLAS storage in-place (the BLAS storage GPU VA stays fixed - the
+    // animated TLAS instance always points at the same VA, only the BVH
+    // contents change). TLAS is rebuilt every frame to pick up the new BLAS
+    // root bounds.
+    struct AnimatedObject
+    {
+        ProceduralGeometry::Mesh             mesh;                   // topology + rest positions
+        std::vector<std::vector<DirectX::XMFLOAT3>> hintPositions;   // per-cluster, max-deformation envelope
+        UINT                                 clusterCount       = 0;
+        UINT                                 maxTrisPerCluster  = 0;
+        UINT                                 maxVertsPerCluster = 0;
+        UINT                                 totalVertexCount   = 0;
+        UINT                                 vertexBufferStride = 0; // bytes per vertex (sizeof(float3))
+
+        DirectX::XMFLOAT3                    worldPos     = {0,0,0};
+        float                                worldScale   = 1.0f;
+        UINT                                 instanceID   = 0;
+
+        // --- Built once at init ---
+        // Hint vertex blob + per-cluster CLUSTER_TEMPLATES_FROM_TRIANGLES args.
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateInputBuffer;
+        D3D12_GPU_VIRTUAL_ADDRESS              templateArgsArrayGPUVA = 0;
+        UINT                                   templateArgsStride     = 0;
+        // Template BVH storage (one templated CLAS per source cluster).
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateResultBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateScratchBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateAddressArray;  // per-cluster GVA into templateResultBuffer
+
+        // --- Reused every frame ---
+        // Per-frame new positions (CPU-side computed + memcpy'd into mapped upload buffer).
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameVertexBuffer;        // upload heap, persistently mapped
+        DirectX::XMFLOAT3*                     perFrameVertexBufferMapped = nullptr;
+        // Per-frame INSTANTIATE_CLUSTER_TEMPLATES_ARGS array (one per cluster).
+        // Each arg points to its cluster template + the slice of perFrameVertexBuffer.
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameInstArgsBuffer;      // upload heap, persistently mapped
+        D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS* perFrameInstArgsMapped = nullptr;
+        // Instantiated CLAS results (rewritten each frame in IMPLICIT_DESTINATIONS mode).
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameClasResultBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameClasScratchBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameClasAddressArray;    // N_clusters x GVA
+        // BLAS storage (fixed GPU VA across frames, rebuilt in place every frame).
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasStorage;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasScratchBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasArgsBuffer;              // upload, mapped, 1 entry
+        D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS* blasArgsMapped = nullptr;
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasResultAddrBuffer;        // upload, 1 entry = blasStorage VA
+        D3D12_GPU_VIRTUAL_ADDRESS              blasGPUVA = 0;
+    };
+    AnimatedObject                          m_animatedObject;
+    bool                                    m_animatedObjectEnabled = false;
+
     // ---------- Raytracing pipeline + shader tables ----------
     ComPtr<ID3D12StateObject>            m_dxrStateObject;
     ComPtr<ID3D12RootSignature>          m_globalRootSignature;
@@ -167,6 +223,9 @@ private:
     void BuildClasIndirect();
     void BuildBlasFromClasIndirect();
     void BuildTlasClassic();
+    void RebuildTlasPerFrame();
+    void BuildAnimatedObjectSetup();          // generates mesh, builds templates ONCE
+    void UpdateAnimatedObjectPerFrame();      // CPU positions -> INSTANTIATE -> BLAS rebuild (per frame)
     void DumpClusterStatsAsync();
     void ReadBuildTimestamps();
     void UpdateTitleBar();

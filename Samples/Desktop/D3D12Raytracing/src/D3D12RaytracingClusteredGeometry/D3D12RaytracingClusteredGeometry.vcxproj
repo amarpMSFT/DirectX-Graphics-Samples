@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  D3D12RaytracingClusteredGeometry sample.
+
+  This project intentionally diverges from the sibling raytracing samples in that it
+  does NOT use the Microsoft.Direct3D.D3D12 / Microsoft.Direct3D.DXC NuGet packages.
+  Both runtime + compiler components are sourced from a local experimental D3D12
+  build via ExperimentalD3D12.props (see that file for what it expects).
+
+  Once a real Agility SDK NuGet package shipping DXR2 is available, switch this
+  project back to the standard pattern (see D3D12RaytracingOpacityMicromaps.vcxproj).
+-->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{C7A2D3E1-1234-4567-89AB-CDEF01234567}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>D3D12Raytracing</RootNamespace>
+    <ProjectName>D3D12RaytracingClusteredGeometry</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- Pull in the experimental D3D12 runtime + DXC compiler hookup. -->
+  <Import Project="ExperimentalD3D12.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
+    <OutDir>bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+      <FunctionLevelLinking Condition="'$(Configuration)'=='Release'">true</FunctionLevelLinking>
+      <IntrinsicFunctions Condition="'$(Configuration)'=='Release'">true</IntrinsicFunctions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
+      <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Delay-load d3d12 so we can run on machines without it for graceful error
+           reporting (matches sibling samples). -->
+      <DelayLoadDLLs>d3d12.dll</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Source / header files. -->
+  <ItemGroup>
+    <ClCompile Include="Main.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="DeviceResources.cpp" />
+    <ClCompile Include="Win32Application.cpp" />
+    <ClCompile Include="DXSample.cpp" />
+    <ClCompile Include="D3D12RaytracingClusteredGeometry.cpp" />
+    <ClCompile Include="stdafx.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="DeviceResources.h" />
+    <ClInclude Include="DirectXRaytracingHelper.h" />
+    <ClInclude Include="DXSample.h" />
+    <ClInclude Include="DXSampleHelper.h" />
+    <ClInclude Include="HlslCompat.h" />
+    <ClInclude Include="ProceduralGeometry.h" />
+    <ClInclude Include="Compressed1.h" />
+    <ClInclude Include="RaytracingHlslCompat.h" />
+    <ClInclude Include="SampleLog.h" />
+    <ClInclude Include="StepTimer.h" />
+    <ClInclude Include="Win32Application.h" />
+    <ClInclude Include="D3D12RaytracingClusteredGeometry.h" />
+    <ClInclude Include="stdafx.h" />
+  </ItemGroup>
+
+  <!-- HLSL shader compiled with the experimental dxc.exe to a C-array header.
+       The default FxCompile task in the Microsoft.Cpp.targets calls fxc.exe and
+       cannot target lib_6_10. We use a CustomBuild step instead, which is what
+       the Microsoft.Direct3D.DXC NuGet does internally too. -->
+  <ItemGroup>
+    <CustomBuild Include="Raytracing.hlsl">
+      <FileType>Document</FileType>
+      <Message>Compiling Raytracing.hlsl -> $(IntDir)CompiledShaders\%(Filename).hlsl.h (lib_6_10)</Message>
+      <Command Condition="'$(Configuration)'=='Debug'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
+"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T lib_6_10 -HV 2021 -Zi -Qembed_debug -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
+      <Command Condition="'$(Configuration)'=='Release'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
+"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T lib_6_10 -HV 2021 -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
+      <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
+      <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
+    </CustomBuild>
+  </ItemGroup>
+
+  <!-- Loose files visible in IDE. -->
+  <ItemGroup>
+    <None Include="packages.config" />
+    <None Include="readme.md" />
+    <None Include="ExperimentalD3D12.props" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

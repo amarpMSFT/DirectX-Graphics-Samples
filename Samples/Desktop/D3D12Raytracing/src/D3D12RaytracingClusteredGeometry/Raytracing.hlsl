@@ -385,6 +385,39 @@ void Hit(inout Payload p, in Attribs a)
         }
         // else: keep the baseline translucent glass material.
     }
+    // Floor (instanceID=6, the glass slab) gets a CHECKER too: alternate
+    // top+bottom face TILES between SHINY MIRROR and TRANSLUCENT glass.
+    // Slab layout (see GeneratePlaneSpatialTiles slab branch):
+    //   600..635 : top    6x6 = 36 clusters
+    //   636..671 : bottom 6x6 = 36 clusters (mirror of top, normal -Y)
+    //   672..675 : 4 side walls (left as-is, baseline glass)
+    // Same parity formula on (tu, tv) as the spheres so the top + bottom
+    // checker stay aligned (a "tile" looks the same material from above
+    // and below).
+    if (InstanceID() == 6)
+    {
+        const uint kFloorFirstCid = 600;
+        const uint kFloorTilesV   = 6;
+        const uint kTopBottomEnd  = kFloorFirstCid + 2u * 36u; // 672 = first wall
+        if (cid < kTopBottomEnd)
+        {
+            // Local index within either the top set (0..35) or the bottom
+            // set (0..35) - same formula because both follow the same tu/tv loop.
+            uint local   = (cid - kFloorFirstCid) % 36u;
+            uint tu      = local / kFloorTilesV;
+            uint tv      = local % kFloorTilesV;
+            bool isB     = ((tu + tv) & 1u) != 0u;
+            if (isB)
+            {
+                mat.reflectivity = 0.85;
+                mat.refractivity = 0.0;
+                mat.ior          = 0.0;
+            }
+            // else: keep the baseline translucent glass slab material.
+        }
+        // Side walls (cid 672..675) untouched - baseline glass; gives the
+        // slab a continuous translucent edge regardless of the tile parity.
+    }
     // ------------------------------------------------------------------
 
     // Cluster-rainbow palette is gated on a single visualisation knob -

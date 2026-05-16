@@ -396,6 +396,25 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
                         (unsigned long long)m_timestampFrequency);
     }
 
+    // Per-frame timestamp heap + readback. 3 ring slots * 6 timestamps each.
+    // Per-frame writes to one slot, resolves to its matching range in the
+    // readback buffer; CPU reads from the slot ~3 frames behind the write
+    // (safe past GPU completion).
+    {
+        D3D12_QUERY_HEAP_DESC qhd = {};
+        qhd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = kPerFrameTsPerSlot * kPerFrameRingSlots;
+        ThrowIfFailed(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&m_pfQueryHeap)));
+        m_pfQueryHeap->SetName(L"AS per-frame timestamp heap");
+
+        auto rbHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(
+            sizeof(UINT64) * kPerFrameTsPerSlot * kPerFrameRingSlots);
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE,
+            &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_pfQueryReadback)));
+        m_pfQueryReadback->SetName(L"AS per-frame timestamp readback");
+    }
+
     ThrowIfFailed(commandAllocator->Reset());
     ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
 
@@ -1474,15 +1493,33 @@ void D3D12RaytracingClusteredGeometry::UpdateTitleBar()
     if (++m_titleUpdateCounter < 30) return;
     m_titleUpdateCounter = 0;
 
-    wchar_t buf[384];
-    swprintf_s(buf,
-        L"DXR2 Clusters | %u obj | %u CLAS / %.1f KB | BLAS / %.1f KB "
-        L"| build %.2f ms (CLAS %.2f, BLAS %.2f, TLAS %.2f) | %u FPS",
-        (UINT)m_objects.size(),
-        m_totalClusterCount, m_totalClasBytes / 1024.0,
-        m_totalBlasBytes / 1024.0,
-        m_totalBuildMs, m_clasBuildMs, m_blasBuildMs, m_tlasBuildMs,
-        (unsigned)m_timer.GetFramesPerSecond());
+    wchar_t buf[512];
+    if (m_animatedObjectEnabled && m_pfFramesCaptured >= kPerFrameRingSlots)
+    {
+        // Per-frame totals broken out: animated AS rebuild (INSTANTIATE_CLUSTER_TEMPLATES
+        // + BUILD_BLAS_FROM_CLAS) + TLAS rebuild.
+        swprintf_s(buf,
+            L"DXR2 Clusters | %u obj (%u+1) %u CLAS | init build %.2f ms "
+            L"(CLAS %.3f, BLAS %.3f, TLAS %.3f) | per-frame AS %.3f ms "
+            L"(anim %.3f + TLAS %.3f) | %u FPS",
+            (UINT)m_objects.size() + 1, (UINT)m_objects.size(),
+            m_totalClusterCount,
+            m_totalBuildMs, m_clasBuildMs, m_blasBuildMs, m_tlasBuildMs,
+            m_pfAnimRebuildMs + m_pfTlasRebuildMs,
+            m_pfAnimRebuildMs, m_pfTlasRebuildMs,
+            (unsigned)m_timer.GetFramesPerSecond());
+    }
+    else
+    {
+        swprintf_s(buf,
+            L"DXR2 Clusters | %u obj | %u CLAS / %.1f KB | BLAS / %.1f KB "
+            L"| build %.2f ms (CLAS %.2f, BLAS %.2f, TLAS %.2f) | %u FPS",
+            (UINT)m_objects.size(),
+            m_totalClusterCount, m_totalClasBytes / 1024.0,
+            m_totalBlasBytes / 1024.0,
+            m_totalBuildMs, m_clasBuildMs, m_blasBuildMs, m_tlasBuildMs,
+            (unsigned)m_timer.GetFramesPerSecond());
+    }
     SetCustomWindowText(buf);
 }
 
@@ -1690,7 +1727,10 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     if (m_screenshotFrame >= 0 && (UINT)m_screenshotFrame < m_framesRendered && !m_screenshotTaken)
         capture = true;
     // Wait a few frames for swap chain warm-up before time-based capture too.
-    if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 5 && !m_screenshotTaken)
+    // Need at least kPerFrameRingSlots * 2 + 5 frames to also get stable
+    // per-frame timestamp EMA reads in the log on shutdown (otherwise the
+    // ring buffer hasn't filled yet).
+    if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 15 && !m_screenshotTaken)
         capture = true;
 
     if (capture)
@@ -1707,15 +1747,56 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     auto cl  = m_deviceResources->GetCommandList();
     auto cl4 = m_dxrCommandList.Get();
 
-    // ---- Per-frame AS work (cheap when m_animatedObjectEnabled is false) ----
-    // 1) Re-instantiate the animated object's CLAS from templates with this
-    //    frame's positions, then rebuild its Cluster BLAS in place.
-    // 2) Rebuild the TLAS (BLAS root bounds for the animated instance just
-    //    changed; static instances are unchanged but TLAS rebuild is cheap).
+    // ---- Per-frame AS work + timestamp queries -----------------------------
+    // Read back the slot that was written N-frames ago first (data is safely
+    // past GPU completion - we read the slot we're about to overwrite). Skip
+    // until we've captured at least kPerFrameRingSlots samples to avoid
+    // reading uninitialised heap data.
     if (m_animatedObjectEnabled)
     {
-        UpdateAnimatedObjectPerFrame();
+        if (m_pfFramesCaptured >= kPerFrameRingSlots)
+        {
+            // The slot we're about to write was last written N frames ago and
+            // resolved on the GPU before this frame was even submitted.
+            UINT readSlot = m_pfWriteSlot;
+            UINT64 ts[kPerFrameTsPerSlot] = {};
+            CD3DX12_RANGE readRange(readSlot * kPerFrameTsPerSlot * sizeof(UINT64),
+                                   (readSlot + 1) * kPerFrameTsPerSlot * sizeof(UINT64));
+            void* mapped = nullptr;
+            if (SUCCEEDED(m_pfQueryReadback->Map(0, &readRange, &mapped)))
+            {
+                memcpy(ts, (uint8_t*)mapped + readSlot * kPerFrameTsPerSlot * sizeof(UINT64),
+                       sizeof(ts));
+                D3D12_RANGE noWrite = { 0, 0 };
+                m_pfQueryReadback->Unmap(0, &noWrite);
+
+                const double freq = (double)m_timestampFrequency;
+                const double animMs = (ts[1] >= ts[0]) ? (double)(ts[1] - ts[0]) * 1000.0 / freq : 0.0;
+                const double tlasMs = (ts[3] >= ts[2]) ? (double)(ts[3] - ts[2]) * 1000.0 / freq : 0.0;
+                // EMA, alpha=0.1 for a sub-second smoothing window.
+                constexpr double a = 0.1;
+                m_pfAnimRebuildMs = m_pfAnimRebuildMs * (1.0 - a) + animMs * a;
+                m_pfTlasRebuildMs = m_pfTlasRebuildMs * (1.0 - a) + tlasMs * a;
+            }
+        }
+
+        // Record this frame's per-frame work, straddled with timestamps.
+        const UINT base = m_pfWriteSlot * kPerFrameTsPerSlot;
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 0);
+        UpdateAnimatedObjectPerFrame();   // INSTANTIATE + BLAS rebuild + barriers
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
+
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 2);
         RebuildTlasPerFrame();
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 3);
+
+        cl->ResolveQueryData(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            base, kPerFrameTsPerSlot, m_pfQueryReadback.Get(),
+            base * sizeof(UINT64));
+
+        m_pfWriteSlot = (m_pfWriteSlot + 1) % kPerFrameRingSlots;
+        if (m_pfFramesCaptured < kPerFrameRingSlots * 2)
+            ++m_pfFramesCaptured;
     }
     cl4->SetComputeRootSignature(m_globalRootSignature.Get());
     ID3D12DescriptorHeap* heaps[] = { m_descriptorHeap.Get() };
@@ -1775,6 +1856,13 @@ void D3D12RaytracingClusteredGeometry::OnSizeChanged(UINT width, UINT height, bo
 void D3D12RaytracingClusteredGeometry::OnDestroy()
 {
     SampleLog::Write(L"OnDestroy: starting shutdown\n");
+    if (m_animatedObjectEnabled && m_pfFramesCaptured >= kPerFrameRingSlots)
+    {
+        SampleLog::LogF(L"[per-frame wall-clock, EMA] animated AS rebuild=%.4f ms "
+                        L"(INSTANTIATE + BLAS), TLAS rebuild=%.4f ms, total=%.4f ms\n",
+                        m_pfAnimRebuildMs, m_pfTlasRebuildMs,
+                        m_pfAnimRebuildMs + m_pfTlasRebuildMs);
+    }
 
     if (m_deviceResources)
     {

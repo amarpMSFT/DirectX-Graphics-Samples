@@ -190,14 +190,27 @@ private:
     SceneConstantBuffer*                 m_sceneCBMapped = nullptr;
 
     // ---------- Timestamp queries for AS build wall-clocks ----------
+    // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).
+    // Per-frame uses a separate heap + readback with 3 ring-buffer slots so
+    // the CPU reads timestamps written ~3 frames ago (safely past GPU
+    // completion) without stalling.
     ComPtr<ID3D12QueryHeap>              m_buildQueryHeap;
     ComPtr<ID3D12Resource>               m_buildQueryReadback;
-    static const UINT                    kBuildTimestampCount = 8;
+    ComPtr<ID3D12QueryHeap>              m_pfQueryHeap;
+    ComPtr<ID3D12Resource>               m_pfQueryReadback;
+    static const UINT                    kBuildTimestampCount    = 8;
+    static const UINT                    kPerFrameTsPerSlot      = 4;   // 2 op pairs
+    static const UINT                    kPerFrameRingSlots      = 3;
     UINT64                               m_timestampFrequency = 0;
     double                               m_clasBuildMs        = 0.0;
     double                               m_blasBuildMs        = 0.0;
     double                               m_tlasBuildMs        = 0.0;
     double                               m_totalBuildMs       = 0.0;
+    // Per-frame (EMA-smoothed).
+    double                               m_pfAnimRebuildMs    = 0.0;  // INSTANTIATE + BLAS rebuild
+    double                               m_pfTlasRebuildMs    = 0.0;  // TLAS rebuild
+    UINT                                 m_pfWriteSlot        = 0;
+    UINT                                 m_pfFramesCaptured   = 0;
     UINT64                               m_totalClasBytes     = 0;
     UINT64                               m_totalBlasBytes     = 0;
     UINT                                 m_titleUpdateCounter = 0;

@@ -73,7 +73,20 @@ struct Attribs { float2 bary; };
 // ============================================================================
 float3 ClusterColor(uint cid)
 {
-    float t = float(cid % 16) * (1.0 / 16.0);
+    // Murmurhash3 finalizer.  Mixes ALL bits of cid into the output so
+    // neighbours in EITHER direction of the parametric grid (cid+1 in
+    // the longitude direction, cid+tilesLong in the latitude direction)
+    // get maximally-different hue indices.  Plain `cid % 16` produced
+    // smooth palette stripes; this gives a true CHECKER scatter on
+    // every mesh that lays clusters out in row-major order.
+    uint h = cid;
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    h &= 0x3fu;                                  // 6 bits -> 64 hues
+    float t = float(h) * (1.0 / 64.0);
     float3 a = float3(0.55, 0.55, 0.55);
     float3 b = float3(0.45, 0.45, 0.45);
     float3 c = float3(1.00, 1.00, 1.00);
@@ -206,14 +219,12 @@ void Miss(inout Payload p)
                                                            // the dome reads
                                                            // BLUE not orange.
 
-    // Ground band below the horizon - DARK at the horizon (atmospheric
-    // perspective), bright sand colour up close.  Very sharp falloff
-    // (-y * 8) and a deeply darker far-color so the gradient is
-    // unmistakable - the dark band hugs the horizon line, the rest of
-    // the visible sand reads bright.
-    float3 ground   = lerp(float3(0.20, 0.18, 0.12),    // very dark / hazy at the horizon (FAR)
-                           float3(0.94, 0.84, 0.62),    // bright sand under foot     (NEAR)
-                           saturate(-y * 8.0));
+    // Ground band below the horizon - moderately darker at the horizon
+    // for atmospheric perspective, full sand colour up close.  Soft
+    // falloff so the dark band reads as haze, not as a black void.
+    float3 ground   = lerp(float3(0.55, 0.46, 0.32),    // moderately dark sand at the horizon (FAR)
+                           float3(0.94, 0.84, 0.62),    // bright sand under foot          (NEAR)
+                           saturate(-y * 4.0));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the
     // actual sun direction.  Daytime sun is white-warm, not sunset-orange.
@@ -521,15 +532,14 @@ void Hit(inout Payload p, in Attribs a)
                                           reflectDir,
                                           cullFlags,
                                           myDepth + 1, childInGlass);
-        // Tint the reflected RGB by the cluster colour DIRECTLY (no
-        // white blend) so the per-cluster decomposition reads loudly on
+        // Tint the reflected RGB by the cluster colour (with a small
+        // white blend) so the per-cluster decomposition reads on
         // mirror-shiny surfaces.  On chrome (refl=0.95) the surface
         // contribution is only 5%, so without this the cluster grid
-        // would be invisible on the mirror ball.  With this, the chrome
-        // sphere reads as a per-cluster COLOURED MIRROR (each cluster
-        // is a small dichroic mirror tile reflecting the scene through
-        // its own hue).
-        float3 reflectTint = clusterCol;
+        // would be invisible on the mirror ball.  ~70%% tint strength
+        // is loud enough to make the cluster checker obvious without
+        // turning every reflection into a pure colour wash.
+        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, 0.70);
         finalColor = lerp(finalColor, reflectedRGB * reflectTint, mat.reflectivity);
     }
 

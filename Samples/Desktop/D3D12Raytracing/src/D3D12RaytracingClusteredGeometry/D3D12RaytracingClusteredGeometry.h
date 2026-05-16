@@ -71,6 +71,9 @@ public:
     virtual IDXGISwapChain* GetSwapchain() override { return m_deviceResources->GetSwapChain(); }
     virtual void ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc) override;
 
+    // Read-only accessor consumed by the BuildSharedClusterTrianglesInputs
+    // free function in the .cpp - keeps the helper's signature short.
+    UINT PositionTruncateBits() const { return m_positionTruncateBits; }
 private:
     static const UINT FrameCount = 3;
 
@@ -101,6 +104,20 @@ private:
     //             compacted; final GPU memory = compacted.
     enum class ClasAllocMode { Implicit, GetSizes, Compact };
     ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Implicit;
+
+    // ---------- Position-truncate bits (FLOAT32_3 mode only) ----------
+    // Per-vertex float positions can have their LOW N mantissa bits zeroed
+    // before the CLAS build sees them - the bits-needed savings are passed
+    // to the driver via D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC's
+    // MinPositionTruncateBitCount + the per-cluster
+    // D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS::PositionTruncateBitCount.
+    // The driver may store positions more compactly when both fields agree
+    // that low bits are zero. Range 0 (no truncation, default) to ~22
+    // (kills all mantissa, useful only as a stress test). Practical sweet
+    // spot for sub-millimeter scenes is 8-12 bits; visually invisible.
+    // Ignored in COMPRESSED1 mode (the union slot is taken by
+    // MaxCompressedClusterPositionsSize there).
+    UINT                                 m_positionTruncateBits = 0;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)

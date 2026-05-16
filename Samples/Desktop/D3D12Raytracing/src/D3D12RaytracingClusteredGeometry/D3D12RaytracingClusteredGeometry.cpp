@@ -76,6 +76,18 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             else if (_wcsicmp(argv[i+1], L"compact")   == 0) m_clasAllocMode = ClasAllocMode::Compact;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--position-truncate") == 0 && i + 1 < argc)
+        {
+            // FLOAT32_3 mode only - clamp the per-vertex position mantissa to
+            // 23-N bits by zeroing the low N. Range 0 (full precision, default)
+            // to 22 (only sign+exponent kept). Sweet spot for sub-mm scenes is
+            // 8-12. Ignored under --vertex-format compressed.
+            int n = _wtoi(argv[i+1]);
+            if (n < 0)  n = 0;
+            if (n > 22) n = 22;
+            m_positionTruncateBits = (UINT)n;
+            i += 1;
+        }
     }
 }
 
@@ -673,7 +685,11 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         a.IndexBufferStride                 = 1;     // 1 byte per uint8_t index
         a.OpacityMicromapIndexBufferStride  = 0;
         a.GeometryIndexAndFlagsArrayStride  = 0;
-        a.PositionTruncateBitCount          = 0;
+        // Per-cluster PositionTruncateBitCount is only meaningful in FLOAT32_3
+        // mode (and must be >= the build's MinPositionTruncateBitCount). In
+        // COMPRESSED1 mode the field is unused (the compressed encoding
+        // already controls precision via x/y/z bit counts in its header).
+        a.PositionTruncateBitCount          = (UINT16)(useFloat ? m_positionTruncateBits : 0);
         a.ReservedPadding                   = 0;
         a.VertexBuffer                      = baseGPUVA + slots[gIdx].vbOffset;
         a.IndexBuffer                       = baseGPUVA + slots[gIdx].ibOffset;
@@ -731,7 +747,8 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
 {
-    SampleLog::LogF(L"[CLAS alloc-mode] %s\n", ClasAllocModeName());
+    SampleLog::LogF(L"[CLAS alloc-mode] %s; position-truncate-bits=%u (FLOAT32_3 only)\n",
+                    ClasAllocModeName(), m_positionTruncateBits);
     m_clasMemStats = ClasMemStats{};        // reset stats for this run
     switch (m_clasAllocMode)
     {
@@ -781,7 +798,15 @@ static void BuildSharedClusterTrianglesInputs(
     outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
     outClasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
     outClasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
-    outClasDesc.MaxCompressedClusterPositionsSize   = useFloat ? 0u : maxCompressedSize;
+    // The last field is a union: in COMPRESSED1 mode it's
+    // MaxCompressedClusterPositionsSize (the max compressed-blob bytes per
+    // cluster), in FLOAT32_3 mode it's MinPositionTruncateBitCount (the
+    // floor on per-cluster mantissa-truncation; per-cluster
+    // PositionTruncateBitCount in the args struct must be >= this).
+    if (useFloat)
+        outClasDesc.MinPositionTruncateBitCount = self.PositionTruncateBits();
+    else
+        outClasDesc.MaxCompressedClusterPositionsSize = maxCompressedSize;
     // .Mode set by each caller.
 }
 

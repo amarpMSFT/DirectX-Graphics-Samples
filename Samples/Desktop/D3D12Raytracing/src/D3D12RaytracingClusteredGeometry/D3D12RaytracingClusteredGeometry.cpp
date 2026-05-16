@@ -319,7 +319,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // around Y, so every angle frames the whole group evenly (no view ends up
     // with one giant object in front and the rest tiny behind it).
     // Hex coordinates: x = R cos(theta), z = R sin(theta), six positions 60° apart.
-    constexpr float R = 1.6f;
+    constexpr float R = 2.20f;
     auto hex = [&](int i) {
         float th = (float)i * (2.0f * (float)M_PI / 6.0f);
         return XMFLOAT3(R * std::cos(th), 0.0f, R * std::sin(th));
@@ -351,18 +351,20 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
         with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
 
-    // Floor plane: 6x6 cluster grid covering ±3 units in XZ at Y = -0.7.
-    // 36 clusters * 4*4 quads * 2 tris = 1152 floor triangles. The floor
-    // sits below every hex-arranged object's lowest extent (the smallest
-    // sphere descends to -0.55 + 0.4 worst case = -0.15) so nothing pokes
-    // through. Receives the directional-light shadow ray cast by hits on
-    // any other object once Stage B lands.
+    // Floor — a 0.55-thick GLASS BLOCK.  Top face at y=-0.7, bottom at
+    // y=-1.25, plus 4 side walls so the slab is a fully-closed glass
+    // volume.  The thicker cross-section is visually obvious from the
+    // default camera angle (you can see the slab's edge depth from
+    // outside), and refraction enters the top, bounces around inside,
+    // and exits through whichever face the refracted ray finds.
+    // Cluster count: 36 top + 36 bottom + 4 side walls = 76 clusters.
     add(ProceduralGeometry::GeneratePlaneSpatialTiles(
-            /*halfSizeU*/3.0f, /*halfSizeV*/3.0f,
+            /*halfSizeU*/3.5f, /*halfSizeV*/3.5f,
             /*tilesU*/6,       /*tilesV*/6,
             /*tileQuadsU*/4,   /*tileQuadsV*/4,
-            /*firstClusterID*/600),
-        XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 6x6 = 36 floor clusters
+            /*firstClusterID*/600,
+            /*thickness*/0.55f),
+        XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 76 clusters total
 
     // Klein bottle - the iconic "neck-through-body" parametric Klein
     // bottle, GLASS-LIKE: real Snell refraction (refr=0.55, ior=1.5) +
@@ -378,7 +380,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
             /*numU*/32, /*numV*/16,                                        // matches torus / sphere2 res
             /*tileUSize*/4, /*tileVSize*/4,
             /*firstClusterID*/700),
-        XMFLOAT3(-1.55f, 1.25f, -0.30f), 1.0f, 8,                          // beside the animated sphere with breathing room
+        XMFLOAT3(-1.55f, 1.55f, -0.30f), 1.0f, 8,                          // beside the animated sphere; lifted clear of the smallest sphere underneath (which is at (-2.2, 0.4, 0) with r=0.45)
         XMFLOAT3(0.20f, /*~30°*/0.55f, 0.0f));                             // tilt + yaw so the loop reads
 
     // Determine per-cluster offsets in the global cluster array (used by the
@@ -1784,7 +1786,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     obj.mesh = ProceduralGeometry::GenerateUVSphereSpatialTiles(
         kRestRadius, /*numLat*/24, /*numLong*/48, /*tileLat*/4, /*tileLong*/6, 0);
     obj.clusterCount         = (UINT)obj.mesh.clusters.size();
-    obj.worldPos             = XMFLOAT3(0.0f, 1.6f, 0.0f);         // hovers above the hex group
+    obj.worldPos             = XMFLOAT3(0.0f, 1.10f, 0.0f);        // hovers above the hex group, dropped lower so refractions through it pick up the floor + objects below
     obj.worldScale           = 1.0f;
     obj.instanceID           = 7;       // matches NUM_MATERIAL_SLOTS-1; this is the refractive glass slot
     obj.vertexBufferStride   = (UINT)sizeof(XMFLOAT3);

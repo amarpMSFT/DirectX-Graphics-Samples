@@ -58,7 +58,12 @@ int Win32Application::Run(DXSample* pSample, HINSTANCE hInstance, int nCmdShow)
         // Initialize the sample. OnInit is defined in each child-implementation of DXSample.
         pSample->OnInit();
 
-        ShowWindow(m_hwnd, nCmdShow);
+        // Force-maximise the window on startup regardless of the launcher's
+        // nCmdShow.  The default 1280x720 client area is fine for screenshots
+        // but feels cramped when interacting; SW_MAXIMIZE fills the monitor
+        // and the existing OnSizeChanged path recreates the DXR output UAV
+        // at the new size, so the scene re-renders correctly.
+        ShowWindow(m_hwnd, SW_MAXIMIZE);
 
         // Main sample loop.
         MSG msg = {};

@@ -289,13 +289,14 @@ namespace ProceduralGeometry
         int tilesU, int tilesV,
         int tileQuadsU, int tileQuadsV,
         unsigned int firstClusterID = 0,
-        float thickness = 0.0f)              // > 0 -> generate a SLAB (top + bottom faces)
+        float thickness = 0.0f)              // > 0 -> generate a closed SLAB (top + bottom + 4 side walls)
     {
         Mesh m;
-        // Slab mode doubles the cluster count (top set + bottom set).  We
-        // pre-reserve in either case so push_back is amortised O(1).
+        // Slab mode: top + bottom (each tilesU*tilesV clusters) + 4 side
+        // walls (one cluster each).  Closed volume so refraction has well-
+        // defined enter / exit faces from any incoming direction.
         const bool slab = (thickness > 0.0f);
-        m.clusters.reserve((size_t)tilesU * tilesV * (slab ? 2u : 1u));
+        m.clusters.reserve((size_t)tilesU * tilesV * (slab ? 2u : 1u) + (slab ? 4u : 0u));
         const int rowSize = tileQuadsU + 1;
         const float tileWidthU = 2.0f * halfSizeU / (float)tilesU;
         const float tileWidthV = 2.0f * halfSizeV / (float)tilesV;
@@ -338,16 +339,10 @@ namespace ProceduralGeometry
             m.clusters.push_back(std::move(c));
         }
 
-        // ---- BOTTOM FACES (slab mode only; normal -Y, CW from above) --
-        // For glass: a refracted ray entering the top face needs a back
-        // face to exit through.  The bottom face is wound the OTHER way
-        // so its outward normal points DOWN (-Y) and DXR's
-        // HitKind::FRONT_FACE corresponds to a hit from below.  Inside-
-        // the-glass refraction rays approaching from above hit the
-        // bottom's BACK face -> closesthit's `HitKind() == BACK_FACE`
-        // path runs the inverse Snell, refracting back out into air.
+        // ---- SLAB EXTRAS (bottom + 4 side walls) -----------------------
         if (slab)
         {
+            // BOTTOM FACES: same grid as top, mirrored in Y, CW so normal = -Y.
             for (int tu = 0; tu < tilesU; ++tu)
             for (int tv = 0; tv < tilesV; ++tv)
             {
@@ -381,6 +376,47 @@ namespace ProceduralGeometry
                 m.totalVertices  += (unsigned int)(tileQuadsU + 1) * (tileQuadsV + 1);
                 m.clusters.push_back(std::move(c));
             }
+
+            // 4 SIDE WALLS - one cluster each, single quad (4 verts, 2 tris).
+            // Outward normals: -X, +X, -Z, +Z.  Each is wound CCW when viewed
+            // from OUTSIDE the slab so back-face culling on primary rays
+            // sees the visible face.
+            //
+            //   p0 (top, near edge)           p2 (top, far edge)
+            //         +-----------------------+
+            //         |                       |
+            //         |        OUTSIDE ->     |
+            //         |                       |
+            //         +-----------------------+
+            //   p1 (bottom, near edge)        p3 (bottom, far edge)
+            //
+            // CCW from outside:  p0 -> p2 -> p3, p0 -> p3 -> p1.
+            auto pushSideWall = [&](float3 p0, float3 p1, float3 p2, float3 p3, float3 nrm)
+            {
+                Cluster c;
+                c.clusterID = clusterCounter++;
+                c.positions = { p0, p1, p2, p3 };
+                c.normals   = { nrm, nrm, nrm, nrm };
+                c.indices   = { 0, 2, 3, 0, 3, 1 };
+                m.totalTriangles += 2;
+                m.totalVertices  += 4;
+                m.clusters.push_back(std::move(c));
+            };
+            const float xMin = -halfSizeU, xMax = halfSizeU;
+            const float zMin = -halfSizeV, zMax = halfSizeV;
+            const float yTop = 0.0f,       yBot = -thickness;
+            // -X wall (x=xMin, normal=-X). View from -X (looking in +X dir).
+            pushSideWall({xMin, yTop, zMin}, {xMin, yBot, zMin},
+                         {xMin, yTop, zMax}, {xMin, yBot, zMax}, {-1, 0, 0});
+            // +X wall (x=xMax, normal=+X). View from +X (looking in -X dir).
+            pushSideWall({xMax, yTop, zMax}, {xMax, yBot, zMax},
+                         {xMax, yTop, zMin}, {xMax, yBot, zMin}, {+1, 0, 0});
+            // -Z wall (z=zMin, normal=-Z). View from -Z (looking in +Z dir).
+            pushSideWall({xMax, yTop, zMin}, {xMax, yBot, zMin},
+                         {xMin, yTop, zMin}, {xMin, yBot, zMin}, {0, 0, -1});
+            // +Z wall (z=zMax, normal=+Z). View from +Z (looking in -Z dir).
+            pushSideWall({xMin, yTop, zMax}, {xMin, yBot, zMax},
+                         {xMax, yTop, zMax}, {xMax, yBot, zMax}, {0, 0, +1});
         }
         return m;
     }

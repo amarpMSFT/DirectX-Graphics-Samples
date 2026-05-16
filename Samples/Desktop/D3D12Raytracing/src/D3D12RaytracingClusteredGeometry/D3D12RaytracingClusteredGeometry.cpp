@@ -289,12 +289,28 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
     SampleLog::LogF(L"  D3D12_RAYTRACING_TIER: 0x%X\n", (unsigned)opts5.RaytracingTier);
     SampleLog::LogF(L"  ClustersAndPTLASSupported: %s   (hr=0x%08X)\n",
                     m_clustersAndPtlasSupported ? L"YES" : L"NO", (unsigned)hr);
-    if (!m_clustersAndPtlasSupported)
-        SampleLog::Write(L"  WARNING: cluster builds will fail. Try 'd3dconfig device force-warp=true'\n");
 
-    SetCustomWindowText(m_clustersAndPtlasSupported
-        ? L"clustered geometry: SUPPORTED"
-        : L"clustered geometry: NOT SUPPORTED");
+    if (!m_clustersAndPtlasSupported)
+    {
+        // Cluster builds will hard-fault later on this adapter.  Pop a
+        // user-visible dialog with the suggested workaround and exit
+        // cleanly rather than letting the app silently die mid-init.
+        const wchar_t* message =
+            L"This sample requires a D3D12 adapter that reports "
+            L"ClustersAndPTLASSupported=YES (D3D12 Raytracing Tier 1.4 "
+            L"DXR2 cluster feature).\n\n"
+            L"The current adapter does not support it.\n\n"
+            L"You can run the sample on the WARP software adapter by "
+            L"enabling it globally with the developer-mode command:\n\n"
+            L"    d3dconfig device force-warp=true\n\n"
+            L"(re-run d3dconfig with force-warp=false to switch back).\n\n"
+            L"WARP renders correctly but is much slower than real hardware.";
+        MessageBoxW(Win32Application::GetHwnd(),
+                    message,
+                    L"D3D12RaytracingClusteredGeometry: unsupported adapter",
+                    MB_ICONERROR | MB_OK);
+        ExitProcess(1);
+    }
 }
 
 // =====================================================================================

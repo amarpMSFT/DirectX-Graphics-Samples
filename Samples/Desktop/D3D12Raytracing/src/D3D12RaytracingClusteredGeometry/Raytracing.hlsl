@@ -249,9 +249,12 @@ void Miss(inout Payload p)
     // bands: deep sky-blue overhead -> mid sky -> hazy lighter blue at
     // the horizon (atmospheric scatter).  The sun itself is a tight
     // disc rendered in the sun-glow code below.
-    float3 zenith   = float3(0.18, 0.42, 0.82);  // deep sky blue overhead
-    float3 midSky   = float3(0.42, 0.62, 0.90);  // mid sky
-    float3 horizon  = float3(0.68, 0.80, 0.92);  // hazy blue at horizon
+    // Background dimmed ~20% to make the centerpiece objects pop more
+    // (also slightly darkens the reflected sky / refracted background
+    // visible through the glass objects).
+    float3 zenith   = float3(0.14, 0.34, 0.66);  // deep sky blue overhead   (was 0.18, 0.42, 0.82)
+    float3 midSky   = float3(0.34, 0.50, 0.72);  // mid sky                  (was 0.42, 0.62, 0.90)
+    float3 horizon  = float3(0.54, 0.64, 0.74);  // hazy blue at horizon     (was 0.68, 0.80, 0.92)
     float  tSky     = saturate(y);               // 0 at horizon, 1 at zenith
     float3 sky      = lerp(horizon,
                            lerp(midSky, zenith, smoothstep(0.0, 0.55, tSky)),
@@ -267,8 +270,8 @@ void Miss(inout Payload p)
     // Desaturated palette - reads as warm beige/khaki, not punchy
     // orange-brown (the previous gradient was too saturated and pulled
     // the eye away from the colourful clustered objects above it).
-    float3 ground   = lerp(float3(0.50, 0.47, 0.42),    // moderately dark, low-saturation beige at horizon (FAR)
-                           float3(0.86, 0.82, 0.74),    // light warm beige under foot                       (NEAR)
+    float3 ground   = lerp(float3(0.40, 0.38, 0.34),    // dimmed beige at horizon (was 0.50, 0.47, 0.42)
+                           float3(0.68, 0.65, 0.59),    // dimmed beige under foot (was 0.86, 0.82, 0.74)
                            saturate(-y * 4.0));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the

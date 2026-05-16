@@ -1866,11 +1866,11 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     // ------------------------------------------------------------------
     constexpr float kRestRadius   = 1.00f;        // central showpiece ball, bigger
     constexpr float kEnvelopeScale = 1.18f;       // hint sphere radius = rest * 1.18
-    // 2x resolution + 2x tile size in each dim - SAME cluster count
-    // (12 lat * 16 long = 192), but each cluster now has 4x4*2 = 48
-    // triangles instead of the previous 2x3*2 = 12.
+    // 2x cluster count per dim (192 -> 768 clusters: 24 lat x 32 long)
+    // while KEEPING per-cluster tris count at 48 - resolution doubled
+    // in each dim (48x96 -> 96x192), tile size kept (tileLat 4, tileLong 6).
     obj.mesh = ProceduralGeometry::GenerateUVSphereSpatialTiles(
-        kRestRadius, /*numLat*/48, /*numLong*/96, /*tileLat*/4, /*tileLong*/6, 0);
+        kRestRadius, /*numLat*/96, /*numLong*/192, /*tileLat*/4, /*tileLong*/6, 0);
     obj.clusterCount         = (UINT)obj.mesh.clusters.size();
     obj.worldPos             = XMFLOAT3(0.0f, 1.10f, 0.0f);        // hovers above the hex group, dropped lower so refractions through it pick up the floor + objects below
     obj.worldScale           = 1.0f;
@@ -2955,7 +2955,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // colour so the scene reads instead of going pitch black.
     XMVECTOR sunDir = XMVector3Normalize(XMVectorSet(0.45f, 0.75f, 0.50f, 0.0f));
     XMStoreFloat4(&cb.lightDir, sunDir);
-    cb.lightDir.w = 0.25f;                                          // ambient floor
+    cb.lightDir.w = 0.15f;                                          // ambient floor (0.15 - middle setting; tried 0.08 punchy, reverted)
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
 }
 

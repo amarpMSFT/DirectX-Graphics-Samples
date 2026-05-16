@@ -153,12 +153,12 @@ private:
     // Multiplies the cosine-palette per-cluster tint into the material
     // baseColor in the closesthit:
     //   tint = lerp(white, ClusterColor(cid), m_clusterTint)
-    // Default 0.3 = a subtle hint of cluster colour so you can SEE the
-    // cluster decomposition (which is the whole point of this sample)
-    // while material colours remain readable.  Set to 0 via --cluster-tint 0
-    // for pure material rendering, or 1 for the original "cluster
-    // rainbow dominates everything" look.
-    float                                m_clusterTint = 0.30f;
+    // Default 0.5 - clusters are clearly visible (this IS a sample about
+    // clustered geometry after all) without completely overwriting the
+    // material colours.  Set to 0 via --cluster-tint 0 for pure material
+    // rendering, 1 for the original "cluster rainbow dominates everything"
+    // look.
+    float                                m_clusterTint = 0.50f;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)

@@ -28,17 +28,19 @@ StructuredBuffer<MaterialDesc>    g_materials : register(t1);
 // Per-cluster shader-side buffers carrying smooth normals + the cluster
 // index buffer.  DXR2 cluster geometry's CLAS only consumes positions in
 // its vertex buffer, so per-vertex normals (and the indices we need to
-// look them up by triangle corner) ride along in these structured
+// look them up by triangle corner) ride along in these BYTE-ADDRESS
 // buffers, indexed by ClusterID() + PrimitiveIndex() in the closesthit.
 //
-// Normals are stored as float4 (with .w = 0 padding) instead of float3 so
-// the HLSL StructuredBuffer<> stride matches the C++ upload exactly -
-// `StructuredBuffer<float3>` with a root SRV has implementation-defined
-// stride padding behaviour that has bitten us before.  `float4` is an
-// unambiguous 16-byte stride on both sides.
-StructuredBuffer<float4>          g_clusterNormals : register(t2);
-StructuredBuffer<uint>            g_clusterIndices : register(t3);
-StructuredBuffer<uint2>           g_clusterOffsets : register(t4);
+// We use ByteAddressBuffer (not StructuredBuffer<T>) because root SRVs +
+// vector-typed StructuredBuffers (uint2, float3) have implementation-
+// defined stride padding behaviour - we hit a bug where
+// `StructuredBuffer<uint2>` returned garbage offsets even though the
+// element type was 8 bytes packed.  ByteAddressBuffer + manual
+// offsets eliminates the ambiguity:  WE compute the byte address, the
+// runtime just does a raw load.
+ByteAddressBuffer                 g_clusterNormals : register(t2);   // float3 stored as 16 bytes (with .w padding)
+ByteAddressBuffer                 g_clusterIndices : register(t3);   // uint  stored as  4 bytes
+ByteAddressBuffer                 g_clusterOffsets : register(t4);   // uint2 stored as  8 bytes (vertOff, idxOff per cluster)
 
 struct [raypayload] Payload
 {
@@ -298,25 +300,31 @@ void Hit(inout Payload p, in Attribs a)
     float3 base = mat.baseColor.xyz * lerp(float3(1, 1, 1), clusterCol, clusterTint);
 
     // World-space surface normal.  Per-vertex normals live in the side-
-    // channel (g_clusterNormals + g_clusterIndices indexed by ClusterID()
-    // and PrimitiveIndex()); we fetch the three corner normals and
-    // barycentric-interpolate.  Smooth shading on curved surfaces (sphere
-    // / torus / Klein) was the user's #5 ask; the cube + floor have
-    // constant per-cluster normals so the interpolation degenerates to
-    // flat there for free.
-    uint primIdx = PrimitiveIndex();
-    uint2 off    = g_clusterOffsets[cid];
-    uint i0      = g_clusterIndices[off.y + primIdx * 3 + 0];
-    uint i1      = g_clusterIndices[off.y + primIdx * 3 + 1];
-    uint i2      = g_clusterIndices[off.y + primIdx * 3 + 2];
-    float3 n0    = g_clusterNormals[off.x + i0];
-    float3 n1    = g_clusterNormals[off.x + i1];
-    float3 n2    = g_clusterNormals[off.x + i2];
+    // channel keyed by (ClusterID, PrimitiveIndex):
+    //   - g_clusterOffsets stores (vertOff, idxOff) per cluster, 8 B/entry
+    //   - g_clusterIndices stores 1 uint32 per index (uint8 widened to
+    //     uint32 on upload for clean ByteAddressBuffer.Load access)
+    //   - g_clusterNormals stores float3 padded to 16 bytes per vertex
+    // We compute byte addresses explicitly via ByteAddressBuffer because
+    // root-descriptor StructuredBuffer<vector-of-something> has
+    // implementation-defined stride padding behaviour - we hit a bug
+    // where StructuredBuffer<uint2>'s root-SRV access returned garbage
+    // offsets even though the element type is 8 bytes packed on both
+    // sides.  Byte loads remove the stride ambiguity.
+    uint primIdx     = PrimitiveIndex();
+    uint2 off        = g_clusterOffsets.Load2(cid * 8);                   // (vertOff, idxOff)
+    uint  idxBase    = (off.y + primIdx * 3) * 4;                         // 4 B per uint32 index
+    uint  i0         = g_clusterIndices.Load(idxBase + 0);
+    uint  i1         = g_clusterIndices.Load(idxBase + 4);
+    uint  i2         = g_clusterIndices.Load(idxBase + 8);
+    float3 n0        = asfloat(g_clusterNormals.Load3((off.x + i0) * 16));
+    float3 n1        = asfloat(g_clusterNormals.Load3((off.x + i1) * 16));
+    float3 n2        = asfloat(g_clusterNormals.Load3((off.x + i2) * 16));
     // a.bary is (w1, w2); w0 = 1 - w1 - w2 (DXR convention).
-    float  bw1   = a.bary.x;
-    float  bw2   = a.bary.y;
-    float  bw0   = 1.0 - bw1 - bw2;
-    float3 nObj  = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
+    float  bw1       = a.bary.x;
+    float  bw2       = a.bary.y;
+    float  bw0       = 1.0 - bw1 - bw2;
+    float3 nObj      = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
     // ObjectToWorld3x4()'s 3x3 sub-matrix is rotation/scale only.  All
     // our instances are uniform-scale so direct mul is correct here; for
     // non-uniform scale we'd need the inverse-transpose of the upper-3x3.

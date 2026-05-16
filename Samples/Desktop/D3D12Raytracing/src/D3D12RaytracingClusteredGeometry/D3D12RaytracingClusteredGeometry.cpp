@@ -743,7 +743,9 @@ void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
 
     const UINT offsetTableSize = maxClusterID + 1;
 
-    std::vector<XMFLOAT3> normals;
+    std::vector<XMFLOAT4> normals;            // 16 bytes per normal (.w padding) to match HLSL's
+                                              // ByteAddressBuffer.Load3((off.x + i_k) * 16) stride.
+                                              // See Raytracing.hlsl declaration of g_clusterNormals.
     std::vector<UINT>     indices;
     std::vector<XMUINT2>  offsets(offsetTableSize, XMUINT2(0u, 0u));
 
@@ -752,7 +754,7 @@ void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
     {
         offsets[cidForOffsetTable] = XMUINT2((UINT)normals.size(), (UINT)indices.size());
         for (const auto& n : c.normals)
-            normals.push_back(XMFLOAT3(n.x, n.y, n.z));
+            normals.push_back(XMFLOAT4(n.x, n.y, n.z, 0.0f));
         for (uint8_t i : c.indices)
             indices.push_back((UINT)i);
     };

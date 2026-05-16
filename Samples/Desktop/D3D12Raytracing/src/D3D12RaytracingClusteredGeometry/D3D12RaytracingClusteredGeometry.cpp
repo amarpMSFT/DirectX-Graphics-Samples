@@ -713,7 +713,7 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     // distinct non-glass focal points for visual contrast.
     set(0,    0.95f, 0.95f, 1.00f, 0.95f, 0.0f,  0.0f,  0.0f); // sphere0  CHROME (opaque, 95% mirror) - large foreground ball
     set(1,    0.92f, 0.95f, 1.00f, 0.10f, 0.82f, 1.55f, 0.0f); // sphere1  clear glass (densest)
-    set(2,    0.55f, 0.95f, 0.85f, 0.08f, 0.78f, 1.40f, 0.0f); // sphere2  aqua glass (water-like)
+    set(2,    0.55f, 0.95f, 0.85f, 0.0f,  0.0f,  0.0f,  0.0f); // sphere2  MATTE OPAQUE aqua (no refl, no refr - exercises FORCE_OPAQUE flag with a pure-diffuse surface for variety)
     set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
     set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
     set(5,    0.92f, 0.78f, 0.60f, 0.10f, 0.82f, 1.50f, 0.0f); // cube     translucent copper-tinted glass (heavily see-through)

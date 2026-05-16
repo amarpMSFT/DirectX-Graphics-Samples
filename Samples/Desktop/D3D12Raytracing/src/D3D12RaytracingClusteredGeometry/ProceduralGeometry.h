@@ -481,7 +481,7 @@ namespace ProceduralGeometry
         // unchanged.  Result: handle exits/re-enters the body about 75%
         // from the top (closer to the body's bottom) instead of at
         // mid-height.
-        const float kEntryDown = 6.0f;
+        const float kEntryDown = 10.0f;
         const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
@@ -492,11 +492,11 @@ namespace ProceduralGeometry
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
             const float r  = 4.0f * (1.0f - cu * 0.5f);
-            // Asymmetric (1-cos(u))²/4 bias, SUBTRACTED so it makes z
-            // more negative -> world Y lower.  Maximum at u=π (thick
-            // join), zero at u=0/2π (thin join).
-            const float oneMinusCu = 1.0f - cu;
-            const float entryShift = -kEntryDown * oneMinusCu * oneMinusCu * 0.25f;
+            // Symmetric cos²(u) bias, SUBTRACTED so it makes z more
+            // negative -> world Y lower.  Equal at both joins (u=0/2π
+            // and u=π) so the handle re-enters the body LOW on both
+            // ends.
+            const float entryShift = -kEntryDown * cu * cu;
             float x, z;
             if (u < kPi)
             {

@@ -702,15 +702,21 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
         m_materials[slot] = m;
     };
     //   slot  R     G     B    refl  refr  ior   trans
-    set(0,    0.95f, 0.55f, 0.35f, 0.20f, 0.0f,  0.0f, 0.0f);  // sphere0  warm matte
-    set(1,    0.95f, 0.95f, 1.00f, 0.85f, 0.0f,  0.0f, 0.0f);  // sphere1  chrome
-    set(2,    0.40f, 0.85f, 0.65f, 0.40f, 0.0f,  0.0f, 0.50f); // sphere2  frosted mirror
-    set(3,    0.40f, 0.55f, 0.95f, 0.35f, 0.0f,  0.0f, 0.0f);  // sphere3  blue metal
-    set(4,    0.95f, 0.80f, 0.40f, 0.25f, 0.0f,  0.0f, 0.0f);  // torus    brass
-    set(5,    1.00f, 0.85f, 0.55f, 0.60f, 0.0f,  0.0f, 0.0f);  // cube     copper-mirror
-    set(6,    0.45f, 0.45f, 0.50f, 0.15f, 0.0f,  0.0f, 0.0f);  // floor    wet stone
-    set(7,    0.85f, 0.92f, 1.00f, 0.20f, 0.70f, 1.5f, 0.0f);  // animated glass
-    set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f, 0.0f);  // klein    clear glass (heavy refraction, no frost)
+    // EVERY object except the cube is now a GLASS variant - same closest-
+    // hit dispatch (Snell refraction + a thin reflection layer) but with
+    // different IORs / tints / reflectivities so each object reads as a
+    // distinct kind of glass (water, optical glass, dense glass, etc).
+    // Cube stays a copper mirror so the scene has at least one fully-
+    // opaque reflective object for visual contrast.
+    set(0,    0.95f, 0.78f, 0.55f, 0.08f, 0.78f, 1.45f, 0.0f); // sphere0  warm-tint glass
+    set(1,    0.92f, 0.95f, 1.00f, 0.10f, 0.82f, 1.55f, 0.0f); // sphere1  clear glass (densest)
+    set(2,    0.55f, 0.95f, 0.85f, 0.08f, 0.78f, 1.40f, 0.0f); // sphere2  aqua glass (water-like)
+    set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
+    set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
+    set(5,    1.00f, 0.85f, 0.55f, 0.55f, 0.0f,  0.0f,  0.0f); // cube     COPPER MIRROR (visual contrast - the only opaque object)
+    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.82f, 1.50f, 0.0f); // floor    glass SLAB (top + bottom faces)
+    set(7,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // animated clear glass
+    set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // klein    clear glass
 
     AllocateUploadBuffer(device, m_materials.data(),
                          m_materials.size() * sizeof(MaterialDesc),
@@ -2616,22 +2622,22 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for the shader to traverse a
     // BLAS built from CLAS. Without it, hits on a Cluster BLAS are undefined.
     auto pipelineConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-    // MaxRecursionDepth = 5: budget for the deepest call tree this scene
-    // can produce.  Worst-case path is
-    //   raygen TraceRay      -> recursion 1 (primary closesthit)
-    //   TraceRay reflect      -> recursion 2 (bounce closesthit on a glass
-    //                                          surface)
-    //   TraceRay refract-in   -> recursion 3 (inside the glass, hits back
-    //                                          face)
-    //   TraceRay refract-out  -> recursion 4 (outside, lit by sun)
-    //   TraceRay shadow       -> recursion 5 (LEAF: SKIP_CLOSEST_HIT, no
-    //                                          further TraceRays)
-    // MaxRecursionDepth=3 (the previous value) was exactly enough for the
-    // pure reflect+shadow OR pure refract-enter+exit paths but EXCEEDED on
-    // the reflect-then-refract cascade, producing GPU TDR hangs as soon
-    // as any reflective material's bounce ray happened to land on the
-    // refractive sphere.
-    pipelineConfig->Config(5, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    // MaxRecursionDepth = 8: budget for cascading-refraction paths now that
+    // EVERY object in the scene is a glass variant.  A primary ray that
+    // pierces several glass volumes in sequence can chain refractions to
+    // depth 4-5 before bottoming out, plus 1 shadow ray per surface hit.
+    // Worst-case path:
+    //   raygen TraceRay     -> recursion 1 (primary closesthit on glass A)
+    //   refract-in glass A   -> recursion 2 (back-face of A)
+    //   refract-out into air -> recursion 3 (front-face of glass B)
+    //   refract-in glass B   -> recursion 4 (back-face of B)
+    //   refract-out          -> recursion 5 (next surface)
+    //   reflection bounce    -> recursion 6 (mirror-reflect off some glass)
+    //   shadow ray           -> recursion 7 (LEAF; SKIP_CLOSEST_HIT)
+    //   safety               -> recursion 8 (unused headroom)
+    // The closesthit gates refraction at myDepth <= 4 to stay well under
+    // this budget while still letting 4+ glass volumes compose visually.
+    pipelineConfig->Config(8, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -2929,6 +2935,36 @@ void D3D12RaytracingClusteredGeometry::OnSizeChanged(UINT width, UINT height, bo
 {
     if (!m_deviceResources->WindowSizeChanged(width, height, minimized)) return;
     UpdateForSizeChange(width, height);
+
+    // The DXR output UAV is sized to match the back buffer.  After
+    // WindowSizeChanged resizes the swap chain, the UAV is the OLD size
+    // and the per-frame `CopyResource(m_raytracingOutput -> back buffer)`
+    // hangs (size mismatch).  Recreate the UAV at the new size and rebind
+    // it into descriptor slot 0 (where CreateDescriptorHeapAndRaytracing-
+    // Output originally placed it - first AllocateDescriptor call).
+    auto device = m_deviceResources->GetD3DDevice();
+    auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
+    if (m_raytracingOutput &&
+        (bbDesc.Width  != m_raytracingOutput->GetDesc().Width ||
+         bbDesc.Height != m_raytracingOutput->GetDesc().Height))
+    {
+        m_raytracingOutput.Reset();
+        auto outDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+            m_deviceResources->GetBackBufferFormat(), bbDesc.Width, bbDesc.Height, 1, 1, 1, 0,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        ThrowIfFailed(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+            &outDesc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&m_raytracingOutput)));
+        m_raytracingOutput->SetName(L"Raytracing output");
+
+        // Overwrite descriptor heap slot 0 in place (don't AllocateDescriptor
+        // again - that would leak the slot and bump m_descriptorsAllocated).
+        D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
+            m_descriptorHeap->GetCPUDescriptorHandleForHeapStart(), 0, m_descriptorSize);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(m_raytracingOutput.Get(), nullptr, &uavDesc, cpuHandle);
+    }
 }
 
 void D3D12RaytracingClusteredGeometry::OnDestroy()

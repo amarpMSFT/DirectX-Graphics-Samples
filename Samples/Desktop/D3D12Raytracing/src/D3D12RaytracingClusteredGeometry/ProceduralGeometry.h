@@ -288,10 +288,14 @@ namespace ProceduralGeometry
         float halfSizeU, float halfSizeV,
         int tilesU, int tilesV,
         int tileQuadsU, int tileQuadsV,
-        unsigned int firstClusterID = 0)
+        unsigned int firstClusterID = 0,
+        float thickness = 0.0f)              // > 0 -> generate a SLAB (top + bottom faces)
     {
         Mesh m;
-        m.clusters.reserve((size_t)tilesU * tilesV);
+        // Slab mode doubles the cluster count (top set + bottom set).  We
+        // pre-reserve in either case so push_back is amortised O(1).
+        const bool slab = (thickness > 0.0f);
+        m.clusters.reserve((size_t)tilesU * tilesV * (slab ? 2u : 1u));
         const int rowSize = tileQuadsU + 1;
         const float tileWidthU = 2.0f * halfSizeU / (float)tilesU;
         const float tileWidthV = 2.0f * halfSizeV / (float)tilesV;
@@ -299,6 +303,8 @@ namespace ProceduralGeometry
         const float quadWidthV = tileWidthV / (float)tileQuadsV;
 
         unsigned int clusterCounter = firstClusterID;
+
+        // ---- TOP FACES (normal +Y, CCW from above) ---------------------
         for (int tu = 0; tu < tilesU; ++tu)
         for (int tv = 0; tv < tilesV; ++tv)
         {
@@ -307,7 +313,6 @@ namespace ProceduralGeometry
             const float baseU = -halfSizeU + (float)tu * tileWidthU;
             const float baseV = -halfSizeV + (float)tv * tileWidthV;
 
-            // Vertices: (tileQuadsU+1) x (tileQuadsV+1) on the XZ plane (Y=0).
             for (int li = 0; li <= tileQuadsU; ++li)
             for (int lj = 0; lj <= tileQuadsV; ++lj)
             {
@@ -318,10 +323,6 @@ namespace ProceduralGeometry
                 });
                 c.normals.push_back({ 0.0f, 1.0f, 0.0f });   // floor faces +Y
             }
-            // Indices: two triangles per quad, both wound CCW when viewed from
-            // above (i.e. normal = +Y). Camera sits at +Y > 0 so it looks
-            // DOWN at the floor; without the +Y winding, RAY_FLAG_CULL_BACK_-
-            // FACING_TRIANGLES would silently hide the entire floor.
             for (int li = 0; li < tileQuadsU; ++li)
             for (int lj = 0; lj < tileQuadsV; ++lj)
             {
@@ -335,6 +336,51 @@ namespace ProceduralGeometry
             m.totalTriangles += (unsigned int)tileQuadsU * tileQuadsV * 2;
             m.totalVertices  += (unsigned int)(tileQuadsU + 1) * (tileQuadsV + 1);
             m.clusters.push_back(std::move(c));
+        }
+
+        // ---- BOTTOM FACES (slab mode only; normal -Y, CW from above) --
+        // For glass: a refracted ray entering the top face needs a back
+        // face to exit through.  The bottom face is wound the OTHER way
+        // so its outward normal points DOWN (-Y) and DXR's
+        // HitKind::FRONT_FACE corresponds to a hit from below.  Inside-
+        // the-glass refraction rays approaching from above hit the
+        // bottom's BACK face -> closesthit's `HitKind() == BACK_FACE`
+        // path runs the inverse Snell, refracting back out into air.
+        if (slab)
+        {
+            for (int tu = 0; tu < tilesU; ++tu)
+            for (int tv = 0; tv < tilesV; ++tv)
+            {
+                Cluster c;
+                c.clusterID = clusterCounter++;
+                const float baseU = -halfSizeU + (float)tu * tileWidthU;
+                const float baseV = -halfSizeV + (float)tv * tileWidthV;
+
+                for (int li = 0; li <= tileQuadsU; ++li)
+                for (int lj = 0; lj <= tileQuadsV; ++lj)
+                {
+                    c.positions.push_back({
+                        baseU + (float)li * quadWidthU,
+                        -thickness,                              // bottom of slab
+                        baseV + (float)lj * quadWidthV
+                    });
+                    c.normals.push_back({ 0.0f, -1.0f, 0.0f });  // faces -Y
+                }
+                for (int li = 0; li < tileQuadsU; ++li)
+                for (int lj = 0; lj < tileQuadsV; ++lj)
+                {
+                    uint8_t i00 = (uint8_t)(li     * rowSize + lj    );
+                    uint8_t i01 = (uint8_t)(li     * rowSize + lj + 1);
+                    uint8_t i10 = (uint8_t)((li+1) * rowSize + lj    );
+                    uint8_t i11 = (uint8_t)((li+1) * rowSize + lj + 1);
+                    // Reverse winding so the outward normal is -Y.
+                    c.indices.push_back(i00); c.indices.push_back(i11); c.indices.push_back(i01);
+                    c.indices.push_back(i00); c.indices.push_back(i10); c.indices.push_back(i11);
+                }
+                m.totalTriangles += (unsigned int)tileQuadsU * tileQuadsV * 2;
+                m.totalVertices  += (unsigned int)(tileQuadsU + 1) * (tileQuadsV + 1);
+                m.clusters.push_back(std::move(c));
+            }
         }
         return m;
     }

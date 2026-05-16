@@ -181,32 +181,35 @@ void Miss(inout Payload p)
     float3 d = normalize(WorldRayDirection());
     float  y = d.y;
 
-    // Three sky bands above the horizon - sky-blue overhead, mauve
-    // transition, warm sunset orange just above the horizon line.
-    float3 zenith   = float3(0.40, 0.60, 0.85);  // proper sky-blue overhead
-    float3 midSky   = float3(0.65, 0.55, 0.55);  // warm-mauve transition
-    float3 horizon  = float3(0.95, 0.55, 0.25);  // sunset orange (kept hot)
+    // Daytime sky.  Sun is up (lightDir.y ~ 0.75 = ~50° elevation), so the
+    // dome reads as DAYLIGHT BLUE - no sunset orange anywhere.  Three
+    // bands: deep sky-blue overhead -> mid sky -> hazy lighter blue at
+    // the horizon (atmospheric scatter).  The sun itself is a tight
+    // disc rendered in the sun-glow code below.
+    float3 zenith   = float3(0.18, 0.42, 0.82);  // deep sky blue overhead
+    float3 midSky   = float3(0.42, 0.62, 0.90);  // mid sky
+    float3 horizon  = float3(0.68, 0.80, 0.92);  // hazy blue at horizon
     float  tSky     = saturate(y);               // 0 at horizon, 1 at zenith
     float3 sky      = lerp(horizon,
-                           lerp(midSky, zenith, smoothstep(0.0, 0.45, tSky)),
-                           smoothstep(0.0, 0.20, tSky));   // squeeze the sunset
+                           lerp(midSky, zenith, smoothstep(0.0, 0.55, tSky)),
+                           smoothstep(0.0, 0.25, tSky));
                                                            // band into the lower
                                                            // 20% so the rest of
                                                            // the dome reads
                                                            // BLUE not orange.
 
-    // Ground band below the horizon - dirt brown deepening with depth.
-    float3 ground   = lerp(float3(0.42, 0.30, 0.18),
-                           float3(0.10, 0.07, 0.05),
+    // Ground band below the horizon - desaturated stone-grey (not warm
+    // sunset brown - the sun is up, this is daytime).
+    float3 ground   = lerp(float3(0.32, 0.32, 0.30),
+                           float3(0.10, 0.10, 0.09),
                            saturate(-y * 1.4));
 
-    // Sun glow at the horizon facing the actual sun.  When the ray
-    // direction is roughly aligned with the sun's azimuth the warm tone
-    // brightens further, simulating the corona / atmospheric scatter.
+    // Sun disc/halo.  Only fires when the ray direction is close to the
+    // actual sun direction.  Daytime sun is white-warm, not sunset-orange.
     float3 sunDir   = normalize(g_scene.lightDir.xyz);
     float  sunAlign = saturate(dot(d, sunDir));
-    float3 sunGlow  = float3(1.20, 0.70, 0.30) *
-                      pow(sunAlign, 8.0) *
+    float3 sunGlow  = float3(1.10, 1.00, 0.85) *
+                      pow(sunAlign, 24.0) *                 // tight sun disc
                       smoothstep(-0.05, 0.30, y);  // only above horizon
 
     // Composite.
@@ -365,7 +368,7 @@ void Hit(inout Payload p, in Attribs a)
     const uint myDepth = p.depth;
     float3 finalColor = surfaceColor;
 
-    if (mat.refractivity > 0.0 && myDepth <= 1)
+    if (mat.refractivity > 0.0 && myDepth <= 4)
     {
         // Snell ratio eta = n_outside / n_inside for entering, the
         // inverse for exiting. We assume air (n=1) outside.  HitKind()

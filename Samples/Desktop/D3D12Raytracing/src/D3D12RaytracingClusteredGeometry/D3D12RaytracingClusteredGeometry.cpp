@@ -716,7 +716,7 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     set(2,    0.55f, 0.95f, 0.85f, 0.08f, 0.78f, 1.40f, 0.0f); // sphere2  aqua glass (water-like)
     set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
     set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
-    set(5,    0.90f, 0.65f, 0.45f, 0.10f, 0.65f, 1.50f, 0.0f); // cube     translucent copper-tinted glass (was opaque mirror)
+    set(5,    0.92f, 0.78f, 0.60f, 0.10f, 0.82f, 1.50f, 0.0f); // cube     translucent copper-tinted glass (heavily see-through)
     set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.55f, 1.50f, 0.0f); // floor    glass SLAB - reduced refractivity so the per-cluster surface tint dominates -> reads as a 6x6 GRID OF COLOURED BRICKS
     set(7,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // animated clear glass
     set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // klein    clear glass

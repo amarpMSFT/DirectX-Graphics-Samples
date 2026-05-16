@@ -498,7 +498,15 @@ namespace ProceduralGeometry
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
         // surface point at parameter (u, v).  Used both for vertex
         // positions and for the central-difference normal estimate below.
-        auto kleinPoint = [kPi, kVscale, kThinDrop](float u, float v) -> float3
+        // Handle "narrow factor" - the standard parametric makes the
+        // handle's cross-section as wide as the body bulb at u=π (r=6
+        // there) and narrows as u advances toward 2π.  Multiply the
+        // handle's v-dependent terms by a (1 -> kHandleNarrow) ramp so
+        // the BOTTOM of the handle (the join with the body's thick side
+        // at u=π) stays smooth-matched (scale=1) but the rest of the
+        // handle tapers DOWN to a narrower tube.
+        const float kHandleNarrow = 0.40f;        // tip-end width = 40% of join-end width
+        auto kleinPoint = [kPi, kVscale, kThinDrop, kHandleNarrow](float u, float v) -> float3
         {
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
@@ -509,18 +517,21 @@ namespace ProceduralGeometry
             // u=0,π,2π so the join is smooth on both ends.
             const float halfCos = std::cos(u * 0.5f);
             const float thinShift = -kThinDrop * halfCos * halfCos;
-            float x, z;
+            float x, z, y;
             if (u < kPi)
             {
                 x = 6.0f * cu * (1.0f + su) + r * cu * cv;
                 z = -kVscale * su           - r * su * cv + thinShift;
+                y = r * std::sin(v);
             }
             else
             {
-                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -kVscale * su                          + thinShift;
+                // Linear narrow ramp from 1 (at u=π) to kHandleNarrow (at u=2π).
+                const float handleScale = 1.0f - (1.0f - kHandleNarrow) * ((u - kPi) / kPi);
+                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi) * handleScale;
+                z = -kVscale * su                                     + thinShift;
+                y = r * std::sin(v) * handleScale;
             }
-            const float y = r * std::sin(v);
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
         };
 

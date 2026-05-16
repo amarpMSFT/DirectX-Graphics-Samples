@@ -206,13 +206,14 @@ void Miss(inout Payload p)
                                                            // the dome reads
                                                            // BLUE not orange.
 
-    // Ground band below the horizon - DARKER at the horizon (atmospheric
-    // perspective makes far ground appear dimmer and bluer), brighter
-    // sand colour up close (looking down).  Reads as foreground sand
-    // fading into a hazy desert distance.
-    float3 ground   = lerp(float3(0.48, 0.40, 0.28),    // darker / hazier sand at the horizon (FAR)
-                           float3(0.92, 0.82, 0.62),    // bright sand under foot     (NEAR, looking down)
-                           saturate(-y * 1.4));
+    // Ground band below the horizon - DARK at the horizon (atmospheric
+    // perspective), bright sand colour up close.  Very sharp falloff
+    // (-y * 8) and a deeply darker far-color so the gradient is
+    // unmistakable - the dark band hugs the horizon line, the rest of
+    // the visible sand reads bright.
+    float3 ground   = lerp(float3(0.20, 0.18, 0.12),    // very dark / hazy at the horizon (FAR)
+                           float3(0.94, 0.84, 0.62),    // bright sand under foot     (NEAR)
+                           saturate(-y * 8.0));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the
     // actual sun direction.  Daytime sun is white-warm, not sunset-orange.
@@ -520,23 +521,17 @@ void Hit(inout Payload p, in Attribs a)
                                           reflectDir,
                                           cullFlags,
                                           myDepth + 1, childInGlass);
-        finalColor = lerp(finalColor, reflectedRGB, mat.reflectivity);
-    }
-
-    p.color = float4(finalColor, 1);
-}
-
-
-apply the same stained-glass-style tint to the reflection -
-        // the mirror reads as a per-cluster COLOURED MIRROR (polished
-        // stained glass) and the cluster decomposition is still
-        // visible.  Half-strength so reflections still read clearly as
-        // reflections, just with a hue.
-        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * 0.5);
+        // Tint the reflected RGB by the cluster colour DIRECTLY (no
+        // white blend) so the per-cluster decomposition reads loudly on
+        // mirror-shiny surfaces.  On chrome (refl=0.95) the surface
+        // contribution is only 5%, so without this the cluster grid
+        // would be invisible on the mirror ball.  With this, the chrome
+        // sphere reads as a per-cluster COLOURED MIRROR (each cluster
+        // is a small dichroic mirror tile reflecting the scene through
+        // its own hue).
+        float3 reflectTint = clusterCol;
         finalColor = lerp(finalColor, reflectedRGB * reflectTint, mat.reflectivity);
     }
 
     p.color = float4(finalColor, 1);
 }
-
-

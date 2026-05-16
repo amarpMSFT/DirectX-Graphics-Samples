@@ -43,8 +43,8 @@ namespace MaterialData
         //             High refractivity (0.93) so translucent tiles read as
         //             clear glass you can see through to the bottom + sand.
         {  { 0.85f, 0.92f, 0.95f, 0.0f }, 0.06f, 0.93f, 1.50f, 0.0f },
-        //   slot 7 - animated clear glass
-        {  { 0.85f, 0.90f, 1.00f, 0.0f }, 0.08f, 0.78f, 1.5f,  0.0f },
+        //   slot 7 - animated clear glass (bumped reflectivity from 0.08 -> 0.30 for a shinier read; ior from 1.5 -> 3.0 (super-dense crystal) for very dramatic refraction)
+        {  { 0.85f, 0.90f, 1.00f, 0.0f }, 0.30f, 0.78f, 3.0f,  0.0f },
         //   slot 8 - Klein bottle clear glass
         {  { 0.85f, 0.90f, 1.00f, 0.0f }, 0.08f, 0.78f, 1.5f,  0.0f },
     }};

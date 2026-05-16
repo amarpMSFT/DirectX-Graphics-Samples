@@ -849,13 +849,21 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
                      obj.surfTintMul, obj.refrTintMul, obj.reflTintMul);
     if (m_animatedObjectEnabled)
     {
-        // The animated object uses default scene config for now (no
-        // checker, baseline tint multipliers).  When scene data moves to
-        // SceneData.h in Phase E the animated object can be a regular
-        // ClusterObject entry like the rest.
-        CheckerConfig noChecker;
+        // Animated object: alternating cluster checker - even parity
+        // is OPAQUE SHINY (chrome-like; refl=0.95, refr=0), odd parity
+        // keeps the baseline refractive glass.  Plus cranked tint
+        // multipliers so the refractive clusters' cluster colours read
+        // prominently.
+        CheckerConfig checker;
+        checker.enabled = true;
+        checker.evenParity.overrideRefl = 0.95f;   // chrome-ish reflectivity
+        checker.evenParity.overrideRefr = 0.0f;    // opaque (no refraction)
+        checker.evenParity.baseColorScale = 1.0f;
+        checker.oddParity.overrideRefl  = 0.0f;    // translucent clusters: no reflection
+        checker.oddParity.overrideRefr  = -1.0f;   // keep baseline refractivity (0.78)
+        checker.oddParity.overrideIor   = -1.0f;   // keep baseline ior (2.4)
         fillFromMesh(m_animatedObject.mesh, kAnimatedClusterIdOffset,
-                     noChecker, /*surf*/1.0f, /*refr*/0.50f, /*refl*/1.08f);
+                     checker, /*surf*/1.0f, /*refr*/0.75f, /*refl*/1.20f);
     }
 
     AllocateUploadBuffer(device, meta.data(), meta.size() * sizeof(ClusterMeta),
@@ -1856,10 +1864,12 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     //    so animation can squash/stretch within [1/envelope, envelope] without
     //    leaving the cluster's pre-built BVH bounds.
     // ------------------------------------------------------------------
-    constexpr float kRestRadius   = 0.65f;
+    constexpr float kRestRadius   = 0.78f;        // bumped 0.65 -> 0.78 (slightly bigger)
     constexpr float kEnvelopeScale = 1.18f;       // hint sphere radius = rest * 1.18
+    // 2x clusters in each dim (tileLat 4->2, tileLong 6->3) gives a 12x16
+    // = 192-cluster animated sphere instead of the prior 6x8 = 48.
     obj.mesh = ProceduralGeometry::GenerateUVSphereSpatialTiles(
-        kRestRadius, /*numLat*/24, /*numLong*/48, /*tileLat*/4, /*tileLong*/6, 0);
+        kRestRadius, /*numLat*/24, /*numLong*/48, /*tileLat*/2, /*tileLong*/3, 0);
     obj.clusterCount         = (UINT)obj.mesh.clusters.size();
     obj.worldPos             = XMFLOAT3(0.0f, 1.10f, 0.0f);        // hovers above the hex group, dropped lower so refractions through it pick up the floor + objects below
     obj.worldScale           = 1.0f;
@@ -2232,9 +2242,14 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
     //    individual clusters shimmering.
     // ------------------------------------------------------------------
     const float t          = (float)m_animSeconds;
-    const float pulse      = 1.0f + 0.10f * std::sin(t * 2.0f);              // 0.90..1.10
-    const float wobbleAmp  = 0.04f;
-    const float wobbleFreq = 5.0f;
+    // Per-vertex radial RIPPLE - sum of three sin waves on independent
+    // axes so the undulation reads as 3-D lumps instead of plane-wave
+    // stripes wrapping around a single (1,1,1) axis.  Each axis's wave
+    // contributes amp/3 so the total radial deflection stays bounded
+    // by wobbleAmp.  Time phases offset per axis so they don't pulse
+    // in lock-step.  amp 0.12 -> 0.08 (a little less aggressive).
+    const float wobbleAmp  = 0.08f;
+    const float wobbleFreq = 20.0f;
 
     XMFLOAT3* dst = obj.perFrameVertexBufferMapped;
     for (UINT c = 0; c < obj.clusterCount; ++c)
@@ -2245,8 +2260,13 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
             const auto& p = src.positions[v];
             // Per-vertex wobble phase from position, so adjacent vertices wobble
             // together (no per-vertex shear that would crack cluster edges).
-            float ph = wobbleFreq * (p.x + p.y + p.z) + t * 3.0f;
-            float scale = pulse * (1.0f + wobbleAmp * std::sin(ph));
+            // 3-axis ripple: independent sin waves on x, y, z with offset
+            // time-phases so they don't lock-step.  Sum divided by 3 so
+            // the worst-case radial deflection stays bounded by wobbleAmp.
+            float sx = std::sin(wobbleFreq * p.x + t * 3.0f + 0.0f);
+            float sy = std::sin(wobbleFreq * p.y + t * 3.0f + 1.7f);
+            float sz = std::sin(wobbleFreq * p.z + t * 3.0f + 3.4f);
+            float scale = 1.0f + wobbleAmp * (sx + sy + sz) * (1.0f / 3.0f);
             // Sphere centred at origin -> radial scaling is just multiplicative.
             dst->x = p.x * scale;
             dst->y = p.y * scale;

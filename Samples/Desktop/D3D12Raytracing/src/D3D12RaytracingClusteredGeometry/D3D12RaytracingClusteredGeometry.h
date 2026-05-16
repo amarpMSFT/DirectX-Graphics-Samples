@@ -17,12 +17,14 @@
 #include "Compressed1.h"
 #include "RaytracingHlslCompat.h"
 #include <DirectXMath.h>
+#include <array>
 
 namespace GlobalRootSig {
     enum {
         OutputUAVSlot = 0,
         AccelerationStructureSlot,
         SceneCBVSlot,
+        MaterialsSRVSlot,           // Stage C: per-instance MaterialDesc[] indexed by InstanceID()
         Count
     };
 }
@@ -255,6 +257,14 @@ private:
     ComPtr<ID3D12Resource>               m_sceneCB;
     SceneConstantBuffer*                 m_sceneCBMapped = nullptr;
 
+    // ---------- Per-instance materials ----------
+    // m_materials[InstanceID] = MaterialDesc.  Indexed by InstanceID() in
+    // HLSL via a structured-buffer SRV at root parameter MaterialsSRVSlot.
+    // Populated in BuildMaterials() and uploaded once at init time.
+    std::array<MaterialDesc, NUM_MATERIAL_SLOTS> m_materials = {};
+    ComPtr<ID3D12Resource>               m_materialsBuffer;
+    void BuildMaterials();
+
     // ---------- Timestamp queries for AS build wall-clocks ----------
     // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).
     // Per-frame uses a separate heap + readback with 3 ring-buffer slots so
@@ -330,6 +340,7 @@ private:
     //                     hit-group record per ray-contribution index)
     static const wchar_t* c_raygenName;
     static const wchar_t* c_closestHitName;
+    static const wchar_t* c_anyHitName;
     static const wchar_t* c_missName;
     static const wchar_t* c_shadowMissName;
     static const wchar_t* c_hitGroupName;

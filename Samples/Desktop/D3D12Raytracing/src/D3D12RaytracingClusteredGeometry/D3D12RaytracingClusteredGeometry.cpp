@@ -225,6 +225,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     QueryDXR2Support();
     SampleLog::Write(L">>> BuildScene\n");
     BuildScene();
+    SampleLog::Write(L">>> BuildMaterials\n");
+    BuildMaterials();
     SampleLog::Write(L">>> BuildAccelerationStructures\n");
     BuildAccelerationStructures();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
@@ -605,6 +607,69 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 // ---------------------------------------------------------------------------------
 // Concatenate per-cluster vertex blob + index buffer + per-cluster build args
 // into a single upload buffer. Layout (clusters in object order, all flattened):
+// =====================================================================================
+// Per-instance material assignment + upload to a structured buffer.
+//
+// 8 slots, indexed by InstanceID() in HLSL:
+//   0  large sphere       OPAQUE diffuse
+//   1  medium sphere      REFLECTIVE (chrome-ish, reflectivity 0.85)
+//   2  small sphere       STOCHASTIC translucent (any-hit, 50% reject)
+//   3  smallest sphere    OPAQUE diffuse
+//   4  torus              OPAQUE diffuse
+//   5  cube               REFLECTIVE (polished metal, reflectivity 0.40)
+//   6  floor              OPAQUE diffuse + per-cluster OPAQUE flag
+//   7  ANIMATED sphere    REFRACTIVE glass (IOR 1.5, translucency 0.7) -
+//                         the morphing surface gives an animated distortion
+//                         of the world behind it.
+//
+// Material kind drives both per-instance flags and HLSL behavior:
+//   OPAQUE      -> instance gets D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE
+//                  (any-hit shader is never invoked for primary OR shadow)
+//   REFLECTIVE  -> instance gets FORCE_OPAQUE (reflective surfaces are still
+//                  fully opaque to ray traversal; reflection just adds bounce)
+//   REFRACTIVE  -> instance gets NO opaque flag - any-hit fires per triangle
+//                  (we use it as the dispatch entry point for the refraction
+//                  bounce, though the closest-hit handles the actual logic)
+//   STOCHASTIC  -> instance gets NO opaque flag - any-hit fires per triangle
+//                  and decides per-hit whether to accept (let closest-hit
+//                  light it) or IgnoreHit (continue past, see what's behind)
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildMaterials()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    // Helper to fill a slot with sane defaults then customise.
+    auto set = [&](UINT slot, UINT kind, float reflectivity, float translucency, float ior)
+    {
+        MaterialDesc m = {};
+        m.baseColor.x = 1.0f;
+        m.baseColor.y = 1.0f;
+        m.baseColor.z = 1.0f;
+        m.baseColor.w = 0.0f;
+        m.params.x    = reflectivity;
+        m.params.y    = translucency;
+        m.params.z    = ior;
+        m.params.w    = 0.0f;
+        m.kind        = kind;
+        m_materials[slot] = m;
+    };
+    set(0, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
+    set(1, MAT_KIND_REFLECTIVE,  0.85f, 0.0f, 0.0f);
+    set(2, MAT_KIND_STOCHASTIC,  0.0f, 0.50f, 0.0f);
+    set(3, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
+    set(4, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
+    set(5, MAT_KIND_REFLECTIVE,  0.40f, 0.0f, 0.0f);
+    set(6, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
+    set(7, MAT_KIND_REFRACTIVE,  0.0f, 0.70f, 1.50f);
+
+    AllocateUploadBuffer(device, m_materials.data(),
+                         m_materials.size() * sizeof(MaterialDesc),
+                         &m_materialsBuffer, L"Per-instance materials");
+
+    SampleLog::LogF(L"[materials] %u slots; refractive ior=%.2f for slot 7 (animated sphere)\n",
+                    (unsigned)m_materials.size(), m_materials[7].params.z);
+}
+
 //
 //   [aligned 16] cluster[0].vertex_blob
 //   [aligned 16] cluster[0].index_buffer
@@ -714,7 +779,23 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         a.ClusterFlags                      = 0;
         a.TriangleCount                     = (UINT16)(src.indices.size() / 3);
         a.VertexCount                       = (UINT16)src.positions.size();
-        a.BaseGeometryIndexAndFlags         = 0;
+        // Per-cluster OPAQUE flag: lives in the upper bits of
+        // BaseGeometryIndexAndFlags. We set it for every cluster of an
+        // OPAQUE-kind material; for translucent (REFRACTIVE / STOCHASTIC)
+        // materials we leave it off so the any-hit shader can fire.
+        // REFLECTIVE counts as opaque from a traversal POV (reflection only
+        // adds a recursive ray; it doesn't change visibility).
+        //
+        // This is partially redundant with the per-instance FORCE_OPAQUE
+        // flag we set on the TLAS instance descs, but the per-cluster flag
+        // demonstrates that opacity can be controlled at cluster
+        // granularity (e.g. an LOD where some clusters are foliage cards
+        // requiring any-hit and others are solid trunks that don't).
+        const UINT matKind = m_materials[obj.instanceID].kind;
+        const bool isOpaqueLike = (matKind == MAT_KIND_OPAQUE) || (matKind == MAT_KIND_REFLECTIVE);
+        a.BaseGeometryIndexAndFlags         = isOpaqueLike
+            ? D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
+            : 0u;
         a.OpacityMicromapBaseLocation       = 0;
         // For COMPRESSED1 the data is a single blob (stride concept doesn't apply, pass 0);
         // for FLOAT32_3 we have packed float3 per vertex (12 bytes stride).
@@ -1582,7 +1663,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     obj.clusterCount         = (UINT)obj.mesh.clusters.size();
     obj.worldPos             = XMFLOAT3(0.0f, 1.6f, 0.0f);         // hovers above the hex group
     obj.worldScale           = 1.0f;
-    obj.instanceID           = 99;
+    obj.instanceID           = 7;       // matches NUM_MATERIAL_SLOTS-1; this is the refractive glass slot
     obj.vertexBufferStride   = (UINT)sizeof(XMFLOAT3);
 
     // Per-cluster hint positions = rest position scaled outward by envelopeScale.
@@ -2058,6 +2139,18 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     // a fixed GVA (EXPLICIT_DESTINATIONS), so this array is good for the life
     // of the sample - only the TLAS BVH itself needs per-frame rebuild to
     // pick up the animated BLAS's new root bounds.
+    // Decide per-instance flags from material kind. OPAQUE + REFLECTIVE
+    // surfaces get FORCE_OPAQUE so any-hit never runs (cheaper traversal,
+    // and reflective surfaces don't need any-hit logic anyway). REFRACTIVE
+    // and STOCHASTIC need any-hit to fire so the closest-hit / any-hit
+    // shaders can run their per-hit dispatch.
+    auto flagsForKind = [](UINT kind) -> D3D12_RAYTRACING_INSTANCE_FLAGS
+    {
+        return (kind == MAT_KIND_OPAQUE || kind == MAT_KIND_REFLECTIVE)
+            ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE
+            : D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+    };
+
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances(N_total);
     for (UINT i = 0; i < N_static; ++i)
     {
@@ -2068,7 +2161,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         instances[i].InstanceID                          = obj.instanceID;
         instances[i].InstanceMask                        = 0xFF;
         instances[i].InstanceContributionToHitGroupIndex = 0;
-        instances[i].Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+        instances[i].Flags = flagsForKind(m_materials[obj.instanceID].kind);
         instances[i].AccelerationStructure               = obj.blasGPUVA;
     }
     if (m_animatedObjectEnabled)
@@ -2080,7 +2173,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         instances[N_static].InstanceID                          = a.instanceID;
         instances[N_static].InstanceMask                        = 0xFF;
         instances[N_static].InstanceContributionToHitGroupIndex = 0;
-        instances[N_static].Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+        instances[N_static].Flags = flagsForKind(m_materials[a.instanceID].kind);
         instances[N_static].AccelerationStructure               = a.blasGPUVA;
     }
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
@@ -2321,6 +2414,9 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         params[GlobalRootSig::OutputUAVSlot].InitAsDescriptorTable(1, &uavRange);
         params[GlobalRootSig::AccelerationStructureSlot].InitAsShaderResourceView(0);
         params[GlobalRootSig::SceneCBVSlot].InitAsConstantBufferView(0);
+        // Per-instance materials live in a structured buffer at t1, indexed by
+        // InstanceID() in the closesthit/anyhit shaders.
+        params[GlobalRootSig::MaterialsSRVSlot].InitAsShaderResourceView(1);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -2381,11 +2477,11 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for the shader to traverse a
     // BLAS built from CLAS. Without it, hits on a Cluster BLAS are undefined.
     auto pipelineConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-    // MaxRecursionDepth = 2: primary ray (depth 0) -> shadow ray (depth 1).
-    // Stage C bumps to 2 (no change needed) for primary -> reflection -> shadow,
-    // and the spec lower-bounds 2 once you have either reflection or shadow,
-    // so 2 is the right number now.
-    pipelineConfig->Config(2, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    // MaxRecursionDepth = 3: primary -> reflection/refraction -> shadow on
+    // the bounced surface. Without 3, the bounced closesthit can't trace
+    // its own shadow ray and the reflective/refractive surfaces would render
+    // unshadowed.
+    pipelineConfig->Config(3, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -2626,6 +2722,8 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::AccelerationStructureSlot,
         m_tlasBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootConstantBufferView(GlobalRootSig::SceneCBVSlot, m_sceneCB->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::MaterialsSRVSlot,
+        m_materialsBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
@@ -2886,4 +2984,5 @@ HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path
     if (FAILED(hr = encoder->Commit())) return cleanup(hr);
     return cleanup(S_OK);
 }
+
 

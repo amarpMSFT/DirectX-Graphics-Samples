@@ -394,6 +394,14 @@ void Hit(inout Payload p, in Attribs a)
         float eta  = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? (1.0 / mat.ior) : mat.ior;
         float3 incident   = WorldRayDirection();
         float3 refractDir = refract(incident, nWorld, eta);
+        // Tint the refracted RGB by the cluster colour so per-cluster
+        // boundaries are VISIBLE through glass (acts like a stained-
+        // glass filter - the cluster decomposition shows up as colour
+        // variation in the refracted view, not just on the thin
+        // surface contribution).  Shared between TIR and true-refraction
+        // branches below.
+        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint);
+
         if (dot(refractDir, refractDir) < 0.001)
         {
             // Total internal reflection: refract() returns 0; fall back
@@ -408,7 +416,7 @@ void Hit(inout Payload p, in Attribs a)
                                             refractDir,
                                             cullFlags,
                                             myDepth + 1, childInGlass);
-            finalColor = lerp(finalColor, tirRGB, mat.refractivity);
+            finalColor = lerp(finalColor, tirRGB * refractTint, mat.refractivity);
         }
         else
         {
@@ -422,7 +430,7 @@ void Hit(inout Payload p, in Attribs a)
                                               refractDir,
                                               cullFlags,
                                               myDepth + 1, childInGlass);
-            finalColor = lerp(finalColor, refractedRGB, mat.refractivity);
+            finalColor = lerp(finalColor, refractedRGB * refractTint, mat.refractivity);
         }
     }
 

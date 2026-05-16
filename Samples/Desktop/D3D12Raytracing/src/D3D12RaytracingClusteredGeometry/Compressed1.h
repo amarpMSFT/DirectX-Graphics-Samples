@@ -9,23 +9,27 @@
 //
 // CPU-side encoder for the DXR2 D3D12_VERTEX_FORMAT_COMPRESSED1 vertex format.
 //
-// Per the spec (Raytracing2.md "Compressed1 position encoding"), each cluster's
-// vertex data is laid out as:
-//   - 12-byte D3D12_VERTEX_FORMAT_COMPRESSED1_HEADER (exponent, 24-bit signed
-//     anchor xyz, 4-bit-each x/y/z bit counts in [1..16])
-//   - immediately followed by per-vertex (x_bits + y_bits + z_bits)-bit packed
-//     offsets (no padding between vertices)
+// Per-cluster layout in the vertex buffer:
+//   - 12-byte D3D12_VERTEX_FORMAT_COMPRESSED1_HEADER
+//       (8-bit biased exponent, three 24-bit signed anchors,
+//        three 4-bit (bit_count - 1) widths per axis, range [1..16])
+//   - immediately followed by per-vertex (x_bits + y_bits + z_bits)-bit
+//     packed deltas, LSB-first within each component, no padding between
+//     components or between vertices.
 //
-// Decoding:  pos[c] = (anchor[c] + offset[c]) * 2^(exponent - 127)
+// Decode:  pos[c] = (anchor[c] + delta[c]) * 2^(exponent - 127)
 //
-// This implementation uses a single bit width N for all three components and
-// picks the exponent automatically so the per-component dynamic range fits in
-// 2^N - 1 levels with the smallest sufficient unit. That is the encoding most
-// engines will pick for static geometry (the spec's recommended best practice
-// for this sample).
+// This implementation mirrors the d3d12conf reference encoder:
+//   1. Iterate exponent upward until anchor + max(delta) fits in a 24-bit
+//      signed range AND every delta fits in 32 bits.
+//   2. Anchor = floor(min(pos) / scale + 0.5). Since the same rounding is
+//      used for the per-vertex quantization, anchor = min(quantized set)
+//      by construction, so every delta is >= 0 with no separate clamp.
+//   3. Per-axis bit count chosen as ceil(log2(maxDelta[axis] + 1)), then
+//      clamped to [1, maxPrecisionBits].
+//   4. Bitstream packed LSB-first, X then Y then Z per vertex.
 //
-// We use the d3d12.h ENCODE_/DECODE_ macros to set/get header bits so any
-// future spec tweaks pick up automatically.
+// All header field manipulation uses the d3d12.h ENCODE_/DECODE_ macros.
 //
 #pragma once
 
@@ -42,149 +46,199 @@ namespace Compressed1
     struct EncodedCluster
     {
         D3D12_VERTEX_FORMAT_COMPRESSED1_HEADER header = {};
-        std::vector<uint8_t> bitstream;      // packed offsets (no padding)
+        std::vector<uint8_t> bitstream;       // packed deltas (no padding)
         unsigned int          vertexCount   = 0;
-        unsigned int          bitsPerComp   = 0;
+        unsigned int          xBits         = 0;
+        unsigned int          yBits         = 0;
+        unsigned int          zBits         = 0;
 
         // Total bytes for the whole compressed cluster (header + bitstream).
         size_t TotalBytes() const { return sizeof(header) + bitstream.size(); }
     };
 
-    // Pack least-significant `nBits` of `value` starting at bit `bitOffset` in `dst`.
-    inline void WriteBits(std::vector<uint8_t>& dst, uint64_t bitOffset, uint32_t value, int nBits)
+    // Minimum number of bits to represent `v` (>=1; returns 1 for v=0 because the
+    // spec requires bit_count in [1..16]).
+    inline uint32_t BitsForValue(uint32_t v)
     {
-        for (int b = 0; b < nBits; ++b)
+        uint32_t b = 1;
+        while ((v >> b) != 0u && b < 32u) ++b;
+        return b;
+    }
+
+    inline void WriteBitsLSB(std::vector<uint8_t>& dst, uint64_t& bitOff,
+                             uint32_t value, uint32_t nBits)
+    {
+        uint32_t written = 0;
+        while (written < nBits)
         {
-            uint64_t p = bitOffset + b;
-            if ((value >> b) & 1u)
-                dst[(size_t)(p / 8)] |= (uint8_t)(1u << (p % 8));
+            const uint64_t bytePos   = bitOff / 8;
+            const uint32_t bitInByte = (uint32_t)(bitOff & 7);
+            const uint32_t take      = std::min<uint32_t>(8 - bitInByte, nBits - written);
+            const uint32_t mask      = (1u << take) - 1u;
+            const uint32_t chunk     = (value >> written) & mask;
+            dst[(size_t)bytePos] &= (uint8_t)(~(mask << bitInByte));
+            dst[(size_t)bytePos] |= (uint8_t)(chunk << bitInByte);
+            written += take;
+            bitOff  += take;
         }
     }
 
-    inline uint32_t ReadBits(const std::vector<uint8_t>& src, uint64_t bitOffset, int nBits)
+    inline uint32_t ReadBitsLSB(const std::vector<uint8_t>& src, uint64_t& bitOff, uint32_t nBits)
     {
-        uint32_t v = 0;
-        for (int b = 0; b < nBits; ++b)
+        uint32_t value = 0, read = 0;
+        while (read < nBits)
         {
-            uint64_t p = bitOffset + b;
-            if (src[(size_t)(p / 8)] & (uint8_t)(1u << (p % 8))) v |= (1u << b);
+            const uint64_t bytePos   = bitOff / 8;
+            const uint32_t bitInByte = (uint32_t)(bitOff & 7);
+            const uint32_t take      = std::min<uint32_t>(8 - bitInByte, nBits - read);
+            const uint32_t mask      = (1u << take) - 1u;
+            const uint32_t chunk     = (src[(size_t)bytePos] >> bitInByte) & mask;
+            value |= (chunk << read);
+            read   += take;
+            bitOff += take;
         }
-        return v;
+        return value;
     }
 
-    // Encode `verts` into compressed1 with `nBitsPerComponent` bits per axis.
-    // If `forcedExponent < 0`, the exponent is auto-picked per-cluster from the
-    // cluster's own dynamic range. If `forcedExponent` is in [1..232], that
-    // BIASED exponent is used directly (use this to keep adjacent clusters in a
-    // shared encoding grid -> watertight at cluster boundaries).
+    // Encode a single cluster.
+    //   - `maxPrecisionBits` caps per-axis bit count (1..16 per spec).
+    //   - `forcedBiasedExponent` in [1..232]: start the search there and never
+    //      decrease (so a scene-wide pick can be enforced for cluster-edge
+    //      watertightness). Pass -1 for an unconstrained per-cluster pick.
     inline EncodedCluster Encode(const std::vector<ProceduralGeometry::float3>& verts,
-                                 int nBitsPerComponent,
-                                 int forcedExponent = -1)
+                                 int maxPrecisionBits = 12,
+                                 int forcedBiasedExponent = -1)
     {
         EncodedCluster out;
         out.vertexCount = (unsigned int)verts.size();
-        out.bitsPerComp = (unsigned int)nBitsPerComponent;
-
         if (verts.empty()) return out;
 
-        // 1) per-axis min/max in input units
+        maxPrecisionBits = std::clamp(maxPrecisionBits, 1, 16);
+
+        // Per-axis min in input units.
         float mn[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX };
-        float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX };
         for (auto& v : verts)
         {
             const float p[3] = { v.x, v.y, v.z };
-            for (int c = 0; c < 3; ++c)
+            for (int c = 0; c < 3; ++c) if (p[c] < mn[c]) mn[c] = p[c];
+        }
+
+        // Iterate exponent until the encoding fits. `maxDeltaValue` is the
+        // cap implied by maxPrecisionBits; deltas exceeding this trigger
+        // another exponent bump (giving up some precision for headroom).
+        const uint64_t maxDeltaValue = (maxPrecisionBits >= 32) ? ~0ull : ((1ull << maxPrecisionBits) - 1ull);
+        int    exponent = (forcedBiasedExponent > 0) ? forcedBiasedExponent : 1;
+        int32_t anchor[3] = { 0, 0, 0 };
+        std::vector<uint32_t> deltas; deltas.reserve(verts.size() * 3);
+        uint32_t maxDelta[3] = { 0, 0, 0 };
+        bool ok = false;
+
+        for (;;)
+        {
+            const double scale    = std::ldexp(1.0, exponent - 127);
+            const double invScale = 1.0 / scale;
+
+            // Anchor = floor(min/scale + 0.5). Monotonic with the per-vertex
+            // rounding below, so anchor IS the min over quantized values
+            // -> all deltas >= 0 without a separate clamp.
+            for (int i = 0; i < 3; ++i)
             {
-                if (p[c] < mn[c]) mn[c] = p[c];
-                if (p[c] > mx[c]) mx[c] = p[c];
+                double a = std::floor((double)mn[i] * invScale + 0.5);
+                a = std::clamp(a, -8388608.0, 8388607.0);    // 24-bit signed
+                anchor[i] = (int32_t)a;
             }
-        }
 
-        // 2) pick the unit so that the largest per-axis extent fits in (2^N - 1)
-        //    quantization levels with a power-of-two unit.
-        int e;
-        if (forcedExponent > 0 && forcedExponent <= 232)
-        {
-            e = forcedExponent;
-        }
-        else
-        {
-            float maxExtent = 0.f;
-            for (int c = 0; c < 3; ++c) maxExtent = std::max(maxExtent, mx[c] - mn[c]);
-            const float maxLevels = float((1ull << nBitsPerComponent) - 1);
-            const float minUnit   = (maxExtent > 0.f) ? (maxExtent / maxLevels) : 1e-30f;
-            e = (int)std::ceil(std::log2(minUnit)) + 127;
-            if (e < 1)   e = 1;
-            if (e > 232) e = 232;
-        }
-        const float unit = std::ldexp(1.0f, e - 127);
+            deltas.clear();
+            maxDelta[0] = maxDelta[1] = maxDelta[2] = 0;
+            bool overflow = false;
+            for (const auto& v : verts)
+            {
+                const float p[3] = { v.x, v.y, v.z };
+                for (int i = 0; i < 3; ++i)
+                {
+                    const double qd = std::floor((double)p[i] * invScale + 0.5);
+                    const uint64_t d = (uint64_t)(int64_t)qd - (uint64_t)anchor[i];
+                    if (d > 0xFFFFFFFFull) { overflow = true; }
+                    if (d > maxDeltaValue) { overflow = true; }
+                    deltas.push_back((uint32_t)d);
+                    if ((uint32_t)d > maxDelta[i]) maxDelta[i] = (uint32_t)d;
+                }
+            }
 
-        // 3) quantize, derive anchor as the per-axis quantized minimum
-        std::vector<int32_t> qX(verts.size()), qY(verts.size()), qZ(verts.size());
-        for (size_t i = 0; i < verts.size(); ++i)
-        {
-            qX[i] = (int32_t)std::lround(verts[i].x / unit);
-            qY[i] = (int32_t)std::lround(verts[i].y / unit);
-            qZ[i] = (int32_t)std::lround(verts[i].z / unit);
+            if (!overflow)
+            {
+                bool anchorOk = true;
+                for (int i = 0; i < 3; ++i)
+                {
+                    if ((int64_t)anchor[i] + (int64_t)maxDelta[i] > 8388607ll) { anchorOk = false; break; }
+                }
+                if (anchorOk) { ok = true; break; }
+            }
+            if (++exponent > 232) { ok = false; break; }      // saturate
         }
-        const int32_t aX = *std::min_element(qX.begin(), qX.end());
-        const int32_t aY = *std::min_element(qY.begin(), qY.end());
-        const int32_t aZ = *std::min_element(qZ.begin(), qZ.end());
+        (void)ok;
 
-        // Sanity: anchors must fit a 24-bit signed range, offsets must fit nBits.
-        const int32_t kMin24 = -(1 << 23);
-        const int32_t kMax24 =  (1 << 23) - 1;
-        (void)kMin24; (void)kMax24;
-        const uint32_t maxOff = (1u << nBitsPerComponent) - 1;
+        // Per-axis bit counts, each at least 1, capped at maxPrecisionBits.
+        const uint32_t bitsNeeded[3] = {
+            std::clamp<uint32_t>(BitsForValue(maxDelta[0]), 1u, (uint32_t)maxPrecisionBits),
+            std::clamp<uint32_t>(BitsForValue(maxDelta[1]), 1u, (uint32_t)maxPrecisionBits),
+            std::clamp<uint32_t>(BitsForValue(maxDelta[2]), 1u, (uint32_t)maxPrecisionBits),
+        };
+        out.xBits = bitsNeeded[0];
+        out.yBits = bitsNeeded[1];
+        out.zBits = bitsNeeded[2];
 
-        // 4) header
+        // Header.
         ENCODE_D3D12_COMPRESSED1(out.header,
-                                 e,
-                                 aX, aY, aZ,
-                                 nBitsPerComponent - 1,
-                                 nBitsPerComponent - 1,
-                                 nBitsPerComponent - 1);
+                                 (uint32_t)exponent,
+                                 anchor[0], anchor[1], anchor[2],
+                                 bitsNeeded[0] - 1, bitsNeeded[1] - 1, bitsNeeded[2] - 1);
 
-        // 5) bitstream (3*N bits per vertex, packed)
-        const uint64_t totalBits = 3ull * nBitsPerComponent * verts.size();
+        // Bitstream: (bitsX + bitsY + bitsZ) bits per vertex, packed LSB-first.
+        const uint64_t totalBits = (uint64_t)(bitsNeeded[0] + bitsNeeded[1] + bitsNeeded[2]) * verts.size();
         out.bitstream.assign((size_t)((totalBits + 7) / 8), 0);
-
         uint64_t bitOff = 0;
-        for (size_t i = 0; i < verts.size(); ++i)
+        for (size_t v = 0; v < verts.size(); ++v)
         {
-            uint32_t ox = (uint32_t)(qX[i] - aX);  if (ox > maxOff) ox = maxOff;
-            uint32_t oy = (uint32_t)(qY[i] - aY);  if (oy > maxOff) oy = maxOff;
-            uint32_t oz = (uint32_t)(qZ[i] - aZ);  if (oz > maxOff) oz = maxOff;
-            WriteBits(out.bitstream, bitOff, ox, nBitsPerComponent); bitOff += nBitsPerComponent;
-            WriteBits(out.bitstream, bitOff, oy, nBitsPerComponent); bitOff += nBitsPerComponent;
-            WriteBits(out.bitstream, bitOff, oz, nBitsPerComponent); bitOff += nBitsPerComponent;
+            uint32_t dx = deltas[v * 3 + 0];
+            uint32_t dy = deltas[v * 3 + 1];
+            uint32_t dz = deltas[v * 3 + 2];
+            // Defensive clamp; with the loop above this should never fire.
+            const uint32_t maskX = (bitsNeeded[0] >= 32) ? ~0u : (1u << bitsNeeded[0]) - 1u;
+            const uint32_t maskY = (bitsNeeded[1] >= 32) ? ~0u : (1u << bitsNeeded[1]) - 1u;
+            const uint32_t maskZ = (bitsNeeded[2] >= 32) ? ~0u : (1u << bitsNeeded[2]) - 1u;
+            if (dx > maskX) dx = maskX;
+            if (dy > maskY) dy = maskY;
+            if (dz > maskZ) dz = maskZ;
+            WriteBitsLSB(out.bitstream, bitOff, dx, bitsNeeded[0]);
+            WriteBitsLSB(out.bitstream, bitOff, dy, bitsNeeded[1]);
+            WriteBitsLSB(out.bitstream, bitOff, dz, bitsNeeded[2]);
         }
-
         return out;
     }
 
-    // CPU-side reference decoder used to verify roundtrip correctness during init.
+    // CPU-side reference decoder for the roundtrip self-check.
     inline std::vector<ProceduralGeometry::float3> Decode(const EncodedCluster& enc)
     {
         const int e  = (int)DECODE_D3D12_COMPRESSED1_EXPONENT(enc.header);
         const int aX = (int)DECODE_D3D12_COMPRESSED1_X_ANCHOR(enc.header);
         const int aY = (int)DECODE_D3D12_COMPRESSED1_Y_ANCHOR(enc.header);
         const int aZ = (int)DECODE_D3D12_COMPRESSED1_Z_ANCHOR(enc.header);
-        const int nx = (int)DECODE_D3D12_COMPRESSED1_X_BITS(enc.header) + 1;
-        const int ny = (int)DECODE_D3D12_COMPRESSED1_Y_BITS(enc.header) + 1;
-        const int nz = (int)DECODE_D3D12_COMPRESSED1_Z_BITS(enc.header) + 1;
-        const float unit = std::ldexp(1.0f, e - 127);
+        const uint32_t nx = (uint32_t)DECODE_D3D12_COMPRESSED1_X_BITS(enc.header) + 1u;
+        const uint32_t ny = (uint32_t)DECODE_D3D12_COMPRESSED1_Y_BITS(enc.header) + 1u;
+        const uint32_t nz = (uint32_t)DECODE_D3D12_COMPRESSED1_Z_BITS(enc.header) + 1u;
+        const float unit  = (float)std::ldexp(1.0, e - 127);
 
         std::vector<ProceduralGeometry::float3> out(enc.vertexCount);
         uint64_t bitOff = 0;
         for (unsigned int i = 0; i < enc.vertexCount; ++i)
         {
-            uint32_t ox = ReadBits(enc.bitstream, bitOff, nx); bitOff += nx;
-            uint32_t oy = ReadBits(enc.bitstream, bitOff, ny); bitOff += ny;
-            uint32_t oz = ReadBits(enc.bitstream, bitOff, nz); bitOff += nz;
-            out[i].x = (float)(aX + (int32_t)ox) * unit;
-            out[i].y = (float)(aY + (int32_t)oy) * unit;
-            out[i].z = (float)(aZ + (int32_t)oz) * unit;
+            uint32_t dx = ReadBitsLSB(enc.bitstream, bitOff, nx);
+            uint32_t dy = ReadBitsLSB(enc.bitstream, bitOff, ny);
+            uint32_t dz = ReadBitsLSB(enc.bitstream, bitOff, nz);
+            out[i].x = (float)((double)(aX + (int32_t)dx) * unit);
+            out[i].y = (float)((double)(aY + (int32_t)dy) * unit);
+            out[i].z = (float)((double)(aZ + (int32_t)dz) * unit);
         }
         return out;
     }

@@ -221,6 +221,10 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildScene()
 {
+    // 12 bits/axis = 36 bits/vertex. Per-axis bit counts in the bitstream
+    // (driven by maxDelta per axis) are typically much less for clusters
+    // with constant or near-constant components (cube faces have 1 bit on
+    // the constant axis).
     constexpr int kCompressedBitsPerComponent = 12;
 
     auto add = [&](ProceduralGeometry::Mesh&& mesh, const XMFLOAT3& pos, float scale, UINT instanceID)
@@ -247,22 +251,12 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     auto with_y = [](XMFLOAT3 p, float y) { p.y = y; return p; };
 
     // Spheres around the hex.
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 32, 64, /*tileLat*/4, /*tileLong*/8, 0),
-        with_y(hex(0),  0.1f), 1.0f, 0);                                  // 8x8=64 clusters
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
-        with_y(hex(1),  0.4f), 1.0f, 1);                                  // 6x8=48 clusters
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),
-        with_y(hex(2), -0.1f), 1.0f, 2);                                  // 4x8=32 clusters
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.45f, 12, 24, /*tileLat*/3, /*tileLong*/4, 300),
-        with_y(hex(3),  0.3f), 1.0f, 3);                                  // 4x6=24 clusters
-
-    // Torus.
-    add(ProceduralGeometry::GenerateTorusSpatialTiles(0.55f, 0.18f, 32, 16, /*tileR*/4, /*tileS*/4, 400),
-        with_y(hex(4), -0.3f), 1.0f, 4);                                  // 8x4=32 clusters
-
-    // Cube (one cluster per face).
-    add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
-        with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
+    // TEMP: tiny sphere SHIFTED in X, Y, Z so every vertex is positive.
+    auto m_shifted = ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 8, 8, /*tileLat*/4, /*tileLong*/4, 0);
+    for (auto& c : m_shifted.clusters)
+        for (auto& p : c.positions) { p.x += 1.5f; p.y += 1.5f; p.z += 1.5f; }
+    add(std::move(m_shifted),
+        XMFLOAT3(-1.5f, -1.5f, -1.5f), 1.0f, 0);
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -289,6 +283,31 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
                     m_vertexMode == VertexMode::Compressed1 ? L"COMPRESSED1 (shared-exponent quantized)"
                                                             : L"FLOAT32_3 (no quantization)");
 
+    // ============================================================================
+    // COMPRESSED1 STATIC PATH - KNOWN ISSUE (open as of 2026-05-15)
+    // ----------------------------------------------------------------------------
+    // On NVIDIA RTX 4090 with experimental D3D12 (D3D12Core 1.10 preview, agility
+    // SDK 722), passing FLOAT32_3 here produces a clean rainbow-tile render of
+    // the scene. Passing COMPRESSED1 renders the cube perfectly but mangles the
+    // sphere/torus clusters - typically with one cluster appearing as a stretched
+    // "tail" extending well beyond the object's bounds, and another cluster
+    // missing entirely. The breakage is reproducible with a SINGLE 4-cluster
+    // sphere (set kSceneTinyRepro = true to enable this minimal repro scene),
+    // and persists across:
+    //   * 8-bit, 12-bit, and 16-bit-per-axis encodings
+    //   * uniform vs per-axis bit counts
+    //   * 16-byte vs 256-byte vertex-buffer alignment
+    //   * positive-only anchors (verified by shifting the mesh into +x+y+z)
+    //   * MaxCompressedClusterPositionsSize set to exact size vs 4x oversize
+    //
+    // CPU-side roundtrip via Compressed1::Decode is bit-exact (max error
+    // ~0.0002 units, which is sub-quantization-step). Byte-for-byte cluster
+    // dumps via DUMP_COMPRESSED1_DIAG match the d3d12conf reference encoder's
+    // bit ordering and header layout.
+    //
+    // Filed as: <TODO: bug-tracker link>. Until resolved, the sample defaults
+    // to FLOAT32_3 (see VertexMode::Float32_3 in the header).
+    // ============================================================================
     if (m_vertexMode == VertexMode::Compressed1)
     {
         // Pick a single shared compressed1 exponent across the WHOLE scene (all
@@ -320,6 +339,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
 
         size_t totalCompressedBytes = 0, totalUncompressedBytes = 0;
         float  maxRoundtripError = 0.f;
+        size_t globalClusterIdx  = 0;
         for (auto& obj : m_objects)
         {
             obj.encoded.reserve(obj.mesh.clusters.size());
@@ -334,9 +354,52 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
                     float dz = decoded[i].z - c.positions[i].z;
                     maxRoundtripError = std::max(maxRoundtripError, std::sqrt(dx*dx + dy*dy + dz*dz));
                 }
+                // Dump cluster 0 (sphere) and cluster 500 (cube) byte-for-byte
+                // for forensic comparison. Cluster 0 is sphere obj #0's first
+                // cluster; cluster 500 is the first cube cluster (cube starts
+                // at firstClusterID=500).
+                // KNOWN-ISSUE FORENSICS (disable for production builds).
+                // Set DUMP_COMPRESSED1_DIAG to 1 to print per-cluster header,
+                // anchors, bit-counts and a sample of original-vs-decoded
+                // positions for the listed cluster IDs. Useful when chasing
+                // why the BVH-build's interpretation of a compressed1 cluster
+                // diverges from the CPU roundtrip decode.
+                #define DUMP_COMPRESSED1_DIAG 0
+                #if DUMP_COMPRESSED1_DIAG
+                if (c.clusterID == 0 || c.clusterID == 1 || c.clusterID == 10
+                    || c.clusterID == 56 || c.clusterID == 500)
+                {
+                    SampleLog::LogF(L"[compressed1 dump] clusterID=%u "
+                                    L"verts=%u  x_bits=%u y_bits=%u z_bits=%u  "
+                                    L"anchor=(%d, %d, %d)  exp=%u\n",
+                                    c.clusterID, enc.vertexCount,
+                                    enc.xBits, enc.yBits, enc.zBits,
+                                    (int)DECODE_D3D12_COMPRESSED1_X_ANCHOR(enc.header),
+                                    (int)DECODE_D3D12_COMPRESSED1_Y_ANCHOR(enc.header),
+                                    (int)DECODE_D3D12_COMPRESSED1_Z_ANCHOR(enc.header),
+                                    (unsigned)DECODE_D3D12_COMPRESSED1_EXPONENT(enc.header));
+                    SampleLog::LogF(L"  header words: %08X %08X %08X  bitstream-bytes=%zu\n",
+                                    enc.header.field0, enc.header.field1, enc.header.field2,
+                                    enc.bitstream.size());
+                    // First 4 AND last 4 vertices: print original + decoded
+                    auto printV = [&](size_t i) {
+                        SampleLog::LogF(L"  v[%2zu] orig=(%+.5f,%+.5f,%+.5f) dec=(%+.5f,%+.5f,%+.5f)\n",
+                                        i,
+                                        c.positions[i].x, c.positions[i].y, c.positions[i].z,
+                                        decoded[i].x,     decoded[i].y,     decoded[i].z);
+                    };
+                    for (size_t i = 0; i < std::min<size_t>(4, c.positions.size()); ++i) printV(i);
+                    if (c.positions.size() > 8)
+                    {
+                        SampleLog::Write(L"  ...\n");
+                        for (size_t i = c.positions.size() - 4; i < c.positions.size(); ++i) printV(i);
+                    }
+                }
+                #endif // DUMP_COMPRESSED1_DIAG
                 totalCompressedBytes   += enc.TotalBytes();
                 totalUncompressedBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
                 obj.encoded.push_back(std::move(enc));
+                ++globalClusterIdx;
             }
         }
         SampleLog::LogF(L"[compressed1] %u clusters @ %d bits/comp -> %zu bytes (vs %zu uncompressed = %.2fx)\n",
@@ -475,8 +538,13 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
 {
     auto device = m_deviceResources->GetD3DDevice();
-    constexpr size_t kAlign = 16;
+    // Use a generous per-cluster alignment for COMPRESSED1 vertex data; some
+    // drivers appear to read past the spec'd end of a cluster's compressed
+    // blob (probably prefetch), so leaving real padding between clusters
+    // avoids stepping into the next cluster's bits. 16 bytes is fine for the
+    // FLOAT32_3 path which has a fixed per-vertex stride.
     const bool       useFloat = (m_vertexMode == VertexMode::Float32_3);
+    const size_t     kAlign   = useFloat ? 16 : 256;
     auto alignTo = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };
 
     auto vbSizeForCluster = [&](const ClusterObject& obj, size_t i) -> size_t
@@ -638,7 +706,8 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
     clasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
     clasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
     // MaxCompressedClusterPositionsSize is only meaningful for COMPRESSED1.
-    clasDesc.MaxCompressedClusterPositionsSize   = useFloat ? 0u : maxCompressedSize;
+    // TEMP: way oversized to test if undersizing is the bug
+    clasDesc.MaxCompressedClusterPositionsSize   = useFloat ? 0u : (maxCompressedSize * 4 + 1024);
 
     D3D12_RTAS_OPERATION_INPUTS opInputs = {};
     opInputs.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;

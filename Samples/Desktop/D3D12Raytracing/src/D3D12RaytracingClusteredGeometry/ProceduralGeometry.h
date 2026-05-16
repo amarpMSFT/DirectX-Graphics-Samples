@@ -470,26 +470,39 @@ namespace ProceduralGeometry
         // value is 16; 13 keeps the recognisable pear-bottle silhouette
         // while making the handle's loop noticeably tighter.
         const float kVscale = 13.0f;
+
+        // Lower the handle's two body-entry points (u=0/2π and u=π) so
+        // the handle visibly enters the BODY's lower half rather than
+        // its middle.  Achieved by adding a kEntryDown * cos²(u) bias
+        // to BOTH body and handle z formulas: cos²(u) is 1 at u=0/π/2π
+        // (the join points) and 0 at u=π/2 (body bottom) and u=3π/2
+        // (handle top), so it preserves the existing smooth join at
+        // u=π and leaves the body's bottom + handle's top extents
+        // unchanged.  Result: handle exits/re-enters the body about 75%
+        // from the top (closer to the body's bottom) instead of at
+        // mid-height.
+        const float kEntryDown = 7.0f;
         const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
         // surface point at parameter (u, v).  Used both for vertex
         // positions and for the central-difference normal estimate below.
-        auto kleinPoint = [kPi, kVscale](float u, float v) -> float3
+        auto kleinPoint = [kPi, kVscale, kEntryDown](float u, float v) -> float3
         {
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
             const float r  = 4.0f * (1.0f - cu * 0.5f);
+            const float entryShift = kEntryDown * cu * cu;   // peaks at u=0,π,2π; zero at u=π/2,3π/2
             float x, z;
             if (u < kPi)
             {
                 x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                z = -kVscale * su           - r * su * cv;
+                z = -kVscale * su           - r * su * cv + entryShift;
             }
             else
             {
                 x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -kVscale * su;
+                z = -kVscale * su                          + entryShift;
             }
             const float y = r * std::sin(v);
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
@@ -568,4 +581,5 @@ namespace ProceduralGeometry
         return m;
     }
 }
+
 

@@ -704,19 +704,20 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
         m_materials[slot] = m;
     };
     //   slot  R     G     B    refl  refr  ior   trans
-    // EVERY object except the cube is now a GLASS variant - same closest-
-    // hit dispatch (Snell refraction + a thin reflection layer) but with
-    // different IORs / tints / reflectivities so each object reads as a
-    // distinct kind of glass (water, optical glass, dense glass, etc).
-    // Cube stays a copper mirror so the scene has at least one fully-
-    // opaque reflective object for visual contrast.
-    set(0,    0.95f, 0.78f, 0.55f, 0.08f, 0.78f, 1.45f, 0.0f); // sphere0  warm-tint glass
+    // Most objects are GLASS variants (different IORs / tints) so the
+    // closesthit's refraction + internal-reflection compose all over the
+    // scene.  Sphere0 (the LARGEST, most-prominent foreground sphere) and
+    // the cube are FORCE_OPAQUE + mirror-shiny instead - they exercise
+    // the FORCE_OPAQUE TLAS-instance flag path (no any-hit, single
+    // closesthit, deterministic mirror bounce) and give the scene
+    // distinct non-glass focal points for visual contrast.
+    set(0,    0.95f, 0.95f, 1.00f, 0.95f, 0.0f,  0.0f,  0.0f); // sphere0  CHROME (opaque, 95% mirror) - large foreground ball
     set(1,    0.92f, 0.95f, 1.00f, 0.10f, 0.82f, 1.55f, 0.0f); // sphere1  clear glass (densest)
     set(2,    0.55f, 0.95f, 0.85f, 0.08f, 0.78f, 1.40f, 0.0f); // sphere2  aqua glass (water-like)
     set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
     set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
-    set(5,    1.00f, 0.85f, 0.55f, 0.55f, 0.0f,  0.0f,  0.0f); // cube     COPPER MIRROR (visual contrast - the only opaque object)
-    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.82f, 1.50f, 0.0f); // floor    glass SLAB (top + bottom faces)
+    set(5,    1.00f, 0.85f, 0.55f, 0.55f, 0.0f,  0.0f,  0.0f); // cube     COPPER MIRROR (also opaque + reflective)
+    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.82f, 1.50f, 0.0f); // floor    glass SLAB (top + bottom + 4 walls)
     set(7,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // animated clear glass
     set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // klein    clear glass
 
@@ -2617,7 +2618,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
 
     // Payload: max(Payload(float4), ShadowPayload(bool)) -> 16 bytes is enough.
     auto shaderConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + sizeof(uint), /*attribs*/ 2 * sizeof(float));
+    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + 2 * sizeof(uint), /*attribs*/ 2 * sizeof(float));   // Payload = float4 color + uint depth + uint inGlass
     auto globalRS = pipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     globalRS->SetRootSignature(m_globalRootSignature.Get());
 

@@ -378,26 +378,20 @@ namespace ProceduralGeometry
             }
 
             // 4 SIDE WALLS - one cluster each, single quad (4 verts, 2 tris).
-            // Outward normals: -X, +X, -Z, +Z.  Each is wound CCW when viewed
-            // from OUTSIDE the slab so back-face culling on primary rays
-            // sees the visible face.
-            //
-            //   p0 (top, near edge)           p2 (top, far edge)
-            //         +-----------------------+
-            //         |                       |
-            //         |        OUTSIDE ->     |
-            //         |                       |
-            //         +-----------------------+
-            //   p1 (bottom, near edge)        p3 (bottom, far edge)
-            //
-            // CCW from outside:  p0 -> p2 -> p3, p0 -> p3 -> p1.
+            // Outward normals: -X, +X, -Z, +Z.  For each wall we list
+            //   p0 = top-near, p1 = bot-near, p2 = top-far, p3 = bot-far
+            // where "near" / "far" run along the wall's horizontal axis
+            // (chosen per-wall so the consistent index order { 0, 1, 3,
+            // 0, 3, 2 } gives a CCW-from-outside winding -> the geometric
+            // cross product (p1-p0) x (p3-p0) equals the outward normal).
+            // Verified by hand for all four walls.
             auto pushSideWall = [&](float3 p0, float3 p1, float3 p2, float3 p3, float3 nrm)
             {
                 Cluster c;
                 c.clusterID = clusterCounter++;
                 c.positions = { p0, p1, p2, p3 };
                 c.normals   = { nrm, nrm, nrm, nrm };
-                c.indices   = { 0, 2, 3, 0, 3, 1 };
+                c.indices   = { 0, 1, 3, 0, 3, 2 };
                 m.totalTriangles += 2;
                 m.totalVertices  += 4;
                 m.clusters.push_back(std::move(c));

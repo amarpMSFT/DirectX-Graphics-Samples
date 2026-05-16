@@ -54,6 +54,13 @@ struct [raypayload] Payload
     // driver; using a dedicated field with single-direction write(caller)
     // + read(closesthit) qualifiers sidesteps the issue.
     uint   depth : write(caller)        : read(closesthit);
+    // 1 = ray is currently INSIDE a glass volume (entered via a refraction
+    // through a glass front face).  closesthit reads this to decide whether
+    // back-face culling is OK on the next bounce - inside-glass child rays
+    // need RAY_FLAG_NONE so they can hit the BACK face of the glass to
+    // refract out, while air-side rays use RAY_FLAG_CULL_BACK_FACING_-
+    // TRIANGLES so they don't see "inside" opaque or grazing-angle objects.
+    uint   inGlass : write(caller)      : read(closesthit);
 };
 struct [raypayload] ShadowPayload
 {
@@ -146,8 +153,9 @@ void RayGen()
         r.TMax      = 1000.0;
 
         Payload p;
-        p.color = float4(0, 0, 0, 1);
-        p.depth = 0;
+        p.color   = float4(0, 0, 0, 1);
+        p.depth   = 0;
+        p.inGlass = 0;       // primary rays start in air
         TraceRay(Scene,
             RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
             /*InstanceInclusionMask*/0xff,
@@ -257,7 +265,7 @@ float ShadowVisibility(float3 hitPos, float3 nWorld, float3 toSun)
 // payload's .a, so it can decide not to recurse further. Caller computes
 // `myDepth + 1` and passes it in.
 // ----------------------------------------------------------------------------
-float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth)
+float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth, uint childInGlass)
 {
     RayDesc r;
     r.Origin    = origin;
@@ -265,8 +273,9 @@ float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth)
     r.TMin      = 0.001;
     r.TMax      = 100.0;
     Payload bp;
-    bp.color = float4(0, 0, 0, 1);
-    bp.depth = childDepth;          // dedicated write(caller)/read(closesthit) field
+    bp.color   = float4(0, 0, 0, 1);
+    bp.depth   = childDepth;        // dedicated write(caller)/read(closesthit) field
+    bp.inGlass = childInGlass;      // 1 if the new ray is travelling INSIDE a glass volume
     TraceRay(Scene, cullFlags, 0xff, /*RayContrib*/0, /*MultiplierGeoContrib*/0,
              /*MissIdx*/0, r, bp);
     return bp.color.rgb;
@@ -358,14 +367,20 @@ void Hit(inout Payload p, in Attribs a)
     // finalColor at that point.  Recursion-cap via the dedicated payload
     // .depth field (caller writes, closesthit reads):
     //
-    //   - reflectivity bounces only at depth 0 (one mirror bounce)
-    //   - refractivity bounces at depths 0 AND 1 (enter glass + exit
-    //     glass = the proper thin-medium approximation; the inside-the-
+    //   - reflectivity bounces at depths <= 2 (one bounce on the front
+    //     face of the surface AND one on the inside back face for glass,
+    //     so a glass volume produces TWO visible reflection layers - the
+    //     surface highlight and the back-wall internal reflection).
+    //     Reflection rays use RAY_FLAG_NONE so they can hit BOTH front
+    //     and back faces (essential for internal reflection inside a
+    //     glass volume to see the opposite inner wall).
+    //   - refractivity bounces at depths <= 4 (enter glass + exit
+    //     glass + chain through 2-3 more glass volumes; the inside-the-
     //     glass closesthit at depth 1 hits the BACK face and refracts
-    //     OUT, so the camera sees the world behind the glass).
+    //     OUT, so the camera sees the world behind the glass).  Already
+    //     uses RAY_FLAG_NONE so inside-glass rays see the back face.
     //
-    // Pipeline MaxRecursionDepth=3 means the depth-2 refraction-exit's
-    // shadow ray (which becomes depth 3) is the leaf.
+    // Pipeline MaxRecursionDepth=8 covers the worst-case chain.
     const uint myDepth = p.depth;
     float3 finalColor = surfaceColor;
 
@@ -382,28 +397,51 @@ void Hit(inout Payload p, in Attribs a)
         if (dot(refractDir, refractDir) < 0.001)
         {
             // Total internal reflection: refract() returns 0; fall back
-            // to a mirror reflection of the incoming ray.
+            // to a mirror reflection of the incoming ray (stays inside
+            // the glass volume - so childInGlass below stays at the
+            // CURRENT-ray value, not the toggled one).
             refractDir = reflect(incident, nWorld);
+            uint childInGlass = p.inGlass;       // TIR keeps us in the same medium
+            uint cullFlags    = childInGlass ? RAY_FLAG_NONE
+                                              : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+            float3 tirRGB     = TraceBounce(hitPos + nWorld * 0.001,
+                                            refractDir,
+                                            cullFlags,
+                                            myDepth + 1, childInGlass);
+            finalColor = lerp(finalColor, tirRGB, mat.refractivity);
         }
-        // Refracted ray must NOT cull back-facing - we want to allow
-        // entering the volume from the outside AND exiting from inside.
-        float3 refractedRGB = TraceBounce(hitPos - nWorld * 0.001,
-                                          refractDir,
-                                          RAY_FLAG_NONE,
-                                          myDepth + 1);
-        finalColor = lerp(finalColor, refractedRGB, mat.refractivity);
+        else
+        {
+            // True refraction: the new ray crosses the interface so its
+            // medium toggles.  Front-face entry from air -> child is in
+            // glass.  Back-face exit from glass -> child is in air.
+            uint childInGlass = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? 1u : 0u;
+            uint cullFlags    = childInGlass ? RAY_FLAG_NONE
+                                              : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+            float3 refractedRGB = TraceBounce(hitPos - nWorld * 0.001,
+                                              refractDir,
+                                              cullFlags,
+                                              myDepth + 1, childInGlass);
+            finalColor = lerp(finalColor, refractedRGB, mat.refractivity);
+        }
     }
 
-    if (mat.reflectivity > 0.0 && myDepth == 0)
+    if (mat.reflectivity > 0.0 && myDepth <= 2)
     {
-        // One-bounce mirror reflection.  Reflected ray uses back-face
-        // culling - we don't expect to enter solid objects from a mirror
-        // bounce.
+        // Mirror bounce.  Reflection STAYS in the same medium as the
+        // current ray (ray hits a surface, bounces back into the same
+        // half-space it came from), so childInGlass = p.inGlass.  Cull
+        // flags chosen to match: in-air bounces use back-face culling,
+        // in-glass bounces (e.g. inside the slab reflecting off the
+        // opposite inner wall) need RAY_FLAG_NONE.
+        uint childInGlass = p.inGlass;
+        uint cullFlags    = childInGlass ? RAY_FLAG_NONE
+                                          : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
         float3 reflectDir   = reflect(WorldRayDirection(), nWorld);
         float3 reflectedRGB = TraceBounce(hitPos + nWorld * 0.001,
                                           reflectDir,
-                                          RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-                                          myDepth + 1);
+                                          cullFlags,
+                                          myDepth + 1, childInGlass);
         finalColor = lerp(finalColor, reflectedRGB, mat.reflectivity);
     }
 

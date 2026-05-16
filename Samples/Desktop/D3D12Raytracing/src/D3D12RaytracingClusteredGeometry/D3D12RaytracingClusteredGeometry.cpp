@@ -767,7 +767,15 @@ static void BuildSharedClusterTrianglesInputs(
 
     outClasDesc = {};
     outClasDesc.ClusterLimits                       = outLimits;
-    outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    // FAST_TRACE: optimise for trace performance over build speed (the typical
+    // static-asset choice; use FAST_OPERATION instead for streaming rebuilds).
+    // ALLOW_DATA_ACCESS: required for the TriangleObjectPositions() HLSL
+    // intrinsic the closest-hit shader uses to compute per-hit normals - the
+    // driver stores the cluster's source positions in/alongside the BVH so the
+    // intrinsic can read them back. Per-cluster ClusterFlags can override with
+    // D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_DISALLOW_DATA_ACCESS to opt some
+    // clusters out (we don't).
+    outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
                                                                : D3D12_VERTEX_FORMAT_COMPRESSED1;
     outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
@@ -968,7 +976,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
     // Sum sizes + compute per-cluster destination offsets in the about-to-be-
     // allocated exact-sized result buffer. ACCELERATION_STRUCTURE alignment
     // (256B) must be respected for every cluster's start address.
-    constexpr UINT64 kAsAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    constexpr UINT64 kClasAlign = D3D12_RAYTRACING_CLAS_BYTE_ALIGNMENT;
     auto alignUp = [](UINT64 x, UINT64 a) { return (x + (a - 1)) & ~(a - 1); };
 
     void* mapped = nullptr;
@@ -981,7 +989,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
     for (UINT i = 0; i < N; ++i)
     {
         destOffsets[i] = packedTotal;
-        packedTotal   += alignUp(sizes[i], kAsAlign);
+        packedTotal   += alignUp(sizes[i], kClasAlign);
         sumActual     += sizes[i];
     }
     D3D12_RANGE noWrite = { 0, 0 };
@@ -1166,7 +1174,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasCompact()
 
     // Sum sizes -> compacted total. The move op packs sequentially with 256B
     // alignment per element.
-    constexpr UINT64 kAsAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    constexpr UINT64 kClasAlign = D3D12_RAYTRACING_CLAS_BYTE_ALIGNMENT;
     auto alignUp = [](UINT64 x, UINT64 a) { return (x + (a - 1)) & ~(a - 1); };
 
     void* mapped = nullptr;
@@ -1205,7 +1213,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasCompact()
     for (UINT i = 0; i < N; ++i)
     {
         sumActual   += sizes[i];
-        packedTotal += alignUp(sizes[i], kAsAlign);
+        packedTotal += alignUp(sizes[i], kClasAlign);
     }
     D3D12_RANGE noWrite = { 0, 0 };
     sizesReadback->Unmap(0, &noWrite);
@@ -1337,7 +1345,7 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
     }
 
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
     blasDesc.MaxArgCount        = N_obj;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = totalClas;
@@ -1589,7 +1597,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 
     D3D12_RTAS_CLUSTER_TEMPLATE_TRIANGLES_INPUTS_DESC tplDesc = {};
     tplDesc.ClusterLimits             = limits;
-    tplDesc.Flags                     = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    tplDesc.Flags                     = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     tplDesc.Mode                      = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     tplDesc.VertexHintFormat          = D3D12_VERTEX_FORMAT_FLOAT32_3;
     tplDesc.VertexInstantiationFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
@@ -1749,7 +1757,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     // ------------------------------------------------------------------
     D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
     instDesc.ClusterLimits     = limits;
-    instDesc.Flags             = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    instDesc.Flags             = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     instDesc.Mode              = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
 
@@ -1775,7 +1783,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 
     // BLAS-from-CLAS prebuild & alloc (single BLAS, EXPLICIT_DESTINATIONS).
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
     blasDesc.MaxArgCount        = 1;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = obj.clusterCount;
@@ -1877,7 +1885,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
 
     D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
     instDesc.ClusterLimits      = limits;
-    instDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    instDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     instDesc.Mode               = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
 
@@ -1912,7 +1920,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
     //    just needs a rebuild/refit to pick up the new root bounds).
     // ------------------------------------------------------------------
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
     blasDesc.MaxArgCount        = 1;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = obj.clusterCount;

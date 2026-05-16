@@ -82,12 +82,20 @@ struct [raypayload] Payload
     // driver; using a dedicated field with single-direction write(caller)
     // + read(closesthit) qualifiers sidesteps the issue.
     uint   depth : write(caller)        : read(closesthit);
-    // 1 = ray is currently INSIDE a glass volume (entered via a refraction
-    // through a glass front face).  closesthit reads this to decide whether
-    // back-face culling is OK on the next bounce - inside-glass child rays
-    // need RAY_FLAG_NONE so they can hit the BACK face of the glass to
-    // refract out, while air-side rays use RAY_FLAG_CULL_BACK_FACING_-
-    // TRIANGLES so they don't see "inside" opaque or grazing-angle objects.
+    // GLASS DEPTH = how many glass volumes the ray is currently inside.
+    // 0 = in air; 1 = inside one glass volume (ordinary case); 2+ = nested
+    // (inside multiple coincident glass volumes simultaneously, which
+    // happens on SELF-INTERSECTING surfaces like the Klein bottle where
+    // the handle's wall physically passes through the body's interior).
+    //
+    // At every refraction we look at the OLD depth vs the NEW depth:
+    //   air → glass (0 → 1): real refraction, eta = 1/ior
+    //   glass → air (1 → 0): real refraction, eta = ior
+    //   glass → glass (n → n±1 with both >0): NO refraction (eta = 1),
+    //                                          ray continues straight.
+    // Without this, a ray inside the body that crosses the handle's wall
+    // would refract spuriously and end up pointing somewhere wrong
+    // (typically down to the floor → sand-coloured "hole" in the bottle).
     uint   inGlass : write(caller)      : read(closesthit);
 };
 struct [raypayload] ShadowPayload
@@ -502,8 +510,34 @@ void GlassHit(inout Payload p, in Attribs a)
 
     if (ctx.mat.refractivity > 0.0 && myDepth <= 4)
     {
-        float  eta        = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE)
-                                ? (1.0 / ctx.mat.ior) : ctx.mat.ior;
+        // REF-COUNTED GLASS DEPTH (handles non-orientable + self-intersecting
+        // surfaces correctly).  Strategy:
+        //   - HitKind() decides ENTERING (front face) vs EXITING (back face)
+        //     for THIS triangle, LOCALLY.  This is geometrically correct
+        //     even on Klein bottle - within a triangle, "front" and "back"
+        //     are well-defined relative to its winding.
+        //   - p.inGlass is a COUNT of how many glass volumes the ray is
+        //     currently inside.  Entering increments, exiting decrements.
+        //   - The eta is chosen by the TRANSITION TYPE:
+        //         old=0 → new=1   : air→glass refraction (eta = 1/ior)
+        //         old=1 → new=0   : glass→air refraction (eta = ior)
+        //         else            : nested glass-glass crossing,
+        //                           eta = 1.0 (NO refraction; ray continues
+        //                           straight).  This is the key fix for
+        //                           self-intersecting glass like the Klein
+        //                           bottle - the handle crossing through
+        //                           the body's interior shouldn't refract
+        //                           since both are the same medium.
+        const bool entering   = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE);
+        const uint oldDepth   = p.inGlass;
+        const uint newDepth   = entering ? (oldDepth + 1u)
+                                          : (oldDepth > 0u ? oldDepth - 1u : 0u);
+        // Eta picks the kind of interface we're crossing.
+        float eta;
+        if      (oldDepth == 0u && newDepth == 1u) eta = 1.0 / ctx.mat.ior; // air → glass
+        else if (oldDepth == 1u && newDepth == 0u) eta = ctx.mat.ior;       // glass → air
+        else                                       eta = 1.0;               // glass → glass (nested)
+
         float3 incident   = WorldRayDirection();
         float3 refractDir = refract(incident, ctx.nWorld, eta);
         float3 refractTint= lerp(float3(1, 1, 1), ctx.clusterCol,
@@ -511,12 +545,13 @@ void GlassHit(inout Payload p, in Attribs a)
 
         if (dot(refractDir, refractDir) < 0.001)
         {
-            // Total internal reflection: full mirror, stays in same medium.
+            // Total internal reflection: full mirror, stays in same medium
+            // (no depth change because reflection doesn't cross the surface).
             tirHappened = true;
             refractDir = reflect(incident, ctx.nWorld);
-            uint childInGlass = p.inGlass;
-            uint cullFlags    = childInGlass ? RAY_FLAG_NONE
-                                              : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+            uint childInGlass = oldDepth;
+            uint cullFlags    = (childInGlass > 0u) ? RAY_FLAG_NONE
+                                                    : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
             float3 tirRGB     = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
                                             refractDir, cullFlags,
                                             myDepth + 1, childInGlass);
@@ -524,22 +559,26 @@ void GlassHit(inout Payload p, in Attribs a)
         }
         else
         {
-            // True refraction with Fresnel-weighted transmission.
-            uint childInGlass = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? 1u : 0u;
-            uint cullFlags    = childInGlass ? RAY_FLAG_NONE
-                                              : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+            // True refraction.  childInGlass = the NEW depth count.
+            uint childInGlass = newDepth;
+            uint cullFlags    = (childInGlass > 0u) ? RAY_FLAG_NONE
+                                                    : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
             float3 refractedRGB = TraceBounce(ctx.hitPos - ctx.nWorld * 0.001,
                                               refractDir, cullFlags,
                                               myDepth + 1, childInGlass);
-            finalColor = lerp(finalColor, refractedRGB * refractTint, Tw);
+            // Glass-glass crossings carry NO Fresnel weighting either -
+            // there's no real reflection at a same-medium boundary.
+            const float weight = (eta == 1.0) ? 1.0 : Tw;
+            finalColor = lerp(finalColor, refractedRGB * refractTint, weight);
         }
     }
 
     if (!tirHappened && ctx.mat.reflectivity > 0.0 && myDepth <= 2)
     {
+        // Reflection keeps the ray in the SAME medium (no depth change).
         uint childInGlass = p.inGlass;
-        uint cullFlags    = childInGlass ? RAY_FLAG_NONE
-                                          : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+        uint cullFlags    = (childInGlass > 0u) ? RAY_FLAG_NONE
+                                                : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
         float3 reflectDir   = reflect(WorldRayDirection(), ctx.nWorld);
         float3 reflectedRGB = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
                                           reflectDir, cullFlags,

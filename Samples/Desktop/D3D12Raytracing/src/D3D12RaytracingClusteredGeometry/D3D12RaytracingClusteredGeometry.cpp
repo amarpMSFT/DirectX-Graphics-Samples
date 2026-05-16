@@ -2739,11 +2739,11 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // Slowly orbit around the scene center. Period = 30s for a full revolution.
     const double t = m_animSeconds;
     const float  angle  = float(t * (2.0 * M_PI / 30.0));
-    const float  radius = 8.0f;                                 // was 6.0 - dollied back so more of the floor fits in frame
-    const float  height = 0.8f;
+    const float  radius = 6.5f;                                 // dollied IN a touch (was 8.0) - frame slightly tighter on the scene
+    const float  height = 1.5f;                                 // eye lifted (was 0.8) - higher vantage
     XMVECTOR eye = XMVectorSet(radius * std::sin(angle), height,
                                -radius * std::cos(angle), 1.0f);
-    XMVECTOR at  = XMVectorSet(0.5f, 1.20f, 0.0f, 1.0f);   // look-at lifted (was 0.2) so the camera tilts UP slightly -> horizon falls into the lower portion of the frame and aligns visually with the floor's back edge instead of leaving a thin sand strip above it
+    XMVECTOR at  = XMVectorSet(0.5f, 0.0f, 0.0f, 1.0f);   // look-at LOWERED (was 1.2) - camera now pitches DOWN noticeably -> floor reads as the dominant surface, sky shrinks to a band at the top, slab gets seen more from above
     XMVECTOR up  = XMVectorSet(0, 1, 0, 0);
 
     XMMATRIX view = XMMatrixLookAtLH(eye, at, up);

@@ -551,78 +551,58 @@ namespace ProceduralGeometry
         const int tilesU = numU / tileUSize;
         const int tilesV = numV / tileVSize;
         m.clusters.reserve((size_t)tilesU * tilesV);
-        const float kPi    = 3.14159265358979323846f;
+        const float kPi = 3.14159265358979323846f;
 
-        // Vertical-extent knob: smaller -> shorter bottle, handle loops
-        // back into body earlier along its parametric arc.  Textbook
-        // value is 16; 13 keeps the recognisable pear-bottle silhouette
-        // while making the handle's loop noticeably tighter.
-        const float kVscale = 13.0f;
-
-        // Lower the handle's two body-entry points (u=0/2π and u=π) so
-        // the handle visibly enters the BODY's lower half rather than
-        // its middle.  Achieved by adding a kEntryDown * cos²(u) bias
-        // to BOTH body and handle z formulas: cos²(u) is 1 at u=0/π/2π
-        // (the join points) and 0 at u=π/2 (body bottom) and u=3π/2
-        // (handle top), so it preserves the existing smooth join at
-        // u=π and leaves the body's bottom + handle's top extents
-        // unchanged.  Result: handle exits/re-enters the body about 75%
-        // from the top (closer to the body's bottom) instead of at
-        // mid-height.
-        // Drop the THIN-side body+handle join point (u=0/2π) DOWN to
-        // make the handle re-enter the bottle further from the top.
-        // The thick-side join (u=π) stays at z=0 (its natural value),
-        // creating an asymmetric bottle where the handle's two ends sit
-        // at different heights - the handle exits the body's thick side
-        // at mid-height and re-enters the thin side LOW on the bulb.
+        // ------------------------------------------------------------------
+        // FIGURE-8 KLEIN BOTTLE IMMERSION (smooth, single closed formula).
         //
-        // Shift function: -kThinDrop * cos²(u/2)
-        //   - = -kThinDrop  at u=0 / u=2π   (thin join: dropped DOWN)
-        //   - = 0           at u=π          (thick join: unchanged)
-        //   - smooth (zero derivative) at all endpoints
-        const float kThinDrop = 7.0f;
-        const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
+        // Earlier this generator used a piecewise (`if u<π / else`) glue
+        // of two parametrics - one for the "body" and one for the
+        // "handle" - to make the silhouette read as a glass bottle.  The
+        // position was C0-continuous at the u=π seam but the DERIVATIVES
+        // weren't, so the central-difference normal calculation averaged
+        // two unrelated slopes and produced garbage normals at the seam
+        // (visible as a triangular sky-coloured "perfect-clear" patch
+        // where refraction shot rays in random directions, often
+        // straight to the sky).
+        //
+        // The canonical figure-8 immersion solves the problem completely:
+        // one closed-form formula, smooth everywhere, with the Klein
+        // topology encoded directly via the u/2 and sin(2v) terms.  The
+        // surface IS continuous and C1 at every u, so central-difference
+        // normals are accurate everywhere.  Visual is a flat-ring sweep
+        // where the cross-section is a figure-8 that rotates by u/2 as
+        // it goes around the ring - this is the "abstract math Klein
+        // bottle" rather than a literal glass bottle, but the
+        // topological inversion (no inside vs outside) is honestly
+        // captured.
+        //
+        //   x(u,v) = (R + r·cos(u/2)·sin(v) − r·sin(u/2)·sin(2v)) · cos(u)
+        //   y(u,v) = (R + r·cos(u/2)·sin(v) − r·sin(u/2)·sin(2v)) · sin(u)
+        //   z(u,v) = r·sin(u/2)·sin(v) + r·cos(u/2)·sin(2v)
+        //
+        //   u ∈ [0, 2π], v ∈ [0, 2π].  R = major (sweep) radius;
+        //   r = minor (figure-8 cross-section) radius.
+        // ------------------------------------------------------------------
+        const float R = 4.0f;      // major sweep radius
+        const float r = 1.6f;      // figure-8 cross-section radius
 
-        // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
-        // surface point at parameter (u, v).  Used both for vertex
-        // positions and for the central-difference normal estimate below.
-        // Handle "narrow factor" - the standard parametric makes the
-        // handle's cross-section as wide as the body bulb at u=π (r=6
-        // there) and narrows as u advances toward 2π.  Multiply the
-        // handle's v-dependent terms by a (1 -> kHandleNarrow) ramp so
-        // the BOTTOM of the handle (the join with the body's thick side
-        // at u=π) stays smooth-matched (scale=1) but the rest of the
-        // handle tapers DOWN to a narrower tube.
-        const float kHandleNarrow = 0.40f;        // tip-end width = 40% of join-end width
-        auto kleinPoint = [kPi, kVscale, kThinDrop, kHandleNarrow](float u, float v) -> float3
+        auto kleinPoint = [R, r](float u, float v) -> float3
         {
-            const float cu = std::cos(u), su = std::sin(u);
-            const float cv = std::cos(v);
-            const float r  = 4.0f * (1.0f - cu * 0.5f);
-            // Thin-side drop: cos²(u/2) = (1+cos(u))/2 is 1 at u=0/2π
-            // (thin join) and 0 at u=π (thick join).  Subtracted so it
-            // pulls the thin join DOWN.  Slope is sin(u)/2 = 0 at all
-            // u=0,π,2π so the join is smooth on both ends.
-            const float halfCos = std::cos(u * 0.5f);
-            const float thinShift = -kThinDrop * halfCos * halfCos;
-            float x, z, y;
-            if (u < kPi)
-            {
-                x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                z = -kVscale * su           - r * su * cv + thinShift;
-                y = r * std::sin(v);
-            }
-            else
-            {
-                // No additional handle taper - we narrowed the global r
-                // function (4.0 -> 2.5) so body+handle are uniformly
-                // slim, no wide-flange-at-the-join discontinuity.
-                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -kVscale * su                          + thinShift;
-                y = r * std::sin(v);
-            }
-            return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
+            const float cu  = std::cos(u),       su  = std::sin(u);
+            const float cv  = std::sin(v),       sv2 = std::sin(2.0f * v);
+            const float cu2 = std::cos(u * 0.5f), su2 = std::sin(u * 0.5f);
+            const float radial = R + r * cu2 * cv - r * su2 * sv2;
+            const float x = radial * cu;
+            const float y = radial * su;
+            const float z = r * su2 * cv + r * cu2 * sv2;
+            return { x, y, z };
         };
+
+        // Bottle scale: the figure-8 immersion's dominant extent is
+        // 2*(R+r) along x and y.  Map that to the user's bottleScale so
+        // the bottle's diameter ≈ 2*bottleScale.
+        const float invSpan = bottleScale / (R + r);
 
         unsigned int clusterCounter = firstClusterID;
         for (int tu = 0; tu < tilesU; ++tu)
@@ -645,11 +625,9 @@ namespace ProceduralGeometry
 
                 float3 p = kleinPoint(u, v);
 
-                // Central-difference partials Pu, Pv of the (u, v)
-                // parametrisation -> normal = Pu x Pv.  Computed in
-                // original-axis space; the same axis remap that swaps
-                // position into world space is applied to the normal
-                // below so they stay consistent.
+                // Central-difference partials Pu, Pv -> normal = Pu x Pv.
+                // SAFE everywhere now: the formula is a single smooth
+                // closed-form, no piecewise branches to straddle.
                 const float h = 1e-3f;
                 float3 pu1 = kleinPoint(u + h, v);
                 float3 pu0 = kleinPoint(u - h, v);
@@ -668,21 +646,16 @@ namespace ProceduralGeometry
                 if (L < 1e-12f) { n = { 0, 1, 0 }; L = 1; }
                 n.x /= L; n.y /= L; n.z /= L;
 
-                // Output axes:  world X = bottle's wide axis (orig x);
-                //               world Y = bottle's height axis (orig z);
-                //               world Z = bottle's depth axis (orig y).
+                // Output axes: world Y is UP for the scene.  The figure-8
+                // immersion has its sweep ring in the (x, y) plane and
+                // its "thickness" along z, so we lift z to world Y so
+                // the ring lies flat-ish above the floor.
                 c.positions.push_back({ invSpan * p.x,
                                         invSpan * p.z,
                                         invSpan * p.y });
-                // Same axis remap for normal (rotation x->x, z->y, y->z).
                 c.normals.push_back  ({ n.x, n.z, n.y });
             }
-            // Two CCW triangles per quad. Winding is consistent with the
-            // outward-facing normal of the parametric (u, v) surface so
-            // RAY_FLAG_CULL_BACK_FACING_TRIANGLES on primary rays sees
-            // the front of every sheet (including the inner neck after
-            // it pierces the body, since its u-range puts it on the
-            // "other side" of the parametrisation).
+            // Two CCW triangles per quad.
             for (int li = 0; li < tileUSize; ++li)
             for (int lj = 0; lj < tileVSize; ++lj)
             {

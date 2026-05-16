@@ -31,42 +31,45 @@ struct SceneConstantBuffer
                                  //        readable instead of pitch black)
 };
 
-// Material kinds (one per scene instance).
-//   OPAQUE:       diffuse + shadow only. Instance gets FORCE_OPAQUE flag, so
-//                 the any-hit shader is never invoked - cheapest path.
-//   REFLECTIVE:   diffuse + shadow PLUS one-bounce reflection. Mixed by
-//                 reflectivity.
-//   REFRACTIVE:   diffuse + shadow PLUS one-bounce refraction (Snell's law,
-//                 IOR per material). Mixed by translucency. Animated sphere
-//                 uses this to morph the distortion of what's behind it.
-//   STOCHASTIC:   diffuse + shadow but the any-hit shader probabilistically
-//                 rejects per triangle (probability = translucency), giving
-//                 a noisy "frosted-glass" partial transparency. NOT marked
-//                 FORCE_OPAQUE on the instance.
-#define MAT_KIND_OPAQUE      0u
-#define MAT_KIND_REFLECTIVE  1u
-#define MAT_KIND_REFRACTIVE  2u
-#define MAT_KIND_STOCHASTIC  3u
-
+// Per-instance material.  Each instance carries an independent BLEND of
+// optical effects rather than a single "kind" - so a chrome sphere with
+// frosted holes punched through it is just `reflectivity=0.85,
+// translucency=0.40` on the same MaterialDesc.  Closesthit composes the
+// final colour as:
+//
+//   base = baseColor * cluster_palette                 (per-cluster tint)
+//   surface = base * (ambient + (1-ambient)*NdotL*shadow)
+//
+//   if (refractivity > 0 && depth <= 1)
+//       refracted = TraceBounce(refracted_dir, depth+1)
+//       surface   = lerp(surface, refracted, refractivity)
+//
+//   if (reflectivity > 0 && depth == 0)
+//       reflected = TraceBounce(reflected_dir, depth+1)
+//       surface   = lerp(surface, reflected, reflectivity)
+//
+// AnyHit fires for any instance whose translucency > 0 OR whose
+// refractivity > 0 (those instances do NOT get FORCE_OPAQUE).  AnyHit
+// only does the stochastic reject - refraction is handled in closesthit
+// via the bounce ray.
+//   - translucency  -> per-triangle hash; IgnoreHit() if random <
+//                      translucency.  Gives "frosted-glass" speckle.
+//   - refractivity  -> AnyHit accepts unconditionally; closesthit's
+//                      Snell-bend ray delivers the see-through.
+//
+// Per-instance FORCE_OPAQUE flag (and per-cluster OPAQUE flag) is set
+// when BOTH translucency == 0 AND refractivity == 0 - opaque materials
+// (with or without reflection) skip any-hit dispatch entirely.
 #define NUM_MATERIAL_SLOTS   9u   // 4 spheres + torus + cube + floor + animated + klein
 
 struct MaterialDesc
 {
-    // baseColor.xyz multiplies the shader's per-cluster colour. For our demo
-    // we always set it to (1,1,1) so the cluster-rainbow shows through every
-    // material. baseColor.w is unused.
+    // baseColor.xyz multiplies the shader's per-cluster colour.  Use
+    // (1,1,1) to let the cluster-rainbow show through unmodified, or a
+    // tint to colour-grade the whole instance.  baseColor.w is unused.
     XMFLOAT4 baseColor;
-    // params.x = reflectivity in [0..1]   (REFLECTIVE only)
-    // params.y = translucency in [0..1]   (REFRACTIVE: blend of refract vs
-    //                                       surface; STOCHASTIC: any-hit
-    //                                       reject probability)
-    // params.z = index of refraction       (REFRACTIVE only; e.g. 1.5 = glass)
-    // params.w = unused
-    XMFLOAT4 params;
-    // .x = MAT_KIND_*; the rest is padding so the struct is 16-byte-aligned
-    // for both HLSL StructuredBuffer reads and CPU upload.
-    uint     kind;
-    uint     _pad0;
-    uint     _pad1;
-    uint     _pad2;
+    float    reflectivity;   // [0..1] mirror-reflection blend at depth 0
+    float    refractivity;   // [0..1] Snell-refraction blend at depth 0+1
+    float    ior;            // refractive index (1.5=glass, 1.33=water, ignored if refractivity==0)
+    float    translucency;   // [0..1] stochastic any-hit reject probability
 };

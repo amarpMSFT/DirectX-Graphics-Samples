@@ -136,6 +136,14 @@ private:
     // Ignored in COMPRESSED1 mode (the union slot is taken by
     // MaxCompressedClusterPositionsSize there).
     UINT                                 m_positionTruncateBits = 12;
+
+    // ANTIALIASING / SUPERSAMPLING.  How many primary rays per output pixel,
+    // each at a different sub-pixel jitter offset.  Set via --aa-samples N
+    // (1, 2, or 4).  Default 1 keeps the sample stable on Debug builds (4x
+    // jitter + recursive reflection/refraction is heavy on the CPU-side
+    // shader validation; on Release a 4090 handles 4 samples comfortably).
+    // Pass-through to the raygen shader is via SceneConstantBuffer.miscParams.z.
+    UINT                                 m_aaSamplesPerPixel = 4;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)

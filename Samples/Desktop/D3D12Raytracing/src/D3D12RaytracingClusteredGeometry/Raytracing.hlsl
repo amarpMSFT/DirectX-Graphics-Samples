@@ -79,32 +79,69 @@ void RayGen()
     uint2 pixel = DispatchRaysIndex().xy;
     uint2 dim   = DispatchRaysDimensions().xy;
 
-    float2 ndc = ((float2(pixel) + 0.5) / float2(dim)) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
+    float aspect = g_scene.miscParams.x;
+    float tanH   = g_scene.miscParams.y;
+    // Sub-pixel sample count comes from the host (1, 2, or 4) via the
+    // SceneConstantBuffer.  Floats are easier to ship across the CB than
+    // ints; we round + clamp to the nearest valid count.
+    uint  samples = (uint)(g_scene.miscParams.z + 0.5);
+    if (samples >= 4)      samples = 4;
+    else if (samples >= 2) samples = 2;
+    else                   samples = 1;
 
-    float  aspect   = g_scene.miscParams.x;
-    float  tanH     = g_scene.miscParams.y;
-    float3 dirView  = normalize(float3(ndc.x * aspect * tanH, ndc.y * tanH, 1.0));
-    float3 dirWorld = mul((float3x3)g_scene.viewToWorld, dirView);
+    // Sub-pixel sample positions in [0,1]^2 within the pixel.  4-sample =
+    // standard 4-rotated-grid 4xMSAA pattern (hits 4 distinct horizontal
+    // AND vertical positions, breaks staircase on both axes).  2-sample =
+    // diagonal pair.  1-sample = pixel centre.  Each sample arrives at the
+    // same closesthit at slightly different barycentrics, so the Hash() in
+    // the stochastic any-hit also returns N different random values per
+    // pixel - 4x supersampling does free noise reduction on the frosted-
+    // glass surfaces in addition to edge antialiasing.
+    static const float2 kSubPixel4[4] = {
+        float2(0.125, 0.625),
+        float2(0.375, 0.125),
+        float2(0.625, 0.875),
+        float2(0.875, 0.375),
+    };
+    static const float2 kSubPixel2[2] = {
+        float2(0.25, 0.25),
+        float2(0.75, 0.75),
+    };
 
-    RayDesc r;
-    r.Origin    = g_scene.cameraPosition.xyz;
-    r.Direction = dirWorld;
-    r.TMin      = 0.001;
-    r.TMax      = 1000.0;
+    float3 accum = float3(0, 0, 0);
+    for (uint s = 0; s < samples; ++s)
+    {
+        float2 sub;
+        if      (samples == 4) sub = kSubPixel4[s];
+        else if (samples == 2) sub = kSubPixel2[s];
+        else                   sub = float2(0.5, 0.5);
 
-    Payload p;
-    p.color = float4(0, 0, 0, 1);
-    p.depth = 0;
-    TraceRay(Scene,
-        RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-        /*InstanceInclusionMask*/0xff,
-        /*RayContributionToHitGroupIndex*/0,
-        /*MultiplierForGeometryContributionToHitGroupIndex*/0,
-        /*MissShaderIndex*/0,
-        r, p);
+        float2 ndc = ((float2(pixel) + sub) / float2(dim)) * 2.0 - 1.0;
+        ndc.y = -ndc.y;
 
-    Output[pixel] = p.color;
+        float3 dirView  = normalize(float3(ndc.x * aspect * tanH, ndc.y * tanH, 1.0));
+        float3 dirWorld = mul((float3x3)g_scene.viewToWorld, dirView);
+
+        RayDesc r;
+        r.Origin    = g_scene.cameraPosition.xyz;
+        r.Direction = dirWorld;
+        r.TMin      = 0.001;
+        r.TMax      = 1000.0;
+
+        Payload p;
+        p.color = float4(0, 0, 0, 1);
+        p.depth = 0;
+        TraceRay(Scene,
+            RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+            /*InstanceInclusionMask*/0xff,
+            /*RayContributionToHitGroupIndex*/0,
+            /*MultiplierForGeometryContributionToHitGroupIndex*/0,
+            /*MissShaderIndex*/0,
+            r, p);
+        accum += p.color.rgb;
+    }
+
+    Output[pixel] = float4(accum / (float)samples, 1);
 }
 
 [shader("miss")]
@@ -212,20 +249,21 @@ float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth)
 [shader("anyhit")]
 void AnyHit(inout Payload p, in Attribs a)
 {
-    // Stochastic translucency: probabilistic per-triangle reject. Only fires
-    // for instances that aren't FORCE_OPAQUE - i.e. REFRACTIVE + STOCHASTIC.
-    // For REFRACTIVE we always accept (closest-hit handles refraction). For
-    // STOCHASTIC we hash and IgnoreHit a fraction of the time.
+    // Stochastic translucency: probabilistic per-triangle reject. Only
+    // fires for instances that aren't FORCE_OPAQUE - which is set when
+    // BOTH translucency==0 AND refractivity==0.  So we get here for
+    // (translucency>0)  : maybe IgnoreHit
+    // (refractivity>0)  : always accept (closesthit handles refraction)
+    // (both>0)          : maybe IgnoreHit; if accepted, closesthit refracts
     MaterialDesc mat = g_materials[InstanceID()];
-    if (mat.kind == MAT_KIND_STOCHASTIC)
+    if (mat.translucency > 0.0)
     {
         uint cid = ClusterID();
         float r = Hash(cid, a.bary);
-        if (r < mat.params.y)               // params.y = translucency
+        if (r < mat.translucency)
             IgnoreHit();
     }
-    // OPAQUE / REFLECTIVE never reach here (FORCE_OPAQUE skips any-hit).
-    // REFRACTIVE: fall through, accept the hit.
+    // Otherwise fall through, accept the hit.
 }
 
 [shader("closesthit")]
@@ -258,46 +296,36 @@ void Hit(inout Payload p, in Attribs a)
     float lit        = ambient + (1.0 - ambient) * NdotL * visibility;
     float3 surfaceColor = base * lit;
 
-    float3 finalColor = surfaceColor;
-    // Recursion-cap via the dedicated payload .depth field (caller writes,
-    // closesthit reads). REFLECTIVE bounces only at depth 0 (one mirror
-    // bounce). REFRACTIVE bounces at depths 0 AND 1: at depth 0 we refract
-    // INTO the glass; at depth 1 the ray inside the glass hits the back
-    // face and we refract OUT, so the camera sees the world behind the
-    // glass (the proper thin-medium approximation). Depth 2 closesthits
-    // render diffuse-only - their only TraceRay is the shadow ray, which
-    // becomes depth 3 (the leaf, MaxRecursionDepth=3 just barely accepts).
+    // Compose optical effects.  Order: surface -> refraction -> reflection.
+    // Each effect is a `lerp` so it composites over whatever's already in
+    // finalColor at that point.  Recursion-cap via the dedicated payload
+    // .depth field (caller writes, closesthit reads):
+    //
+    //   - reflectivity bounces only at depth 0 (one mirror bounce)
+    //   - refractivity bounces at depths 0 AND 1 (enter glass + exit
+    //     glass = the proper thin-medium approximation; the inside-the-
+    //     glass closesthit at depth 1 hits the BACK face and refracts
+    //     OUT, so the camera sees the world behind the glass).
+    //
+    // Pipeline MaxRecursionDepth=3 means the depth-2 refraction-exit's
+    // shadow ray (which becomes depth 3) is the leaf.
     const uint myDepth = p.depth;
-    if (myDepth == 0 && mat.kind == MAT_KIND_REFLECTIVE)
+    float3 finalColor = surfaceColor;
+
+    if (mat.refractivity > 0.0 && myDepth <= 1)
     {
-        // One-bounce mirror reflection. Reflected ray uses back-face culling
-        // (we don't expect to enter solid objects).
-        float3 reflectDir   = reflect(WorldRayDirection(), nWorld);
-        float3 reflectedRGB = TraceBounce(hitPos + nWorld * 0.001,
-                                          reflectDir,
-                                          RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-                                          myDepth + 1);
-        finalColor = lerp(surfaceColor, reflectedRGB, mat.params.x);  // params.x = reflectivity
-    }
-    else if (myDepth <= 1 && mat.kind == MAT_KIND_REFRACTIVE)
-    {
-        // Two-interface refraction (proper thin-medium glass).
-        //   depth 0 hit: front face from outside  -> refract air -> glass
-        //   depth 1 hit: back face from inside    -> refract glass -> air
-        // Snell ratio eta = n_outside / n_inside for entering, the inverse
-        // for exiting. We assume air (n=1) outside the material and the
-        // material's IOR inside. HitKind() told us which face we hit; we
-        // already flipped nWorld accordingly so the normal always points
-        // TOWARD the incoming ray's origin - which is exactly what HLSL
-        // refract() expects for `normal` (the second arg).
-        float ior  = mat.params.z;
-        float eta  = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? (1.0 / ior) : ior;
-        float3 incident    = WorldRayDirection();
-        float3 refractDir  = refract(incident, nWorld, eta);
+        // Snell ratio eta = n_outside / n_inside for entering, the
+        // inverse for exiting. We assume air (n=1) outside.  HitKind()
+        // told us which face we hit; we already flipped nWorld so the
+        // normal points TOWARD the incoming ray's origin, which is what
+        // HLSL refract() expects.
+        float eta  = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? (1.0 / mat.ior) : mat.ior;
+        float3 incident   = WorldRayDirection();
+        float3 refractDir = refract(incident, nWorld, eta);
         if (dot(refractDir, refractDir) < 0.001)
         {
-            // Total internal reflection: refract() returns 0; fall back to
-            // a mirror reflection of the incoming ray.
+            // Total internal reflection: refract() returns 0; fall back
+            // to a mirror reflection of the incoming ray.
             refractDir = reflect(incident, nWorld);
         }
         // Refracted ray must NOT cull back-facing - we want to allow
@@ -306,14 +334,21 @@ void Hit(inout Payload p, in Attribs a)
                                           refractDir,
                                           RAY_FLAG_NONE,
                                           myDepth + 1);
-        finalColor = lerp(surfaceColor, refractedRGB, mat.params.y);  // params.y = translucency
+        finalColor = lerp(finalColor, refractedRGB, mat.refractivity);
     }
-    // OPAQUE + STOCHASTIC: surfaceColor as-is. STOCHASTIC's "transparency" is
-    // delivered by the any-hit shader rejecting some hits on the way in,
-    // which means closest-hit never even runs for the rejected triangles.
-    // OPAQUE + STOCHASTIC: surfaceColor as-is. STOCHASTIC's "transparency" is
-    // delivered by the any-hit shader rejecting some hits on the way in,
-    // which means closest-hit never even runs for the rejected triangles.
+
+    if (mat.reflectivity > 0.0 && myDepth == 0)
+    {
+        // One-bounce mirror reflection.  Reflected ray uses back-face
+        // culling - we don't expect to enter solid objects from a mirror
+        // bounce.
+        float3 reflectDir   = reflect(WorldRayDirection(), nWorld);
+        float3 reflectedRGB = TraceBounce(hitPos + nWorld * 0.001,
+                                          reflectDir,
+                                          RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                                          myDepth + 1);
+        finalColor = lerp(finalColor, reflectedRGB, mat.reflectivity);
+    }
 
     p.color = float4(finalColor, 1);
 }

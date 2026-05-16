@@ -351,10 +351,10 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // layered visual complexity.
     add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
             /*bottleScale*/0.55f,
-            /*numU*/64, /*numV*/32,                                       // higher res for the curvy bottle
-            /*tileUSize*/8, /*tileVSize*/8,
+            /*numU*/32, /*numV*/16,                                       // matches torus / sphere2 res
+            /*tileUSize*/4, /*tileVSize*/4,
             /*firstClusterID*/700),
-        XMFLOAT3(3.6f, 0.0f, 0.0f), 1.0f, 8);                             // 8x4 = 32 klein clusters, 4096 tris
+        XMFLOAT3(3.6f, 0.0f, 0.0f), 1.0f, 8);                             // 8x4 = 32 klein clusters, 1024 tris
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -636,65 +636,63 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 // =====================================================================================
 // Per-instance material assignment + upload to a structured buffer.
 //
-// 8 slots, indexed by InstanceID() in HLSL:
-//   0  large sphere       OPAQUE diffuse
-//   1  medium sphere      REFLECTIVE (chrome-ish, reflectivity 0.85)
-//   2  small sphere       STOCHASTIC translucent (any-hit, 50% reject)
-//   3  smallest sphere    OPAQUE diffuse
-//   4  torus              OPAQUE diffuse
-//   5  cube               REFLECTIVE (polished metal, reflectivity 0.40)
-//   6  floor              OPAQUE diffuse + per-cluster OPAQUE flag
-//   7  ANIMATED sphere    REFRACTIVE glass (IOR 1.5, translucency 0.7) -
-//                         the morphing surface gives an animated distortion
-//                         of the world behind it.
+// 9 slots, indexed by InstanceID() in HLSL.  Every object in this scene
+// has reflectivity > 0 (the user wanted everything mirror-tinged); a
+// subset additionally has translucency or refractivity to demo any-hit
+// stochastic transparency / Snell-law refraction.  Stacking is allowed -
+// e.g., the Klein bottle is BOTH partly reflective AND frosted.
 //
-// Material kind drives both per-instance flags and HLSL behavior:
-//   OPAQUE      -> instance gets D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE
-//                  (any-hit shader is never invoked for primary OR shadow)
-//   REFLECTIVE  -> instance gets FORCE_OPAQUE (reflective surfaces are still
-//                  fully opaque to ray traversal; reflection just adds bounce)
-//   REFRACTIVE  -> instance gets NO opaque flag - any-hit fires per triangle
-//                  (we use it as the dispatch entry point for the refraction
-//                  bounce, though the closest-hit handles the actual logic)
-//   STOCHASTIC  -> instance gets NO opaque flag - any-hit fires per triangle
-//                  and decides per-hit whether to accept (let closest-hit
-//                  light it) or IgnoreHit (continue past, see what's behind)
+//   0  large sphere       diffuse + soft 20% reflection                (matte plastic)
+//   1  medium sphere      85% mirror reflection                        (chrome)
+//   2  small sphere       40% reflection + 50% stochastic translucency (frosted mirror)
+//   3  smallest sphere    35% reflection                               (warm metal)
+//   4  torus              25% reflection                               (brushed brass)
+//   5  cube               60% reflection                               (polished steel)
+//   6  floor              15% reflection                               (wet stone)
+//   7  ANIMATED sphere    20% reflection + 70% refraction (IOR 1.5)    (animated glass)
+//   8  Klein bottle       30% reflection + 55% stochastic translucency (frosted purple)
+//
+// Per-instance flags are derived from the floats:
+//   translucency==0 && refractivity==0  -> FORCE_OPAQUE (any-hit skipped)
+//   otherwise                            -> NO opaque flag (any-hit fires)
+// (A 100% reflective surface is still fully OPAQUE to ray traversal -
+//  reflection is composed in closesthit, not in any-hit.)
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildMaterials()
 {
     auto device = m_deviceResources->GetD3DDevice();
 
-    // Helper to fill a slot with sane defaults then customise.
-    auto set = [&](UINT slot, UINT kind, float reflectivity, float translucency, float ior)
+    auto set = [&](UINT slot, float r, float g, float b,
+                   float reflectivity, float refractivity, float ior, float translucency)
     {
         MaterialDesc m = {};
-        m.baseColor.x = 1.0f;
-        m.baseColor.y = 1.0f;
-        m.baseColor.z = 1.0f;
-        m.baseColor.w = 0.0f;
-        m.params.x    = reflectivity;
-        m.params.y    = translucency;
-        m.params.z    = ior;
-        m.params.w    = 0.0f;
-        m.kind        = kind;
+        m.baseColor.x  = r;
+        m.baseColor.y  = g;
+        m.baseColor.z  = b;
+        m.baseColor.w  = 0.0f;
+        m.reflectivity = reflectivity;
+        m.refractivity = refractivity;
+        m.ior          = ior;
+        m.translucency = translucency;
         m_materials[slot] = m;
     };
-    set(0, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
-    set(1, MAT_KIND_REFLECTIVE,  0.85f, 0.0f, 0.0f);
-    set(2, MAT_KIND_STOCHASTIC,  0.0f, 0.50f, 0.0f);
-    set(3, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
-    set(4, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
-    set(5, MAT_KIND_REFLECTIVE,  0.40f, 0.0f, 0.0f);
-    set(6, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
-    set(7, MAT_KIND_REFRACTIVE,  0.0f, 0.70f, 1.50f);
-    set(8, MAT_KIND_STOCHASTIC,  0.0f, 0.55f, 0.0f);    // Klein bottle - frosted-glass
+    //   slot  R     G     B    refl  refr  ior   trans
+    set(0,    0.95f, 0.55f, 0.35f, 0.20f, 0.0f,  0.0f, 0.0f);  // sphere0  warm matte
+    set(1,    0.95f, 0.95f, 1.00f, 0.85f, 0.0f,  0.0f, 0.0f);  // sphere1  chrome
+    set(2,    0.40f, 0.85f, 0.65f, 0.40f, 0.0f,  0.0f, 0.50f); // sphere2  frosted mirror
+    set(3,    0.40f, 0.55f, 0.95f, 0.35f, 0.0f,  0.0f, 0.0f);  // sphere3  blue metal
+    set(4,    0.95f, 0.80f, 0.40f, 0.25f, 0.0f,  0.0f, 0.0f);  // torus    brass
+    set(5,    1.00f, 0.85f, 0.55f, 0.60f, 0.0f,  0.0f, 0.0f);  // cube     copper-mirror
+    set(6,    0.45f, 0.45f, 0.50f, 0.15f, 0.0f,  0.0f, 0.0f);  // floor    wet stone
+    set(7,    0.85f, 0.92f, 1.00f, 0.20f, 0.70f, 1.5f, 0.0f);  // animated glass
+    set(8,    0.65f, 0.40f, 0.90f, 0.30f, 0.0f,  0.0f, 0.55f); // klein    frosted purple
 
     AllocateUploadBuffer(device, m_materials.data(),
                          m_materials.size() * sizeof(MaterialDesc),
                          &m_materialsBuffer, L"Per-instance materials");
 
     SampleLog::LogF(L"[materials] %u slots; refractive ior=%.2f for slot 7 (animated sphere)\n",
-                    (unsigned)m_materials.size(), m_materials[7].params.z);
+                    (unsigned)m_materials.size(), m_materials[7].ior);
 }
 
 //
@@ -807,19 +805,20 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         a.TriangleCount                     = (UINT16)(src.indices.size() / 3);
         a.VertexCount                       = (UINT16)src.positions.size();
         // Per-cluster OPAQUE flag: lives in the upper bits of
-        // BaseGeometryIndexAndFlags. We set it for every cluster of an
-        // OPAQUE-kind material; for translucent (REFRACTIVE / STOCHASTIC)
-        // materials we leave it off so the any-hit shader can fire.
-        // REFLECTIVE counts as opaque from a traversal POV (reflection only
-        // adds a recursive ray; it doesn't change visibility).
-        //
-        // This is partially redundant with the per-instance FORCE_OPAQUE
-        // flag we set on the TLAS instance descs, but the per-cluster flag
-        // demonstrates that opacity can be controlled at cluster
-        // granularity (e.g. an LOD where some clusters are foliage cards
-        // requiring any-hit and others are solid trunks that don't).
-        const UINT matKind = m_materials[obj.instanceID].kind;
-        const bool isOpaqueLike = (matKind == MAT_KIND_OPAQUE) || (matKind == MAT_KIND_REFLECTIVE);
+        // BaseGeometryIndexAndFlags. We set it for every cluster of a
+        // material whose translucency==0 AND refractivity==0 (i.e. no
+        // any-hit work).  Reflective surfaces still count as fully opaque
+        // to traversal - reflection only adds a recursive ray; it doesn't
+        // change per-triangle visibility.  Materials with stochastic alpha
+        // or Snell refraction need any-hit to fire, so we leave the flag
+        // off.  This is partially redundant with the per-instance
+        // FORCE_OPAQUE flag set on the TLAS instance desc, but the per-
+        // cluster flag demonstrates that opacity can be controlled at
+        // cluster granularity (e.g. an LOD where some clusters are
+        // foliage cards requiring any-hit and others are solid trunks
+        // that don't).
+        const auto& mat = m_materials[obj.instanceID];
+        const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
         a.BaseGeometryIndexAndFlags         = isOpaqueLike
             ? D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
             : 0u;
@@ -2166,14 +2165,16 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     // a fixed GVA (EXPLICIT_DESTINATIONS), so this array is good for the life
     // of the sample - only the TLAS BVH itself needs per-frame rebuild to
     // pick up the animated BLAS's new root bounds.
-    // Decide per-instance flags from material kind. OPAQUE + REFLECTIVE
-    // surfaces get FORCE_OPAQUE so any-hit never runs (cheaper traversal,
-    // and reflective surfaces don't need any-hit logic anyway). REFRACTIVE
-    // and STOCHASTIC need any-hit to fire so the closest-hit / any-hit
-    // shaders can run their per-hit dispatch.
-    auto flagsForKind = [](UINT kind) -> D3D12_RAYTRACING_INSTANCE_FLAGS
+    // Per-instance flags: instances whose material has translucency==0 AND
+    // refractivity==0 get FORCE_OPAQUE so any-hit never runs (cheaper
+    // traversal).  Reflective surfaces can still be FORCE_OPAQUE because
+    // reflection is composed in closesthit, not in any-hit.  Refractive
+    // and stochastic-translucent instances need any-hit to fire, so they
+    // get NONE.
+    auto flagsForMat = [](const MaterialDesc& mat) -> D3D12_RAYTRACING_INSTANCE_FLAGS
     {
-        return (kind == MAT_KIND_OPAQUE || kind == MAT_KIND_REFLECTIVE)
+        const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
+        return isOpaqueLike
             ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE
             : D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
     };
@@ -2196,7 +2197,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         instances[i].InstanceID                          = obj.instanceID;
         instances[i].InstanceMask                        = 0xFF;
         instances[i].InstanceContributionToHitGroupIndex = 0;
-        instances[i].Flags = flagsForKind(m_materials[obj.instanceID].kind);
+        instances[i].Flags = flagsForMat(m_materials[obj.instanceID]);
         instances[i].AccelerationStructure               = obj.blasGPUVA;
     }
     if (m_animatedObjectEnabled)
@@ -2208,7 +2209,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         instances[N_static].InstanceID                          = a.instanceID;
         instances[N_static].InstanceMask                        = 0xFF;
         instances[N_static].InstanceContributionToHitGroupIndex = 0;
-        instances[N_static].Flags = flagsForKind(m_materials[a.instanceID].kind);
+        instances[N_static].Flags = flagsForMat(m_materials[a.instanceID]);
         instances[N_static].AccelerationStructure               = a.blasGPUVA;
     }
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
@@ -2512,11 +2513,22 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for the shader to traverse a
     // BLAS built from CLAS. Without it, hits on a Cluster BLAS are undefined.
     auto pipelineConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-    // MaxRecursionDepth = 3: primary -> reflection/refraction -> shadow on
-    // the bounced surface. Without 3, the bounced closesthit can't trace
-    // its own shadow ray and the reflective/refractive surfaces would render
-    // unshadowed.
-    pipelineConfig->Config(3, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    // MaxRecursionDepth = 5: budget for the deepest call tree this scene
+    // can produce.  Worst-case path is
+    //   raygen TraceRay      -> recursion 1 (primary closesthit)
+    //   TraceRay reflect      -> recursion 2 (bounce closesthit on a glass
+    //                                          surface)
+    //   TraceRay refract-in   -> recursion 3 (inside the glass, hits back
+    //                                          face)
+    //   TraceRay refract-out  -> recursion 4 (outside, lit by sun)
+    //   TraceRay shadow       -> recursion 5 (LEAF: SKIP_CLOSEST_HIT, no
+    //                                          further TraceRays)
+    // MaxRecursionDepth=3 (the previous value) was exactly enough for the
+    // pure reflect+shadow OR pure refract-enter+exit paths but EXCEEDED on
+    // the reflect-then-refract cascade, producing GPU TDR hangs as soon
+    // as any reflective material's bounce ray happened to land on the
+    // refractive sphere.
+    pipelineConfig->Config(5, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -2637,7 +2649,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     XMStoreFloat4(&cb.cameraPosition, eye);
     cb.miscParams.x = (float)m_width / (float)m_height;
     cb.miscParams.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60deg vertical FOV
-    cb.miscParams.z = 0;
+    cb.miscParams.z = (float)m_aaSamplesPerPixel;                  // raygen sample count (1/2/4)
     cb.miscParams.w = 0;
     // Sun in upper-back-right. Direction TO the light, normalized. .w is the
     // ambient floor: even fully-shadowed pixels get this fraction of base
@@ -3019,5 +3031,6 @@ HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path
     if (FAILED(hr = encoder->Commit())) return cleanup(hr);
     return cleanup(S_OK);
 }
+
 
 

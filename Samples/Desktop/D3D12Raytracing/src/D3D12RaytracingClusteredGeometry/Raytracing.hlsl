@@ -181,14 +181,19 @@ void Miss(inout Payload p)
     float3 d = normalize(WorldRayDirection());
     float  y = d.y;
 
-    // Two sky bands above the horizon.
-    float3 zenith   = float3(0.10, 0.13, 0.30);  // deep dusk
-    float3 midSky   = float3(0.45, 0.32, 0.40);  // mauve transition
-    float3 horizon  = float3(0.95, 0.55, 0.25);  // warm sunset orange
+    // Three sky bands above the horizon - sky-blue overhead, mauve
+    // transition, warm sunset orange just above the horizon line.
+    float3 zenith   = float3(0.40, 0.60, 0.85);  // proper sky-blue overhead
+    float3 midSky   = float3(0.65, 0.55, 0.55);  // warm-mauve transition
+    float3 horizon  = float3(0.95, 0.55, 0.25);  // sunset orange (kept hot)
     float  tSky     = saturate(y);               // 0 at horizon, 1 at zenith
     float3 sky      = lerp(horizon,
-                           lerp(midSky, zenith, smoothstep(0.0, 0.6, tSky)),
-                           smoothstep(0.0, 0.4, tSky));
+                           lerp(midSky, zenith, smoothstep(0.0, 0.45, tSky)),
+                           smoothstep(0.0, 0.20, tSky));   // squeeze the sunset
+                                                           // band into the lower
+                                                           // 20% so the rest of
+                                                           // the dome reads
+                                                           // BLUE not orange.
 
     // Ground band below the horizon - dirt brown deepening with depth.
     float3 ground   = lerp(float3(0.42, 0.30, 0.18),

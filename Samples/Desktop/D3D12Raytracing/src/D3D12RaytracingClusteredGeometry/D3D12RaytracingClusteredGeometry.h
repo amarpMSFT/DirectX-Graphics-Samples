@@ -158,7 +158,7 @@ private:
     // material colours.  Set to 0 via --cluster-tint 0 for pure material
     // rendering, 1 for the original "cluster rainbow dominates everything"
     // look.
-    float                                m_clusterTint = 0.50f;
+    float                                m_clusterTint = 0.60f;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)

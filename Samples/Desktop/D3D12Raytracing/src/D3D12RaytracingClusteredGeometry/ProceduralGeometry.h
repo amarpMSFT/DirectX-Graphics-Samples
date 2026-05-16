@@ -388,12 +388,18 @@ namespace ProceduralGeometry
         const int tilesV = numV / tileVSize;
         m.clusters.reserve((size_t)tilesU * tilesV);
         const float kPi    = 3.14159265358979323846f;
-        const float invSpan = bottleScale / 16.0f;     // normalises z extent to [-bottleScale, bottleScale]
+
+        // Vertical-extent knob: smaller -> shorter bottle, handle loops
+        // back into body earlier along its parametric arc.  Textbook
+        // value is 16; 13 keeps the recognisable pear-bottle silhouette
+        // while making the handle's loop noticeably tighter.
+        const float kVscale = 13.0f;
+        const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
         // surface point at parameter (u, v).  Used both for vertex
         // positions and for the central-difference normal estimate below.
-        auto kleinPoint = [kPi](float u, float v) -> float3
+        auto kleinPoint = [kPi, kVscale](float u, float v) -> float3
         {
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
@@ -402,12 +408,12 @@ namespace ProceduralGeometry
             if (u < kPi)
             {
                 x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                z = -16.0f * su            - r * su * cv;
+                z = -kVscale * su           - r * su * cv;
             }
             else
             {
                 x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -16.0f * su;
+                z = -kVscale * su;
             }
             const float y = r * std::sin(v);
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
@@ -486,3 +492,4 @@ namespace ProceduralGeometry
         return m;
     }
 }
+

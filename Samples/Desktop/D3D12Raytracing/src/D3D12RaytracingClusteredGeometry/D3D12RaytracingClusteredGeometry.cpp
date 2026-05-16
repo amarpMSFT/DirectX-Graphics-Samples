@@ -364,23 +364,22 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
             /*firstClusterID*/600),
         XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 6x6 = 36 floor clusters
 
-    // Klein bottle - the iconic "neck-through-body" Klein bottle, parked
-    // WELL OUTSIDE the hex group on the +X side so it doesn't dominate the
-    // default camera frame and clears the large sphere at hex(0)=(1.6,
-    // 0.1, 0). Stands upright (height along world Y, half-height ≈
-    // bottleScale=0.55), centred at y=0 so the bottle's lower extent
-    // (~ y=-0.55) stays above the floor at y=-0.7. STOCHASTIC translucency
-    // (frosted-glass per-triangle any-hit reject) gives a noisy partial-
-    // transparency look that highlights the bottle's self-intersection -
-    // rays passing through the outer sheet hit the inner sheet (or the
-    // neck where it dives through the body wall) and produce naturally-
-    // layered visual complexity.
+    // Klein bottle - the iconic "neck-through-body" parametric Klein
+    // bottle, GLASS-LIKE: real Snell refraction (refr=0.55, ior=1.5) +
+    // a faint mirror sheen (refl=0.10) + a tiny stochastic dusting
+    // (trans=0.10) for a slight "frosted glass" texture.  Positioned
+    // BESIDE the animated glass sphere up high so the two refractive
+    // objects are visually adjacent (compare a topologically-trivial
+    // glass ball with a topologically-bonkers glass Klein bottle), and
+    // rotated so the handle's loop-into-body geometry shows in the
+    // default camera view.
     add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
-            /*bottleScale*/0.55f,
-            /*numU*/32, /*numV*/16,                                       // matches torus / sphere2 res
+            /*bottleScale*/0.65f,                                          // a touch bigger so refraction reads
+            /*numU*/32, /*numV*/16,                                        // matches torus / sphere2 res
             /*tileUSize*/4, /*tileVSize*/4,
             /*firstClusterID*/700),
-        XMFLOAT3(3.6f, 0.0f, 0.0f), 1.0f, 8);                             // 8x4 = 32 klein clusters, 1024 tris
+        XMFLOAT3(-1.55f, 1.25f, -0.30f), 1.0f, 8,                          // beside the animated sphere with breathing room
+        XMFLOAT3(0.20f, /*~30°*/0.55f, 0.0f));                             // tilt + yaw so the loop reads
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -711,7 +710,7 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     set(5,    1.00f, 0.85f, 0.55f, 0.60f, 0.0f,  0.0f, 0.0f);  // cube     copper-mirror
     set(6,    0.45f, 0.45f, 0.50f, 0.15f, 0.0f,  0.0f, 0.0f);  // floor    wet stone
     set(7,    0.85f, 0.92f, 1.00f, 0.20f, 0.70f, 1.5f, 0.0f);  // animated glass
-    set(8,    0.65f, 0.40f, 0.90f, 0.30f, 0.0f,  0.0f, 0.55f); // klein    frosted purple
+    set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f, 0.0f);  // klein    clear glass (heavy refraction, no frost)
 
     AllocateUploadBuffer(device, m_materials.data(),
                          m_materials.size() * sizeof(MaterialDesc),

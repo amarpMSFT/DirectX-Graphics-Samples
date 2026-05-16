@@ -538,33 +538,46 @@ void GlassHit(inout Payload p, in Attribs a)
 
     if (ctx.mat.refractivity > 0.0 && myDepth <= 4)
     {
-        // REF-COUNTED GLASS DEPTH (handles non-orientable + self-intersecting
-        // surfaces correctly).  Strategy:
-        //   - HitKind() decides ENTERING (front face) vs EXITING (back face)
-        //     for THIS triangle, LOCALLY.  This is geometrically correct
-        //     even on Klein bottle - within a triangle, "front" and "back"
-        //     are well-defined relative to its winding.
-        //   - p.inGlass is a COUNT of how many glass volumes the ray is
-        //     currently inside.  Entering increments, exiting decrements.
-        //   - The eta is chosen by the TRANSITION TYPE:
-        //         old=0 → new=1   : air→glass refraction (eta = 1/ior)
-        //         old=1 → new=0   : glass→air refraction (eta = ior)
-        //         else            : nested glass-glass crossing,
-        //                           eta = 1.0 (NO refraction; ray continues
-        //                           straight).  This is the key fix for
-        //                           self-intersecting glass like the Klein
-        //                           bottle - the handle crossing through
-        //                           the body's interior shouldn't refract
-        //                           since both are the same medium.
-        const bool entering   = ctx.entering;
+        // ENTERING/EXITING decision: TOGGLE based on p.inGlass count
+        // (not on HitKind() or on the smooth-normal dot product).
+        //
+        // Rationale: on a non-orientable surface (Klein bottle), there
+        // is NO globally consistent "outward" direction for the smooth
+        // normal - the parametric orientation flips somewhere on the
+        // surface no matter how you set it up, so dot(rayDir,
+        // smoothNormal) gives the wrong sign for some hits.  HitKind()
+        // has the same problem (triangle winding can be flipped vs the
+        // geometric "outside" at the orientation seam).  Both produce
+        // visible closed-curve artifacts where rays crossing the seam
+        // during interior traversal get misclassified as "deeper into
+        // glass" instead of "exiting to air".
+        //
+        // The bottle doesn't physically self-intersect in 3D (body's z
+        // < 0, handle's z > 0 - they never overlap), so a ray is always
+        // either in air (count=0) or inside the single glass volume
+        // (count=1) - count never reaches 2.  Under that invariant the
+        // robust rule is simply: every glass hit TOGGLES the count.
+        // Entry ⇔ count=0; exit ⇔ count=1.  No normal-direction
+        // dependence, no orientation-seam sensitivity.
+        //
+        // The smooth normal is STILL flipped (in LoadHitContext) so
+        // refract() always sees N pointing back toward the ray origin -
+        // that geometric flip works correctly regardless of which
+        // global direction the smooth normal happens to point in this
+        // cluster, because we always flip when dot(rayDir, n_preflip)
+        // > 0.  So refract() gets the right N either way.
+        const bool entering   = (p.inGlass == 0u);
         const uint oldDepth   = p.inGlass;
-        const uint newDepth   = entering ? (oldDepth + 1u)
-                                          : (oldDepth > 0u ? oldDepth - 1u : 0u);
-        // Eta picks the kind of interface we're crossing.
+        const uint newDepth   = entering ? 1u : 0u;
+        // Eta picks the kind of interface we're crossing.  With the
+        // toggle rule above we only ever have 0↔1 transitions; the
+        // "else" (glass-glass nested) branch is unreachable for our
+        // bottle but kept defensively for any future scene where
+        // count > 1 becomes possible.
         float eta;
         if      (oldDepth == 0u && newDepth == 1u) eta = 1.0 / ctx.mat.ior; // air → glass
         else if (oldDepth == 1u && newDepth == 0u) eta = ctx.mat.ior;       // glass → air
-        else                                       eta = 1.0;               // glass → glass (nested)
+        else                                       eta = 1.0;               // glass → glass (nested, unused for Klein bottle)
 
         float3 incident   = WorldRayDirection();
         float3 refractDir = refract(incident, ctx.nWorld, eta);

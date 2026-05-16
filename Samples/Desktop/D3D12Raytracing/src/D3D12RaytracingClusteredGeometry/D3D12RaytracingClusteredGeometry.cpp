@@ -896,6 +896,44 @@ void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
     m_dxrCommandList->ResourceBarrier(_countof(barriers), barriers);
     const auto t1 = std::chrono::steady_clock::now();
     m_clasMemStats.cpuWallMsPhase1 = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // Read back the per-cluster sizes the driver wrote into m_clasSizeArray
+    // as a side effect of the build, so the [CLAS mem] stats line can show
+    // the actual irreducible storage (sum_actual). This is a one-time CPU
+    // stall - production code that picks implicit mode would skip it. The
+    // sample does it so users can see the over-allocation at a glance.
+    auto cmdList = m_deviceResources->GetCommandList();
+    ComPtr<ID3D12Resource> sizesReadback;
+    {
+        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer((UINT64)N * sizeof(UINT64));
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sizesReadback)));
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmdList->ResourceBarrier(1, &toCopy);
+        cmdList->CopyBufferRegion(sizesReadback.Get(), 0, m_clasSizeArray.Get(), 0,
+            (UINT64)N * sizeof(UINT64));
+        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList->ResourceBarrier(1, &fromCopy);
+    }
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    {
+        void* mapped = nullptr;
+        D3D12_RANGE rr = { 0, (SIZE_T)N * sizeof(UINT64) };
+        ThrowIfFailed(sizesReadback->Map(0, &rr, &mapped));
+        auto* sizes = reinterpret_cast<const UINT64*>(mapped);
+        UINT64 sum = 0;
+        for (UINT i = 0; i < N; ++i) sum += sizes[i];
+        D3D12_RANGE noWrite = {0, 0};
+        sizesReadback->Unmap(0, &noWrite);
+        m_clasMemStats.sumActualBytes = sum;
+    }
+    auto cmdAlloc = m_deviceResources->GetCommandAllocator();
+    ThrowIfFailed(cmdAlloc->Reset());
+    ThrowIfFailed(cmdList->Reset(cmdAlloc, nullptr));
 }
 
 // ---------------------------------------------------------------------------------
@@ -2173,6 +2211,26 @@ void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
         (unsigned long long)s.scratchBytesPhase2,
         s.cpuWallMsPhase1, s.cpuWallMsPhase2,
         overheadVsActual, savingsVsImplicit);
+
+    // Discoverability hint: if the user is on the simplest path (implicit)
+    // AND the over-allocation is actually painful (>2x), point them at the
+    // alternative modes. Most users won't read all of d3d12.h, so the sample
+    // itself should help connect "you allocated 1.2 MB" to "you only used
+    // 220 KB; here's how to fix it".
+    if (m_clasAllocMode == ClasAllocMode::Implicit
+        && s.sumActualBytes > 0
+        && s.resultFinalBytes > s.sumActualBytes * 2)
+    {
+        const double ratio = (double)s.resultFinalBytes / (double)s.sumActualBytes;
+        SampleLog::LogF(
+            L"[CLAS mem hint] implicit mode allocated %.1fx the bytes actually "
+            L"used (%llu / %llu). Re-run with --clas-alloc get-sizes for an "
+            L"exact-fit alloc, or --clas-alloc compact for build-then-compact "
+            L"semantics. See readme.md for the tradeoff table.\n",
+            ratio,
+            (unsigned long long)s.resultFinalBytes,
+            (unsigned long long)s.sumActualBytes);
+    }
 }
 
 // ---------------------------------------------------------------------------------

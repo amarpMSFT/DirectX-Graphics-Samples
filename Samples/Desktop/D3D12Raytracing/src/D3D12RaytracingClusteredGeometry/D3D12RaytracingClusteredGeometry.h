@@ -112,12 +112,22 @@ private:
     // MinPositionTruncateBitCount + the per-cluster
     // D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS::PositionTruncateBitCount.
     // The driver may store positions more compactly when both fields agree
-    // that low bits are zero. Range 0 (no truncation, default) to ~22
-    // (kills all mantissa, useful only as a stress test). Practical sweet
-    // spot for sub-millimeter scenes is 8-12 bits; visually invisible.
+    // that low bits are zero. Range 0 (no truncation) to ~22 (kills all
+    // mantissa, useful only as a stress test).
+    //
+    // DEFAULT: 12 bits. On this scene's ~1m bounding box that leaves
+    // ~244 micrometer per-vertex resolution - sub-pixel-equivalent at any
+    // sane camera distance, visually identical to 0-bit, ~27% smaller CLAS
+    // bytes. Pass --position-truncate 0 for the no-truncation baseline,
+    // or --position-truncate 16/22 to see the artifacts kick in.
+    //
+    // For larger scenes you'd pick a smaller value (or normalize positions
+    // first); the right knob is "what per-vertex precision do you need in
+    // world units" not "how many bits".
+    //
     // Ignored in COMPRESSED1 mode (the union slot is taken by
     // MaxCompressedClusterPositionsSize there).
-    UINT                                 m_positionTruncateBits = 0;
+    UINT                                 m_positionTruncateBits = 12;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)

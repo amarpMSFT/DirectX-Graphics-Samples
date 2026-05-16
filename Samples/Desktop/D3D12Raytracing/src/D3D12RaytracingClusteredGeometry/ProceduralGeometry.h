@@ -41,7 +41,12 @@ namespace ProceduralGeometry
     {
         unsigned int            clusterID;     // exposed via HLSL ClusterID() in hits
         std::vector<float3>     positions;     // local positions (mesh-local space)
-        std::vector<uint8_t>    indices;       // local 8-bit indices into positions
+        std::vector<float3>     normals;       // parallel to positions; analytic per-vertex
+                                               // surface normals.  Travels through a SEPARATE
+                                               // structured-buffer side channel because
+                                               // DXR2 cluster geometry's CLAS only takes
+                                               // positions in its vertex buffer.
+        std::vector<uint8_t>    indices;       // local 8-bit indices into positions/normals
     };
 
     struct Mesh
@@ -97,9 +102,11 @@ namespace ProceduralGeometry
                 float phi   = float((double)longIdx * 2.0 * M_PI / numLong);
                 float sinT = std::sin(theta), cosT = std::cos(theta);
                 float cosP = std::cos(phi),   sinP = std::sin(phi);
-                c.positions.push_back({ radius * sinT * cosP,
-                                        radius * cosT,
-                                        radius * sinT * sinP });
+                // Sphere normal at (theta, phi) is the unit radial direction;
+                // position is just radius * normal so we share trig values.
+                const float nx = sinT * cosP, ny = cosT, nz = sinT * sinP;
+                c.positions.push_back({ radius * nx, radius * ny, radius * nz });
+                c.normals.push_back  ({ nx, ny, nz });
             }
 
             // Two CCW (viewed from outside) triangles per quad.
@@ -162,6 +169,10 @@ namespace ProceduralGeometry
                 float cv = std::cos(v), sv = std::sin(v);
                 float r  = majorRadius + minorRadius * cv;
                 c.positions.push_back({ r * cu, minorRadius * sv, r * su });
+                // Torus normal at (u, v) = direction from tube central ring
+                // out to the surface = (cos v cos u, sin v, cos v sin u).
+                // Already unit length (Pythagorean identity).
+                c.normals.push_back  ({ cv * cu, sv, cv * su });
             }
 
             for (int ri = 0; ri < tileRing; ++ri)
@@ -224,6 +235,13 @@ namespace ProceduralGeometry
             Cluster c;
             c.clusterID = clusterCounter++;
             const Face& face = faces[f];
+            // Per-face flat normal = axisU x axisV (outward by construction
+            // of the face table).  All vertices on this cluster share it -
+            // cubes don't smooth across edges.
+            const float3 nFace = {
+                face.axisU.y * face.axisV.z - face.axisU.z * face.axisV.y,
+                face.axisU.z * face.axisV.x - face.axisU.x * face.axisV.z,
+                face.axisU.x * face.axisV.y - face.axisU.y * face.axisV.x };
             const float du = (2 * h) / faceSubdiv;
             const int rowSize = tileSize + 1;
             for (int li = 0; li <= tileSize; ++li)
@@ -235,6 +253,7 @@ namespace ProceduralGeometry
                     face.origin.x + face.axisU.x * u + face.axisV.x * v,
                     face.origin.y + face.axisU.y * u + face.axisV.y * v,
                     face.origin.z + face.axisU.z * u + face.axisV.z * v });
+                c.normals.push_back(nFace);
             }
             for (int li = 0; li < tileSize; ++li)
             for (int lj = 0; lj < tileSize; ++lj)
@@ -297,6 +316,7 @@ namespace ProceduralGeometry
                     0.0f,
                     baseV + (float)lj * quadWidthV
                 });
+                c.normals.push_back({ 0.0f, 1.0f, 0.0f });   // floor faces +Y
             }
             // Indices: two triangles per quad, both wound CCW when viewed from
             // above (i.e. normal = +Y). Camera sits at +Y > 0 so it looks
@@ -370,6 +390,29 @@ namespace ProceduralGeometry
         const float kPi    = 3.14159265358979323846f;
         const float invSpan = bottleScale / 16.0f;     // normalises z extent to [-bottleScale, bottleScale]
 
+        // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
+        // surface point at parameter (u, v).  Used both for vertex
+        // positions and for the central-difference normal estimate below.
+        auto kleinPoint = [kPi](float u, float v) -> float3
+        {
+            const float cu = std::cos(u), su = std::sin(u);
+            const float cv = std::cos(v);
+            const float r  = 4.0f * (1.0f - cu * 0.5f);
+            float x, z;
+            if (u < kPi)
+            {
+                x = 6.0f * cu * (1.0f + su) + r * cu * cv;
+                z = -16.0f * su            - r * su * cv;
+            }
+            else
+            {
+                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
+                z = -16.0f * su;
+            }
+            const float y = r * std::sin(v);
+            return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
+        };
+
         unsigned int clusterCounter = firstClusterID;
         for (int tu = 0; tu < tilesU; ++tu)
         for (int tv = 0; tv < tilesV; ++tv)
@@ -385,27 +428,40 @@ namespace ProceduralGeometry
                 const int gj = tv * tileVSize + lj;
                 const float u = (float)gi / (float)numU * 2.0f * kPi;
                 const float v = (float)gj / (float)numV * 2.0f * kPi;
-                const float cu = std::cos(u), su = std::sin(u);
-                const float cv = std::cos(v);
-                const float r  = 4.0f * (1.0f - cu * 0.5f);
-                float x, z;
-                if (u < kPi)
-                {
-                    x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                    z = -16.0f * su            - r * su * cv;
-                }
-                else
-                {
-                    x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                    z = -16.0f * su;
-                }
-                const float y = r * std::sin(v);
+
+                float3 p = kleinPoint(u, v);
+
+                // Central-difference partials Pu, Pv of the (u, v)
+                // parametrisation -> normal = Pu x Pv.  Computed in
+                // original-axis space; the same axis remap that swaps
+                // position into world space is applied to the normal
+                // below so they stay consistent.
+                const float h = 1e-3f;
+                float3 pu1 = kleinPoint(u + h, v);
+                float3 pu0 = kleinPoint(u - h, v);
+                float3 pv1 = kleinPoint(u, v + h);
+                float3 pv0 = kleinPoint(u, v - h);
+                float3 Pu = { (pu1.x - pu0.x) * 0.5f / h,
+                              (pu1.y - pu0.y) * 0.5f / h,
+                              (pu1.z - pu0.z) * 0.5f / h };
+                float3 Pv = { (pv1.x - pv0.x) * 0.5f / h,
+                              (pv1.y - pv0.y) * 0.5f / h,
+                              (pv1.z - pv0.z) * 0.5f / h };
+                float3 n  = { Pu.y * Pv.z - Pu.z * Pv.y,
+                              Pu.z * Pv.x - Pu.x * Pv.z,
+                              Pu.x * Pv.y - Pu.y * Pv.x };
+                float L = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+                if (L < 1e-12f) { n = { 0, 1, 0 }; L = 1; }
+                n.x /= L; n.y /= L; n.z /= L;
+
                 // Output axes:  world X = bottle's wide axis (orig x);
                 //               world Y = bottle's height axis (orig z);
                 //               world Z = bottle's depth axis (orig y).
-                c.positions.push_back({ invSpan * x,
-                                        invSpan * z,
-                                        invSpan * y });
+                c.positions.push_back({ invSpan * p.x,
+                                        invSpan * p.z,
+                                        invSpan * p.y });
+                // Same axis remap for normal (rotation x->x, z->y, y->z).
+                c.normals.push_back  ({ n.x, n.z, n.y });
             }
             // Two CCW triangles per quad. Winding is consistent with the
             // outward-facing normal of the parametric (u, v) surface so

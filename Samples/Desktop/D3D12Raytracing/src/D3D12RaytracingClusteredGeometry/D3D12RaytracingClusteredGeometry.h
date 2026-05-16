@@ -25,6 +25,10 @@ namespace GlobalRootSig {
         AccelerationStructureSlot,
         SceneCBVSlot,
         MaterialsSRVSlot,           // Stage C: per-instance MaterialDesc[] indexed by InstanceID()
+        ClusterNormalsSRVSlot,      // Stage F: StructuredBuffer<float3> g_clusterNormals  (per-vertex)
+        ClusterIndicesSRVSlot,      // Stage F: StructuredBuffer<uint>   g_clusterIndices  (uint32 per index)
+        ClusterOffsetsSRVSlot,      // Stage F: StructuredBuffer<uint2>  g_clusterOffsets  (per-cluster
+                                    //                                                      vertOff, idxOff)
         Count
     };
 }
@@ -144,6 +148,17 @@ private:
     // shader validation; on Release a 4090 handles 4 samples comfortably).
     // Pass-through to the raygen shader is via SceneConstantBuffer.miscParams.z.
     UINT                                 m_aaSamplesPerPixel = 4;
+
+    // CLUSTER-RAINBOW VISUALISATION KNOB.  miscParams.w in the scene CB.
+    // Multiplies the cosine-palette per-cluster tint into the material
+    // baseColor in the closesthit:
+    //   tint = lerp(white, ClusterColor(cid), m_clusterTint)
+    // Default 0.3 = a subtle hint of cluster colour so you can SEE the
+    // cluster decomposition (which is the whole point of this sample)
+    // while material colours remain readable.  Set to 0 via --cluster-tint 0
+    // for pure material rendering, or 1 for the original "cluster
+    // rainbow dominates everything" look.
+    float                                m_clusterTint = 0.30f;
     const wchar_t*                       ClasAllocModeName() const
     {
         switch (m_clasAllocMode)
@@ -278,6 +293,47 @@ private:
     std::array<MaterialDesc, NUM_MATERIAL_SLOTS> m_materials = {};
     ComPtr<ID3D12Resource>               m_materialsBuffer;
     void BuildMaterials();
+
+    // ---------- Per-vertex normal side channel (smooth shading) ----------
+    // DXR2 cluster geometry only carries positions in the CLAS vertex buffer,
+    // so per-vertex normals and the cluster index buffer have to travel
+    // through a SEPARATE channel for the closesthit shader to interpolate
+    // them by barycentrics.  Three upload-heap StructuredBuffers + an
+    // offset table:
+    //
+    //   m_clusterNormalsBuffer : float3[]   - all per-cluster normals
+    //                                          concatenated.  Vertex offset
+    //                                          per cluster comes from the
+    //                                          offsets table below.
+    //   m_clusterIndicesBuffer : uint[]     - all per-cluster index buffers
+    //                                          concatenated.  Stored as
+    //                                          uint32 per index for clean
+    //                                          StructuredBuffer access; the
+    //                                          source uint8 indices are
+    //                                          widened on upload.
+    //   m_clusterOffsetsBuffer : uint2[]    - indexed by ClusterID().  .x =
+    //                                          start in normals buffer; .y
+    //                                          = start in indices buffer.
+    //                                          Sized to max(ClusterID)+1
+    //                                          (sparse - unused slots
+    //                                          contain (~0u,~0u)).
+    //
+    // The closesthit shader then does:
+    //   uint cid = ClusterID();
+    //   uint2 off = g_clusterOffsets[cid];
+    //   uint i0 = g_clusterIndices[off.y + PrimitiveIndex()*3 + 0];
+    //   ... interpolate g_clusterNormals[off.x + i_k] via barycentrics.
+    //
+    // For the animated sphere we reuse its BASE normals (computed once at
+    // gen time) - the per-frame morph deformation is small enough that the
+    // static normals stay visually plausible without per-frame re-upload.
+    ComPtr<ID3D12Resource>               m_clusterNormalsBuffer;
+    ComPtr<ID3D12Resource>               m_clusterIndicesBuffer;
+    ComPtr<ID3D12Resource>               m_clusterOffsetsBuffer;
+    UINT                                 m_clusterNormalsCount = 0;
+    UINT                                 m_clusterIndicesCount = 0;
+    UINT                                 m_clusterOffsetsCount = 0;
+    void BuildClusterShaderSideBuffers();
 
     // ---------- Timestamp queries for AS build wall-clocks ----------
     // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).

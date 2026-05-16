@@ -90,6 +90,30 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             m_positionTruncateBits = (UINT)n;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--aa-samples") == 0 && i + 1 < argc)
+        {
+            // Anti-aliasing samples per pixel.  The raygen shader traces N
+            // jittered primary rays per pixel and averages.  N must be 1,
+            // 2, or 4 (clamped to nearest valid).  Default is 4.
+            int n = _wtoi(argv[i+1]);
+            if (n <= 1) n = 1;
+            else if (n <= 2) n = 2;
+            else n = 4;
+            m_aaSamplesPerPixel = (UINT)n;
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--cluster-tint") == 0 && i + 1 < argc)
+        {
+            // Cluster-rainbow tint blend in [0..1].  0 = pure material
+            // colour; 1 = original "cluster rainbow dominates everything"
+            // look.  Default 0.3 leaves a visible hint of cluster
+            // boundaries without overpowering the material palette.
+            float t = (float)_wtof(argv[i+1]);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            m_clusterTint = t;
+            i += 1;
+        }
     }
 }
 
@@ -229,6 +253,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildMaterials();
     SampleLog::Write(L">>> BuildAccelerationStructures\n");
     BuildAccelerationStructures();
+    SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
+    BuildClusterShaderSideBuffers();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
     CreateRaytracingPipelineAndShaderTables();
     SampleLog::Write(L">>> CreateDescriptorHeapAndRaytracingOutput\n");
@@ -694,6 +720,70 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     SampleLog::LogF(L"[materials] %u slots; refractive ior=%.2f for slot 7 (animated sphere)\n",
                     (unsigned)m_materials.size(), m_materials[7].ior);
 }
+
+
+void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    // Animated sphere clusters are reachable via templated INSTANTIATE with
+    // ClusterIdOffset = 800 (see BuildAnimatedObjectSetup), so the GPU-side
+    // ClusterID() seen on hits is template_id + 800.  Mirror that offset
+    // here when registering the animated mesh's clusters.
+    const UINT kAnimatedClusterIdOffset = 800;
+
+    // Pass 1: figure out the offset-table size.
+    UINT maxClusterID = 0;
+    for (const auto& obj : m_objects)
+        for (const auto& c : obj.mesh.clusters)
+            maxClusterID = std::max(maxClusterID, c.clusterID);
+    if (m_animatedObjectEnabled)
+        for (const auto& c : m_animatedObject.mesh.clusters)
+            maxClusterID = std::max(maxClusterID, c.clusterID + kAnimatedClusterIdOffset);
+
+    const UINT offsetTableSize = maxClusterID + 1;
+
+    std::vector<XMFLOAT3> normals;
+    std::vector<UINT>     indices;
+    std::vector<XMUINT2>  offsets(offsetTableSize, XMUINT2(0u, 0u));
+
+    // Helper: append one cluster's data and stamp its offset entry.
+    auto appendCluster = [&](const ProceduralGeometry::Cluster& c, UINT cidForOffsetTable)
+    {
+        offsets[cidForOffsetTable] = XMUINT2((UINT)normals.size(), (UINT)indices.size());
+        for (const auto& n : c.normals)
+            normals.push_back(XMFLOAT3(n.x, n.y, n.z));
+        for (uint8_t i : c.indices)
+            indices.push_back((UINT)i);
+    };
+
+    for (const auto& obj : m_objects)
+        for (const auto& c : obj.mesh.clusters)
+            appendCluster(c, c.clusterID);
+
+    if (m_animatedObjectEnabled)
+        for (const auto& c : m_animatedObject.mesh.clusters)
+            appendCluster(c, c.clusterID + kAnimatedClusterIdOffset);
+
+    AllocateUploadBuffer(device, normals.data(), normals.size() * sizeof(DirectX::XMFLOAT4),
+                         &m_clusterNormalsBuffer, L"Cluster vertex normals (per-vertex side channel)");
+    AllocateUploadBuffer(device, indices.data(), indices.size() * sizeof(UINT),
+                         &m_clusterIndicesBuffer, L"Cluster indices (uint32-widened side channel)");
+    AllocateUploadBuffer(device, offsets.data(), offsets.size() * sizeof(XMUINT2),
+                         &m_clusterOffsetsBuffer, L"Cluster vert/idx offset table");
+
+    m_clusterNormalsCount = (UINT)normals.size();
+    m_clusterIndicesCount = (UINT)indices.size();
+    m_clusterOffsetsCount = (UINT)offsets.size();
+
+    SampleLog::LogF(L"[normals] side channel: %u vertex normals, %u indices, %u offset slots (max cid=%u, ~%u KB total)\n",
+                    m_clusterNormalsCount, m_clusterIndicesCount, m_clusterOffsetsCount,
+                    maxClusterID,
+                    (UINT)((normals.size() * sizeof(XMFLOAT3) +
+                            indices.size() * sizeof(UINT) +
+                            offsets.size() * sizeof(XMUINT2)) / 1024));
+}
+
 
 //
 //   [aligned 16] cluster[0].vertex_blob
@@ -1668,7 +1758,7 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 //   └────────────────────────────────────────────────────────────────────────┘
 //
 // CLUSTER ID OFFSET: the animated object's clusters get unique IDs by setting
-// ClusterIdOffset=10000 in the per-cluster instantiate args. So the shader
+// ClusterIdOffset=800 in the per-cluster instantiate args. So the shader
 // sees the same ClusterColor() palette but at a different region of the
 // rainbow than the 6 static objects (which use ClusterIDs 0..505).
 // =====================================================================================
@@ -1939,7 +2029,11 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         {
             D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS a = {};
             a.GeometryIndexOffset = 0;
-            a.ClusterIdOffset     = 10000;                       // unique color range
+            a.ClusterIdOffset     = 800;                         // unique color range, packed
+                                                                 // right after the static cluster
+                                                                 // IDs (max 731) so the per-cluster
+                                                                 // shader-side normal lookup table
+                                                                 // stays small (~7 KB instead of 80).
             a.ClusterTemplate     = templateGVAs[c];
             a.VertexBuffer.StartAddress  = pfVbGPUVA + vbCursor;
             a.VertexBuffer.StrideInBytes = sizeof(XMFLOAT3);
@@ -2453,6 +2547,14 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         // Per-instance materials live in a structured buffer at t1, indexed by
         // InstanceID() in the closesthit/anyhit shaders.
         params[GlobalRootSig::MaterialsSRVSlot].InitAsShaderResourceView(1);
+        // Per-cluster shader-side buffers for smooth normals.  DXR2 cluster
+        // geometry's CLAS only takes positions in its vertex buffer, so per-
+        // vertex normals (and the index buffer, so we can find which 3
+        // vertices a triangle hit references) travel through 3 separate
+        // structured buffers indexed by ClusterID() + PrimitiveIndex().
+        params[GlobalRootSig::ClusterNormalsSRVSlot].InitAsShaderResourceView(2);
+        params[GlobalRootSig::ClusterIndicesSRVSlot].InitAsShaderResourceView(3);
+        params[GlobalRootSig::ClusterOffsetsSRVSlot].InitAsShaderResourceView(4);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -2650,7 +2752,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     cb.miscParams.x = (float)m_width / (float)m_height;
     cb.miscParams.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60deg vertical FOV
     cb.miscParams.z = (float)m_aaSamplesPerPixel;                  // raygen sample count (1/2/4)
-    cb.miscParams.w = 0;
+    cb.miscParams.w = m_clusterTint;                               // 0..1 cluster-rainbow tint blend
     // Sun in upper-back-right. Direction TO the light, normalized. .w is the
     // ambient floor: even fully-shadowed pixels get this fraction of base
     // colour so the scene reads instead of going pitch black.
@@ -2771,6 +2873,12 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     cl4->SetComputeRootConstantBufferView(GlobalRootSig::SceneCBVSlot, m_sceneCB->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::MaterialsSRVSlot,
         m_materialsBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterNormalsSRVSlot,
+        m_clusterNormalsBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterIndicesSRVSlot,
+        m_clusterIndicesBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterOffsetsSRVSlot,
+        m_clusterOffsetsBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
@@ -3031,6 +3139,4 @@ HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path
     if (FAILED(hr = encoder->Commit())) return cleanup(hr);
     return cleanup(S_OK);
 }
-
-
 

@@ -25,6 +25,21 @@ RWTexture2D<float4>               Output      : register(u0);
 ConstantBuffer<SceneConstantBuffer> g_scene   : register(b0);
 StructuredBuffer<MaterialDesc>    g_materials : register(t1);
 
+// Per-cluster shader-side buffers carrying smooth normals + the cluster
+// index buffer.  DXR2 cluster geometry's CLAS only consumes positions in
+// its vertex buffer, so per-vertex normals (and the indices we need to
+// look them up by triangle corner) ride along in these structured
+// buffers, indexed by ClusterID() + PrimitiveIndex() in the closesthit.
+//
+// Normals are stored as float4 (with .w = 0 padding) instead of float3 so
+// the HLSL StructuredBuffer<> stride matches the C++ upload exactly -
+// `StructuredBuffer<float3>` with a root SRV has implementation-defined
+// stride padding behaviour that has bitten us before.  `float4` is an
+// unambiguous 16-byte stride on both sides.
+StructuredBuffer<float4>          g_clusterNormals : register(t2);
+StructuredBuffer<uint>            g_clusterIndices : register(t3);
+StructuredBuffer<uint2>           g_clusterOffsets : register(t4);
+
 struct [raypayload] Payload
 {
     float4 color : write(miss, closesthit) : read(caller);
@@ -272,14 +287,39 @@ void Hit(inout Payload p, in Attribs a)
     MaterialDesc mat = g_materials[InstanceID()];
 
     uint cid = ClusterID();
-    float3 cluster = (cid != 0xFFFFFFFFu) ? ClusterColor(cid)
-                                          : float3(0.6, 0.6, 0.6);
-    float3 base = mat.baseColor.xyz * cluster;
+    // Cluster-rainbow palette is gated on a single visualisation knob -
+    // miscParams.w in the scene CB.  >0 lets the per-cluster cosine
+    // palette tint the base colour (so the user can SEE the cluster
+    // boundaries which is the whole point of this sample); 0 makes
+    // material colours fully take over.  Default is a subtle 0.3 blend.
+    float  clusterTint = saturate(g_scene.miscParams.w);
+    float3 clusterCol  = (cid != 0xFFFFFFFFu) ? ClusterColor(cid)
+                                              : float3(0.6, 0.6, 0.6);
+    float3 base = mat.baseColor.xyz * lerp(float3(1, 1, 1), clusterCol, clusterTint);
 
-    // World-space geometric normal. ObjectToWorld3x4()'s 3x3 sub-matrix is
-    // rotation/scale only (translation column dropped).
-    BuiltInTrianglePositions tri = TriangleObjectPositions();
-    float3 nObj   = GeometricNormalObj(tri);
+    // World-space surface normal.  Per-vertex normals live in the side-
+    // channel (g_clusterNormals + g_clusterIndices indexed by ClusterID()
+    // and PrimitiveIndex()); we fetch the three corner normals and
+    // barycentric-interpolate.  Smooth shading on curved surfaces (sphere
+    // / torus / Klein) was the user's #5 ask; the cube + floor have
+    // constant per-cluster normals so the interpolation degenerates to
+    // flat there for free.
+    uint primIdx = PrimitiveIndex();
+    uint2 off    = g_clusterOffsets[cid];
+    uint i0      = g_clusterIndices[off.y + primIdx * 3 + 0];
+    uint i1      = g_clusterIndices[off.y + primIdx * 3 + 1];
+    uint i2      = g_clusterIndices[off.y + primIdx * 3 + 2];
+    float3 n0    = g_clusterNormals[off.x + i0];
+    float3 n1    = g_clusterNormals[off.x + i1];
+    float3 n2    = g_clusterNormals[off.x + i2];
+    // a.bary is (w1, w2); w0 = 1 - w1 - w2 (DXR convention).
+    float  bw1   = a.bary.x;
+    float  bw2   = a.bary.y;
+    float  bw0   = 1.0 - bw1 - bw2;
+    float3 nObj  = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
+    // ObjectToWorld3x4()'s 3x3 sub-matrix is rotation/scale only.  All
+    // our instances are uniform-scale so direct mul is correct here; for
+    // non-uniform scale we'd need the inverse-transpose of the upper-3x3.
     float3 nWorld = normalize(mul((float3x3)ObjectToWorld3x4(), nObj));
 
     // Flip the normal if we hit a back face (refractive surfaces let rays
@@ -352,4 +392,5 @@ void Hit(inout Payload p, in Attribs a)
 
     p.color = float4(finalColor, 1);
 }
+
 

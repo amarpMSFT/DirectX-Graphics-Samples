@@ -251,12 +251,22 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     auto with_y = [](XMFLOAT3 p, float y) { p.y = y; return p; };
 
     // Spheres around the hex.
-    // TEMP: tiny sphere SHIFTED in X, Y, Z so every vertex is positive.
-    auto m_shifted = ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 8, 8, /*tileLat*/4, /*tileLong*/4, 0);
-    for (auto& c : m_shifted.clusters)
-        for (auto& p : c.positions) { p.x += 1.5f; p.y += 1.5f; p.z += 1.5f; }
-    add(std::move(m_shifted),
-        XMFLOAT3(-1.5f, -1.5f, -1.5f), 1.0f, 0);
+    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 32, 64, /*tileLat*/4, /*tileLong*/8, 0),
+        with_y(hex(0),  0.1f), 1.0f, 0);                                  // 8x8=64 clusters
+    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
+        with_y(hex(1),  0.4f), 1.0f, 1);                                  // 6x8=48 clusters
+    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),
+        with_y(hex(2), -0.1f), 1.0f, 2);                                  // 4x8=32 clusters
+    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.45f, 12, 24, /*tileLat*/3, /*tileLong*/4, 300),
+        with_y(hex(3),  0.3f), 1.0f, 3);                                  // 4x6=24 clusters
+
+    // Torus.
+    add(ProceduralGeometry::GenerateTorusSpatialTiles(0.55f, 0.18f, 32, 16, /*tileR*/4, /*tileS*/4, 400),
+        with_y(hex(4), -0.3f), 1.0f, 4);                                  // 8x4=32 clusters
+
+    // Cube (one cluster per face).
+    add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
+        with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -284,29 +294,37 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
                                                             : L"FLOAT32_3 (no quantization)");
 
     // ============================================================================
-    // COMPRESSED1 STATIC PATH - KNOWN ISSUE (open as of 2026-05-15)
+    // COMPRESSED1 STATIC PATH - NVIDIA DRIVER BUG (open as of 2026-05-15)
     // ----------------------------------------------------------------------------
-    // On NVIDIA RTX 4090 with experimental D3D12 (D3D12Core 1.10 preview, agility
-    // SDK 722), passing FLOAT32_3 here produces a clean rainbow-tile render of
-    // the scene. Passing COMPRESSED1 renders the cube perfectly but mangles the
-    // sphere/torus clusters - typically with one cluster appearing as a stretched
-    // "tail" extending well beyond the object's bounds, and another cluster
-    // missing entirely. The breakage is reproducible with a SINGLE 4-cluster
-    // sphere (set kSceneTinyRepro = true to enable this minimal repro scene),
-    // and persists across:
-    //   * 8-bit, 12-bit, and 16-bit-per-axis encodings
-    //   * uniform vs per-axis bit counts
-    //   * 16-byte vs 256-byte vertex-buffer alignment
-    //   * positive-only anchors (verified by shifting the mesh into +x+y+z)
-    //   * MaxCompressedClusterPositionsSize set to exact size vs 4x oversize
+    // SUMMARY: The exact same compressed1 byte stream produced by this sample's
+    // encoder renders correctly on experimental WARP and incorrectly on NVIDIA
+    // (RTX 4090, D3D12Core 1.10 preview, agility SDK 722). On NVIDIA, the cube
+    // renders cleanly but sphere/torus clusters are mangled: one cluster appears
+    // as a stretched "tail" reaching well beyond the object's bounds, an
+    // adjacent cluster goes missing, the rest of the scene renders correctly.
     //
-    // CPU-side roundtrip via Compressed1::Decode is bit-exact (max error
-    // ~0.0002 units, which is sub-quantization-step). Byte-for-byte cluster
-    // dumps via DUMP_COMPRESSED1_DIAG match the d3d12conf reference encoder's
-    // bit ordering and header layout.
+    // EVIDENCE:
+    //   1. Force-warp=true: all 7 objects (animated sphere + 4 static spheres +
+    //      torus + cube) render pixel-equivalent to the FLOAT32_3 path.
+    //   2. Force-warp=false (NVIDIA): same input bytes, same args -> broken.
+    //   3. CPU-side Compressed1::Decode is bit-exact (max error ~0.0002 units,
+    //      sub-quantization-step).
+    //   4. Byte-for-byte cluster dumps via DUMP_COMPRESSED1_DIAG match the
+    //      d3d12conf reference encoder's header layout and bitstream packing
+    //      (see Compressed1.h header for the side-by-side derivation).
+    //   5. Breakage on NVIDIA persists across every variable I tried:
+    //        - 8 / 12 / 16 bits/axis
+    //        - uniform vs per-axis bit counts
+    //        - 16-byte vs 256-byte vertex-buffer alignment
+    //        - positive-only anchors (mesh shifted to +x +y +z)
+    //        - MaxCompressedClusterPositionsSize exact vs 4x oversize
+    //        - UPLOAD heap vs DEFAULT heap for the vertex buffer
     //
-    // Filed as: <TODO: bug-tracker link>. Until resolved, the sample defaults
-    // to FLOAT32_3 (see VertexMode::Float32_3 in the header).
+    // CONCLUSION: The bug is in NVIDIA's COMPRESSED1 BVH-build implementation,
+    // not in this sample. Filed as: <TODO bug-tracker link>. Until resolved,
+    // the sample defaults to FLOAT32_3 (VertexMode::Float32_3 in the header);
+    // pass --vertex-format compressed to exercise the broken path against a
+    // future NVIDIA driver update.
     // ============================================================================
     if (m_vertexMode == VertexMode::Compressed1)
     {

@@ -20,3 +20,5 @@ screenshots/
 *.user
 *.suo
 *.aps
+phase*_check.png
+phase*.png

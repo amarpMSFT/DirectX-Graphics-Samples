@@ -320,27 +320,41 @@ namespace ProceduralGeometry
     }
 
     // ------------------------------------------------------------------
-    // Klein bottle - figure-8 immersion in R^3.  A non-orientable closed
-    // surface (no inside/outside!), parametrised over (u,v) in [0, 2π]^2
-    // by:
+    // Klein bottle - "bottle" immersion in R^3.  This is the iconic shape
+    // people picture when they hear "Klein bottle":  a closed surface with
+    // a slim neck that curves up over the body and dives back down through
+    // the body wall to reconnect with the bottom from the inside.  The
+    // surface is non-orientable - if you slide an arrow along it, you can
+    // return to the start with the arrow flipped, so there is no inside
+    // and no outside.  In R^3 the only way to render this is to let the
+    // neck self-intersect the body (an unavoidable consequence of trying
+    // to embed a non-orientable closed surface in three dimensions).
     //
-    //     half = u/2
-    //     r = a + cos(half)*sin(v) - sin(half)*sin(2v)
-    //     x = r * cos(u)
-    //     y = sin(half)*sin(v) + cos(half)*sin(2v)
-    //     z = r * sin(u)
+    // Parametric form (standard "bottle" immersion, u ∈ [0, 2π], v ∈ [0,
+    // 2π], piecewise at u=π where the neck meets the body):
     //
-    // (Y up; the standard Klein-bottle "twisted donut" silhouette.)
+    //   r = 4 * (1 - cos(u)/2)
+    //   if u < π:
+    //       x = 6*cos(u)*(1+sin(u)) + r*cos(u)*cos(v)
+    //       z = -16*sin(u)          - r*sin(u)*cos(v)
+    //   else:
+    //       x = 6*cos(u)*(1+sin(u)) + r*cos(v + π)
+    //       z = -16*sin(u)
+    //   y = r*sin(v)
     //
-    // The figure-8 immersion DOES self-intersect in 3-space (an unavoidable
-    // consequence of squeezing a non-orientable surface into 3D), which is
-    // genuinely useful for translucency demos: refractive / stochastic rays
-    // pass into and out of multiple surface sheets, producing strikingly
-    // animated distortions and frosted-glass overlap.
+    // Original extents (x, y, z) ≈ (±12, ±6, ±16) - we normalise by 16
+    // and swap the original z (the longest axis, which is the bottle's
+    // height direction) into world Y so the bottle stands upright in the
+    // scene.  bottleScale then maps to roughly the bottle's half-height
+    // in world units.
     //
-    // Mesh is decomposed into (tilesU x tilesV) cluster tiles in the same
-    // way as GenerateTorusSpatialTiles - one cluster per (tileU, tileV)
-    // patch, each cluster owning its own (tileQuadsU+1) x (tileQuadsV+1)
+    // The mesh is open at the u=0/u=2π seam (v→-v identification across
+    // that seam isn't representable on a regular cluster-tile grid), but
+    // the visual seam falls inside the body where the neck rejoins, so
+    // it's effectively invisible behind the self-intersection.
+    //
+    // Decomposed into (tilesU x tilesV) cluster tiles - one cluster per
+    // (tu, tv) patch, each with its own (tileUSize+1) x (tileVSize+1)
     // local vertex buffer.
     // ------------------------------------------------------------------
     inline Mesh GenerateKleinBottleSpatialTiles(
@@ -353,8 +367,8 @@ namespace ProceduralGeometry
         const int tilesU = numU / tileUSize;
         const int tilesV = numV / tileVSize;
         m.clusters.reserve((size_t)tilesU * tilesV);
-        const float kPi = 3.14159265358979323846f;
-        const float a   = 2.0f;            // figure-8 main radius
+        const float kPi    = 3.14159265358979323846f;
+        const float invSpan = bottleScale / 16.0f;     // normalises z extent to [-bottleScale, bottleScale]
 
         unsigned int clusterCounter = firstClusterID;
         for (int tu = 0; tu < tilesU; ++tu)
@@ -364,8 +378,6 @@ namespace ProceduralGeometry
             c.clusterID = clusterCounter++;
             const int rowSize = tileVSize + 1;
 
-            // Vertices on a (tileUSize+1) x (tileVSize+1) grid in (u,v)
-            // parameter space.
             for (int li = 0; li <= tileUSize; ++li)
             for (int lj = 0; lj <= tileVSize; ++lj)
             {
@@ -373,20 +385,34 @@ namespace ProceduralGeometry
                 const int gj = tv * tileVSize + lj;
                 const float u = (float)gi / (float)numU * 2.0f * kPi;
                 const float v = (float)gj / (float)numV * 2.0f * kPi;
-                const float half = u * 0.5f;
-                const float ch = std::cos(half), sh = std::sin(half);
-                const float cv = std::cos(v),    sv = std::sin(v);
-                const float s2v = std::sin(2.0f * v);
-                const float r   = a + ch * sv - sh * s2v;
-                const float x   = r * std::cos(u);
-                const float y   = sh * sv + ch * s2v;
-                const float z   = r * std::sin(u);
-                c.positions.push_back({ bottleScale * x,
-                                        bottleScale * y,
-                                        bottleScale * z });
+                const float cu = std::cos(u), su = std::sin(u);
+                const float cv = std::cos(v);
+                const float r  = 4.0f * (1.0f - cu * 0.5f);
+                float x, z;
+                if (u < kPi)
+                {
+                    x = 6.0f * cu * (1.0f + su) + r * cu * cv;
+                    z = -16.0f * su            - r * su * cv;
+                }
+                else
+                {
+                    x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
+                    z = -16.0f * su;
+                }
+                const float y = r * std::sin(v);
+                // Output axes:  world X = bottle's wide axis (orig x);
+                //               world Y = bottle's height axis (orig z);
+                //               world Z = bottle's depth axis (orig y).
+                c.positions.push_back({ invSpan * x,
+                                        invSpan * z,
+                                        invSpan * y });
             }
-            // Indices: two CCW triangles per quad (winding consistent with
-            // the parametric surface's natural normal direction).
+            // Two CCW triangles per quad. Winding is consistent with the
+            // outward-facing normal of the parametric (u, v) surface so
+            // RAY_FLAG_CULL_BACK_FACING_TRIANGLES on primary rays sees
+            // the front of every sheet (including the inner neck after
+            // it pierces the body, since its u-range puts it on the
+            // "other side" of the parametrisation).
             for (int li = 0; li < tileUSize; ++li)
             for (int lj = 0; lj < tileVSize; ++lj)
             {

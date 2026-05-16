@@ -110,9 +110,50 @@ void RayGen()
 [shader("miss")]
 void Miss(inout Payload p)
 {
-    float t = saturate(WorldRayDirection().y * 0.5 + 0.5);
-    p.color = float4(lerp(float3(0.06, 0.07, 0.10),
-                          float3(0.40, 0.55, 0.75), t), 1);
+    // Sunset sky / ground gradient.  The ray direction tells us where the
+    // camera is looking - we synthesise a believable environment from the
+    // y component:
+    //
+    //   y > 0       sky.   Top is deep dusk-blue, fading through orange
+    //               near the horizon as if looking toward the setting sun.
+    //   y < 0       ground.  Mostly desaturated dirt-brown.
+    //   y around 0  horizon band where the sun is - we add a warm rim
+    //               highlight that's hottest exactly at y=0.
+    //
+    // No texture, no skybox - cheap procedural that ties the lit colours
+    // (which use the same sun direction in g_scene.lightDir) to a
+    // matching environment so reflections and refractions of the sky
+    // carry the right colour temperature.
+    float3 d = normalize(WorldRayDirection());
+    float  y = d.y;
+
+    // Two sky bands above the horizon.
+    float3 zenith   = float3(0.10, 0.13, 0.30);  // deep dusk
+    float3 midSky   = float3(0.45, 0.32, 0.40);  // mauve transition
+    float3 horizon  = float3(0.95, 0.55, 0.25);  // warm sunset orange
+    float  tSky     = saturate(y);               // 0 at horizon, 1 at zenith
+    float3 sky      = lerp(horizon,
+                           lerp(midSky, zenith, smoothstep(0.0, 0.6, tSky)),
+                           smoothstep(0.0, 0.4, tSky));
+
+    // Ground band below the horizon - dirt brown deepening with depth.
+    float3 ground   = lerp(float3(0.42, 0.30, 0.18),
+                           float3(0.10, 0.07, 0.05),
+                           saturate(-y * 1.4));
+
+    // Sun glow at the horizon facing the actual sun.  When the ray
+    // direction is roughly aligned with the sun's azimuth the warm tone
+    // brightens further, simulating the corona / atmospheric scatter.
+    float3 sunDir   = normalize(g_scene.lightDir.xyz);
+    float  sunAlign = saturate(dot(d, sunDir));
+    float3 sunGlow  = float3(1.20, 0.70, 0.30) *
+                      pow(sunAlign, 8.0) *
+                      smoothstep(-0.05, 0.30, y);  // only above horizon
+
+    // Composite.
+    float3 col = (y >= 0.0) ? sky : ground;
+    col += sunGlow;
+    p.color = float4(col, 1);
 }
 
 [shader("miss")]
@@ -161,7 +202,8 @@ float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth)
     r.TMin      = 0.001;
     r.TMax      = 100.0;
     Payload bp;
-    bp.color = float4(0, 0, 0, (float)childDepth);
+    bp.color = float4(0, 0, 0, 1);
+    bp.depth = childDepth;          // dedicated write(caller)/read(closesthit) field
     TraceRay(Scene, cullFlags, 0xff, /*RayContrib*/0, /*MultiplierGeoContrib*/0,
              /*MissIdx*/0, r, bp);
     return bp.color.rgb;
@@ -275,3 +317,4 @@ void Hit(inout Payload p, in Attribs a)
 
     p.color = float4(finalColor, 1);
 }
+

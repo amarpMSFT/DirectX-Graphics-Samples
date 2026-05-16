@@ -314,9 +314,11 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // Torus, rotated ~60° around X so the donut hole faces camera-up rather
     // than pointing straight down (where it'd be invisible from any orbiting
     // camera angle). The +Y world axis is the orbit axis; the torus's
-    // generator built it lying flat in XZ.
+    // generator built it lying flat in XZ. Lifted to y=+0.2 so the rotated
+    // donut's lower extent (~-0.63 below center) stays clear of the floor
+    // at y=-0.7.
     add(ProceduralGeometry::GenerateTorusSpatialTiles(0.55f, 0.18f, 32, 16, /*tileR*/4, /*tileS*/4, 400),
-        with_y(hex(4), -0.3f), 1.0f, 4,
+        with_y(hex(4),  0.2f), 1.0f, 4,
         XMFLOAT3(1.0472f, 0.0f, 0.0f));                                   // ~60° around X
 
     // Cube (one cluster per face).
@@ -336,22 +338,23 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
             /*firstClusterID*/600),
         XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 6x6 = 36 floor clusters
 
-    // Klein bottle - figure-8 immersion, parked OUTSIDE the hex group on
-    // the +X side so it doesn't dominate the default camera frame.  Tilted
-    // forward + slight yaw so the non-orientable figure-8 silhouette
-    // reads clearly from any orbiting camera angle.  STOCHASTIC
-    // translucency (frosted-glass per-triangle any-hit reject) gives a
-    // noisy partial-transparency look that highlights the surface's
-    // self-intersections - rays passing through the outer sheet hit the
-    // inner sheet (or another section of outer sheet) and produce
-    // naturally-layered visual complexity.
+    // Klein bottle - the iconic "neck-through-body" Klein bottle, parked
+    // WELL OUTSIDE the hex group on the +X side so it doesn't dominate the
+    // default camera frame and clears the large sphere at hex(0)=(1.6,
+    // 0.1, 0). Stands upright (height along world Y, half-height ≈
+    // bottleScale=0.55), centred at y=0 so the bottle's lower extent
+    // (~ y=-0.55) stays above the floor at y=-0.7. STOCHASTIC translucency
+    // (frosted-glass per-triangle any-hit reject) gives a noisy partial-
+    // transparency look that highlights the bottle's self-intersection -
+    // rays passing through the outer sheet hit the inner sheet (or the
+    // neck where it dives through the body wall) and produce naturally-
+    // layered visual complexity.
     add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
-            /*bottleScale*/0.28f,
-            /*numU*/32, /*numV*/16,
-            /*tileUSize*/4, /*tileVSize*/4,
+            /*bottleScale*/0.55f,
+            /*numU*/64, /*numV*/32,                                       // higher res for the curvy bottle
+            /*tileUSize*/8, /*tileVSize*/8,
             /*firstClusterID*/700),
-        XMFLOAT3(2.8f, 0.3f, -0.6f), 1.0f, 8,                             // 8x4 = 32 klein clusters
-        XMFLOAT3(0.6f, 0.4f, 0.0f));                                      // tilt forward + slight yaw
+        XMFLOAT3(3.6f, 0.0f, 0.0f), 1.0f, 8);                             // 8x4 = 32 klein clusters, 4096 tris
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).

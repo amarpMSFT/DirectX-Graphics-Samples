@@ -21,7 +21,7 @@
 // D3D12_SDK_VERSION (= 620, the latest non-preview release). When a real Agility
 // SDK NuGet package shipping DXR2 ships, swap this back to D3D12_SDK_VERSION.
 extern "C" { __declspec(dllexport) extern const UINT  D3D12SDKVersion = D3D12_PREVIEW_SDK_VERSION; }
-extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath    = u8".\\D3D12\\"; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath    = ".\\D3D12\\"; }
 
 _Use_decl_annotations_
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)

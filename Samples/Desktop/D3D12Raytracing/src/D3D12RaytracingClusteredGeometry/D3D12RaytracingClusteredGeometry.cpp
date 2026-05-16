@@ -13,6 +13,8 @@
 #include "D3D12RaytracingClusteredGeometry.h"
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\\Raytracing.hlsl.h"
+#include "SceneData.h"
+#include "MaterialData.h"
 
 #include <DirectXMath.h>
 #include <algorithm>
@@ -298,128 +300,67 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildScene()
 {
-    // 12 bits/axis = 36 bits/vertex. Per-axis bit counts in the bitstream
-    // (driven by maxDelta per axis) are typically much less for clusters
-    // with constant or near-constant components (cube faces have 1 bit on
-    // the constant axis).
+    // 12 bits/axis = 36 bits/vertex for Compressed1 vertex format.  Per-
+    // axis bit counts in the actual bitstream (driven by maxDelta per
+    // axis) are typically much less for clusters with constant or near-
+    // constant components (e.g. cube faces have 1 bit on the constant axis).
     constexpr int kCompressedBitsPerComponent = 12;
 
-    auto add = [&](ProceduralGeometry::Mesh&& mesh, const XMFLOAT3& pos, float scale, UINT instanceID,
-                   const XMFLOAT3& euler = XMFLOAT3(0,0,0)) -> ClusterObject&
+    // GENERIC scene-build pass.  Iterates over the pure-data scene
+    // definition (SceneData::BuildSceneDefinition()) and dispatches to
+    // the right ProceduralGeometry generator per ObjectSpec.  All art /
+    // material / placement / per-cluster-checker config lives in
+    // SceneData.cpp - this function has zero hardcoded geometry numbers
+    // and zero per-object branches outside the GenKind switch.
+    using SD = SceneData::ObjectSpec;
+    const auto scene = SceneData::BuildSceneDefinition();
+
+    auto genMesh = [](const SD& s) -> ProceduralGeometry::Mesh
+    {
+        switch (s.kind)
+        {
+        case SceneData::GenKind::UVSphere:
+            return ProceduralGeometry::GenerateUVSphereSpatialTiles(
+                s.args.sphereRadius, s.args.sphereNumLat, s.args.sphereNumLong,
+                s.args.sphereTileLat, s.args.sphereTileLong, s.firstClusterID);
+        case SceneData::GenKind::Torus:
+            return ProceduralGeometry::GenerateTorusSpatialTiles(
+                s.args.torusMajor, s.args.torusMinor,
+                s.args.torusRingSegs, s.args.torusSideSegs,
+                s.args.torusTileRing, s.args.torusTileSide, s.firstClusterID);
+        case SceneData::GenKind::Cube:
+            return ProceduralGeometry::GenerateCubeSpatialTiles(
+                s.args.cubeHalfExtent, s.args.cubeFaceSubdiv,
+                s.args.cubeTileSize, s.firstClusterID);
+        case SceneData::GenKind::Slab:
+            return ProceduralGeometry::GeneratePlaneSpatialTiles(
+                s.args.slabHalfSizeU, s.args.slabHalfSizeV,
+                s.args.slabTilesU, s.args.slabTilesV,
+                s.args.slabTileQuadsU, s.args.slabTileQuadsV,
+                s.firstClusterID, s.args.slabThickness);
+        case SceneData::GenKind::Klein:
+            return ProceduralGeometry::GenerateKleinBottleSpatialTiles(
+                s.args.kleinScale, s.args.kleinNumU, s.args.kleinNumV,
+                s.args.kleinTileUSize, s.args.kleinTileVSize, s.firstClusterID);
+        }
+        // Unreachable - all enum cases handled above.
+        return ProceduralGeometry::Mesh{};
+    };
+
+    for (const SD& s : scene)
     {
         ClusterObject obj;
-        obj.mesh          = std::move(mesh);
-        obj.worldPos      = pos;
-        obj.worldScale    = scale;
-        obj.worldRotEuler = euler;
-        obj.instanceID    = instanceID;
+        obj.mesh          = genMesh(s);
+        obj.worldPos      = s.pos;
+        obj.worldScale    = s.scale;
+        obj.worldRotEuler = s.rotEuler;
+        obj.instanceID    = s.instanceID;
+        obj.checker       = s.checker;
+        obj.surfTintMul   = s.surfTintMul;
+        obj.refrTintMul   = s.refrTintMul;
+        obj.reflTintMul   = s.reflTintMul;
         m_objects.push_back(std::move(obj));
-        return m_objects.back();
-    };
-
-    // Arrange the six objects in a roughly-hexagonal cluster around the origin
-    // in the XZ plane, with small Y offsets for visual interest. Camera orbits
-    // around Y, so every angle frames the whole group evenly (no view ends up
-    // with one giant object in front and the rest tiny behind it).
-    // Hex coordinates: x = R cos(theta), z = R sin(theta), six positions 60° apart.
-    constexpr float R = 2.55f;                                                // outer hex radius (was 2.20) - objects spaced further apart for breathing room.  Max object extent (R + sphere0 radius 0.85) = 3.40, safely inside slab halfSize 3.5.
-    auto hex = [&](int i) {
-        float th = (float)i * (2.0f * (float)M_PI / 6.0f);
-        return XMFLOAT3(R * std::cos(th), 0.0f, R * std::sin(th));
-    };
-
-    auto with_y = [](XMFLOAT3 p, float y) { p.y = y; return p; };
-
-    // ------------------------------------------------------------------
-    // SPHERES.  Per-object SCENE CONFIG is attached right after add() to
-    // drive the GENERIC BuildClusterMetadata() pass - no per-instance
-    // branches anywhere in the shader.  (In Phase E these become static
-    // table entries in SceneData.h, removed from this engine code.)
-    // ------------------------------------------------------------------
-    // Sphere0 - CHROME, no checker.  reflTintMul stays at default 1.08
-    // so the chrome ball shows its cluster grid clearly in the mirror.
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 32, 64, /*tileLat*/4, /*tileLong*/8, 0),
-        with_y(hex(0),  0.40f), 1.0f, 0);                                  // 8x8=64 clusters - lifted clear of floor
-
-    // Sphere1 - SHINY-MIRROR / TRANSLUCENT-GLASS checker.  Odd-parity
-    // clusters override to mirror (refl=0.90, refr=0); even-parity
-    // clusters keep the baseline translucent glass material.
-    {
-        auto& obj = add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
-            with_y(hex(1),  0.4f), 1.0f, 1);                               // 6x8=48 clusters
-        obj.checker.enabled = true;
-        obj.checker.oddParity.overrideRefl = 0.90f;
-        obj.checker.oddParity.overrideRefr = 0.0f;
-        obj.checker.oddParity.overrideIor  = 0.0f;
     }
-
-    // Sphere2 - MATTE-VIBRANT / TRANSLUCENT-GLASS checker.  Odd-parity:
-    // translucent glass override.  Even-parity: brighten baseColor 1.45x
-    // so the matte tiles read as vibrant colour patches.
-    {
-        auto& obj = add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),
-            with_y(hex(2), -0.1f), 1.0f, 2);                               // 4x8=32 clusters
-        obj.checker.enabled = true;
-        obj.checker.oddParity.overrideRefr = 0.85f;
-        obj.checker.oddParity.overrideIor  = 1.50f;
-        obj.checker.evenParity.baseColorScale = 1.45f;
-    }
-
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.45f, 12, 24, /*tileLat*/3, /*tileLong*/4, 300),
-        with_y(hex(3),  0.3f), 1.0f, 3);                                  // 4x6=24 clusters
-
-    // Torus, rotated ~60° around X so the donut hole faces camera-up rather
-    // than pointing straight down (where it'd be invisible from any orbiting
-    // camera angle). The +Y world axis is the orbit axis; the torus's
-    // generator built it lying flat in XZ. Lifted to y=+0.2 so the rotated
-    // donut's lower extent (~-0.63 below center) stays clear of the floor
-    // at y=-0.7.
-    add(ProceduralGeometry::GenerateTorusSpatialTiles(0.55f, 0.18f, 32, 16, /*tileR*/4, /*tileS*/4, 400),
-        with_y(hex(4),  0.2f), 1.0f, 4,
-        XMFLOAT3(1.0472f, 0.0f, 0.0f));                                   // ~60° around X
-
-    // Cube (one cluster per face).
-    add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
-        with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
-
-    // Floor - GLASS SLAB with chess-board CHECKER (top + bottom + 4 walls
-    // share cluster colour + material per column).  Odd-parity tiles are
-    // MIRROR override; even-parity keep the baseline translucent glass.
-    // Tint mults dial the floor's stained-glass intensity down so the
-    // translucent tiles read as pale glass (not saturated coloured bricks).
-    {
-        auto& obj = add(ProceduralGeometry::GeneratePlaneSpatialTiles(
-                /*halfSizeU*/3.5f, /*halfSizeV*/3.5f,
-                /*tilesU*/6,       /*tilesV*/6,
-                /*tileQuadsU*/4,   /*tileQuadsV*/4,
-                /*firstClusterID*/600,
-                /*thickness*/0.28f),
-            XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);
-        obj.checker.enabled = true;
-        obj.checker.oddParity.overrideRefl = 0.85f;
-        obj.checker.oddParity.overrideRefr = 0.0f;
-        obj.checker.oddParity.overrideIor  = 0.0f;
-        // Reduce surface + refraction + reflection tinting on the floor.
-        // Default clusterTint = 0.65; the resulting effective blends are:
-        //   surf = 0.65 * 0.40 = 0.26   (pale glass colour bias)
-        //   refr = 0.65 * 0.25 = 0.16   (refraction reads cleanly)
-        //   refl = 0.65 * 0.31 = 0.20   (mirror tiles show sky-direction
-        //                                variation, not cluster identity)
-        obj.surfTintMul = 0.40f;
-        obj.refrTintMul = 0.25f;
-        obj.reflTintMul = 0.31f;
-    }
-
-    // Klein bottle - the iconic "neck-through-body" parametric Klein
-    // bottle, GLASS-LIKE: real Snell refraction + a faint mirror sheen.
-    // No checker; uses default tint mults.
-    add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
-            /*bottleScale*/0.65f,
-            /*numU*/32, /*numV*/16,
-            /*tileUSize*/4, /*tileVSize*/4,
-            /*firstClusterID*/700),
-        XMFLOAT3(-1.55f, 1.55f, -0.30f), 1.0f, 8,
-        XMFLOAT3(0.20f, 0.55f, 0.0f));
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -727,44 +668,19 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
 {
     auto device = m_deviceResources->GetD3DDevice();
 
-    auto set = [&](UINT slot, float r, float g, float b,
-                   float reflectivity, float refractivity, float ior, float translucency)
-    {
-        MaterialDesc m = {};
-        m.baseColor.x  = r;
-        m.baseColor.y  = g;
-        m.baseColor.z  = b;
-        m.baseColor.w  = 0.0f;
-        m.reflectivity = reflectivity;
-        m.refractivity = refractivity;
-        m.ior          = ior;
-        m.translucency = translucency;
-        m_materials[slot] = m;
-    };
-    //   slot  R     G     B    refl  refr  ior   trans
-    // Most objects are GLASS variants (different IORs / tints) so the
-    // closesthit's refraction + internal-reflection compose all over the
-    // scene.  Sphere0 (the LARGEST, most-prominent foreground sphere) and
-    // the cube are FORCE_OPAQUE + mirror-shiny instead - they exercise
-    // the FORCE_OPAQUE TLAS-instance flag path (no any-hit, single
-    // closesthit, deterministic mirror bounce) and give the scene
-    // distinct non-glass focal points for visual contrast.
-    set(0,    0.95f, 0.95f, 1.00f, 0.95f, 0.0f,  0.0f,  0.0f); // sphere0  CHROME (opaque, 95% mirror) - large foreground ball
-    set(1,    0.92f, 0.95f, 1.00f, 0.10f, 0.82f, 1.55f, 0.0f); // sphere1  clear glass (densest)
-    set(2,    0.55f, 0.95f, 0.85f, 0.0f,  0.0f,  0.0f,  0.0f); // sphere2  MATTE OPAQUE aqua (no refl, no refr - exercises FORCE_OPAQUE flag with a pure-diffuse surface for variety)
-    set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
-    set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
-    set(5,    0.92f, 0.78f, 0.60f, 0.10f, 0.82f, 1.50f, 0.0f); // cube     translucent copper-tinted glass (heavily see-through)
-    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.80f, 1.50f, 0.0f); // floor    glass SLAB - HIGH refractivity so the TRANSLUCENT tiles read clearly as "windows" you can see through (top -> bottom face -> sand below), with the SHINY tiles' mirror behaviour as the clear visual contrast.  Mirror tiles (parity isB=true) still get the per-cluster reflectivity=0.85 override at runtime.
-    set(7,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // animated clear glass
-    set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // klein    clear glass
+    // Pure copy from the data table.  The actual MaterialDesc values
+    // live in MaterialData.cpp - this engine code never touches the
+    // baseColor / refl / refr / ior numbers directly.
+    std::copy(MaterialData::kMaterials.begin(),
+              MaterialData::kMaterials.end(),
+              m_materials.begin());
 
     AllocateUploadBuffer(device, m_materials.data(),
                          m_materials.size() * sizeof(MaterialDesc),
                          &m_materialsBuffer, L"Per-instance materials");
 
-    SampleLog::LogF(L"[materials] %u slots; refractive ior=%.2f for slot 7 (animated sphere)\n",
-                    (unsigned)m_materials.size(), m_materials[7].ior);
+    SampleLog::LogF(L"[materials] %u slots loaded from MaterialData::kMaterials\n",
+                    (unsigned)m_materials.size());
 }
 
 
@@ -891,7 +807,7 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
     // but otherwise carries the same per-cluster info on its mesh).
     auto fillFromMesh = [&](const ProceduralGeometry::Mesh& mesh,
                             UINT cidOffset,
-                            const ClusterObject::CheckerConfig& checker,
+                            const CheckerConfig& checker,
                             float surfTintMul, float refrTintMul, float reflTintMul)
     {
         for (const auto& c : mesh.clusters)
@@ -927,7 +843,7 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
         // checker, baseline tint multipliers).  When scene data moves to
         // SceneData.h in Phase E the animated object can be a regular
         // ClusterObject entry like the rest.
-        ClusterObject::CheckerConfig noChecker;
+        CheckerConfig noChecker;
         fillFromMesh(m_animatedObject.mesh, kAnimatedClusterIdOffset,
                      noChecker, /*surf*/1.0f, /*refr*/0.50f, /*refl*/1.08f);
     }

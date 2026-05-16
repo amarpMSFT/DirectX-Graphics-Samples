@@ -16,6 +16,7 @@
 #include "ProceduralGeometry.h"
 #include "Compressed1.h"
 #include "RaytracingHlslCompat.h"
+#include "SceneCommon.h"          // CheckerConfig shared with SceneData::ObjectSpec
 #include <DirectXMath.h>
 #include <array>
 
@@ -66,35 +67,19 @@ struct ClusterObject
     UINT                                     instanceID    = 0;
 
     // ------------------------------------------------------------------
-    // Per-object SCENE/ART config (will move to SceneData.h in Phase E).
-    // Drives the GENERIC BuildClusterMetadata() pass which produces the
-    // per-cluster GPU buffer: shader has zero per-object branches.
+    // Per-object SCENE/ART config copied from SceneData::ObjectSpec at
+    // BuildScene() time.  Drives the GENERIC BuildClusterMetadata() pass
+    // which produces the per-cluster GPU buffer: shader has zero per-
+    // object branches.
     // ------------------------------------------------------------------
-    struct CheckerOverride
-    {
-        // <0 sentinel = no override.  Otherwise the value replaces the
-        // baseline material's corresponding field for clusters matching
-        // this side of the parity.
-        float overrideRefl     = -1.0f;
-        float overrideRefr     = -1.0f;
-        float overrideIor      = -1.0f;
-        // 1.0 = no change.  Multiplies the baseline material's baseColor.xyz.
-        float baseColorScale   =  1.0f;
-    };
-    struct CheckerConfig
-    {
-        bool             enabled = false;
-        CheckerOverride  evenParity;     // (gridU + gridV) & 1 == 0
-        CheckerOverride  oddParity;      // (gridU + gridV) & 1 == 1
-    };
-    CheckerConfig checker;
+    CheckerConfig checker;            // see SceneCommon.h
 
     // Per-object TINT MULTIPLIERS (applied to ALL clusters of this object,
     // baked into per-cluster ClusterMeta).  Each multiplies the global
     // clusterTint slider before its respective lerp blend.
-    float surfTintMul = 1.0f;   // surface base-colour cluster tint
-    float refrTintMul = 0.50f;  // refraction tint
-    float reflTintMul = 1.08f;  // reflection tint  (= 0.70 / 0.65 default)
+    float surfTintMul = 1.0f;
+    float refrTintMul = 0.50f;
+    float reflTintMul = 1.08f;
 };
 
 class D3D12RaytracingClusteredGeometry : public DXSample
@@ -456,5 +441,7 @@ private:
     static const wchar_t* c_hitGroupName;
     static const wchar_t* c_shadowHitGroupName;
 };
+
+
 
 

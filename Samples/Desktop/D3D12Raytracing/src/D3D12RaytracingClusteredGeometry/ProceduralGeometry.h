@@ -554,55 +554,79 @@ namespace ProceduralGeometry
         const float kPi = 3.14159265358979323846f;
 
         // ------------------------------------------------------------------
-        // FIGURE-8 KLEIN BOTTLE IMMERSION (smooth, single closed formula).
+        // BOTTLE-WITH-HANDLE Klein-bottle silhouette, made C1-smooth at the
+        // body↔handle seam via a SMOOTHSTEP BLEND.
         //
-        // Earlier this generator used a piecewise (`if u<π / else`) glue
-        // of two parametrics - one for the "body" and one for the
-        // "handle" - to make the silhouette read as a glass bottle.  The
-        // position was C0-continuous at the u=π seam but the DERIVATIVES
-        // weren't, so the central-difference normal calculation averaged
-        // two unrelated slopes and produced garbage normals at the seam
-        // (visible as a triangular sky-coloured "perfect-clear" patch
-        // where refraction shot rays in random directions, often
-        // straight to the sky).
+        // History: the natural "literal glass bottle with handle looping
+        // through the body" silhouette comes from gluing two parametrics -
+        // one for the body, one for the handle - at u = π.  Both formulas
+        // produce the SAME POSITION at u=π so the surface is C0-continuous,
+        // but their DERIVATIVES at u=π differ (∂z/∂u disagrees by r·cv).
+        // A hard switch (`if (u < π) ... else ...`) made the central-
+        // difference normal calculator straddle two unrelated slopes
+        // RIGHT at the cluster boundary that sits on u=π, producing
+        // garbage normals → a triangular sky-coloured "perfect-clear"
+        // refraction artifact on the bottle's handle.
         //
-        // The canonical figure-8 immersion solves the problem completely:
-        // one closed-form formula, smooth everywhere, with the Klein
-        // topology encoded directly via the u/2 and sin(2v) terms.  The
-        // surface IS continuous and C1 at every u, so central-difference
-        // normals are accurate everywhere.  Visual is a flat-ring sweep
-        // where the cross-section is a figure-8 that rotates by u/2 as
-        // it goes around the ring - this is the "abstract math Klein
-        // bottle" rather than a literal glass bottle, but the
-        // topological inversion (no inside vs outside) is honestly
-        // captured.
+        // Fix: keep BOTH formulas exactly as they were (so the silhouette
+        // away from the seam is unchanged) but BLEND them with a
+        // smoothstep weight over a narrow window u ∈ [π − δ, π + δ].
         //
-        //   x(u,v) = (R + r·cos(u/2)·sin(v) − r·sin(u/2)·sin(2v)) · cos(u)
-        //   y(u,v) = (R + r·cos(u/2)·sin(v) − r·sin(u/2)·sin(2v)) · sin(u)
-        //   z(u,v) = r·sin(u/2)·sin(v) + r·cos(u/2)·sin(2v)
+        //   weight(u) = smoothstep(0, 1, (u − (π − δ)) / (2δ))
+        //   point(u, v) = (1 − weight) · body(u, v) + weight · handle(u, v)
         //
-        //   u ∈ [0, 2π], v ∈ [0, 2π].  R = major (sweep) radius;
-        //   r = minor (figure-8 cross-section) radius.
+        // Because body(π, v) ≡ handle(π, v), the blend has zero
+        // discontinuity at the seam (the weight·(handle − body) term
+        // vanishes there).  Within the window the formula is C1 (since
+        // each side is C1 and smoothstep is C1).  Outside the window
+        // (|u − π| > δ) the formula reduces EXACTLY to body or handle,
+        // so the silhouette away from the seam is identical to the
+        // pre-fix bottle.  δ = π/16 means only ≈ 6 % of the bottle's u
+        // range gets blended, and the change is visually a smooth
+        // transition through the body↔handle join instead of a kink.
         // ------------------------------------------------------------------
-        const float R = 4.0f;      // major sweep radius
-        const float r = 1.6f;      // figure-8 cross-section radius
+        const float kVscale       = 13.0f;     // vertical-extent knob (was 16 textbook)
+        const float kThinDrop     = 7.0f;      // drop the thin (u=0/2π) join down
+        const float kBlendDelta   = kPi / 16.0f;  // smoothstep window half-width
 
-        auto kleinPoint = [R, r](float u, float v) -> float3
+        auto bodyPoint = [kVscale, kThinDrop](float u, float v) -> float3
         {
-            const float cu  = std::cos(u),       su  = std::sin(u);
-            const float cv  = std::sin(v),       sv2 = std::sin(2.0f * v);
-            const float cu2 = std::cos(u * 0.5f), su2 = std::sin(u * 0.5f);
-            const float radial = R + r * cu2 * cv - r * su2 * sv2;
-            const float x = radial * cu;
-            const float y = radial * su;
-            const float z = r * su2 * cv + r * cu2 * sv2;
+            const float cu = std::cos(u), su = std::sin(u);
+            const float cv = std::cos(v);
+            const float r  = 4.0f * (1.0f - cu * 0.5f);
+            const float halfCos = std::cos(u * 0.5f);
+            const float thinShift = -kThinDrop * halfCos * halfCos;
+            const float x = 6.0f * cu * (1.0f + su) + r * cu * cv;
+            const float z = -kVscale * su - r * su * cv + thinShift;
+            const float y = r * std::sin(v);
             return { x, y, z };
         };
+        auto handlePoint = [kVscale, kThinDrop, kPi](float u, float v) -> float3
+        {
+            const float cu = std::cos(u), su = std::sin(u);
+            const float r  = 4.0f * (1.0f - cu * 0.5f);
+            const float halfCos = std::cos(u * 0.5f);
+            const float thinShift = -kThinDrop * halfCos * halfCos;
+            const float x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
+            const float z = -kVscale * su + thinShift;
+            const float y = r * std::sin(v);
+            return { x, y, z };
+        };
+        auto kleinPoint = [&bodyPoint, &handlePoint, kPi, kBlendDelta](float u, float v) -> float3
+        {
+            if (u <= kPi - kBlendDelta) return bodyPoint(u, v);
+            if (u >= kPi + kBlendDelta) return handlePoint(u, v);
+            // Blend window: smoothstep weight 0 -> 1 across [π-δ, π+δ].
+            const float t = (u - (kPi - kBlendDelta)) / (2.0f * kBlendDelta);
+            const float w = t * t * (3.0f - 2.0f * t);   // smoothstep
+            const float3 b = bodyPoint(u, v);
+            const float3 h = handlePoint(u, v);
+            return { (1.0f - w) * b.x + w * h.x,
+                     (1.0f - w) * b.y + w * h.y,
+                     (1.0f - w) * b.z + w * h.z };
+        };
 
-        // Bottle scale: the figure-8 immersion's dominant extent is
-        // 2*(R+r) along x and y.  Map that to the user's bottleScale so
-        // the bottle's diameter ≈ 2*bottleScale.
-        const float invSpan = bottleScale / (R + r);
+        const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         unsigned int clusterCounter = firstClusterID;
         for (int tu = 0; tu < tilesU; ++tu)
@@ -625,9 +649,9 @@ namespace ProceduralGeometry
 
                 float3 p = kleinPoint(u, v);
 
-                // Central-difference partials Pu, Pv -> normal = Pu x Pv.
-                // SAFE everywhere now: the formula is a single smooth
-                // closed-form, no piecewise branches to straddle.
+                // Central-difference partials -> normal = Pu x Pv.
+                // SAFE everywhere now: kleinPoint is C1 across the seam
+                // thanks to the smoothstep blend above.
                 const float h = 1e-3f;
                 float3 pu1 = kleinPoint(u + h, v);
                 float3 pu0 = kleinPoint(u - h, v);
@@ -646,10 +670,9 @@ namespace ProceduralGeometry
                 if (L < 1e-12f) { n = { 0, 1, 0 }; L = 1; }
                 n.x /= L; n.y /= L; n.z /= L;
 
-                // Output axes: world Y is UP for the scene.  The figure-8
-                // immersion has its sweep ring in the (x, y) plane and
-                // its "thickness" along z, so we lift z to world Y so
-                // the ring lies flat-ish above the floor.
+                // Output axes:  world X = bottle's wide axis (orig x);
+                //               world Y = bottle's height axis (orig z);
+                //               world Z = bottle's depth axis (orig y).
                 c.positions.push_back({ invSpan * p.x,
                                         invSpan * p.z,
                                         invSpan * p.y });

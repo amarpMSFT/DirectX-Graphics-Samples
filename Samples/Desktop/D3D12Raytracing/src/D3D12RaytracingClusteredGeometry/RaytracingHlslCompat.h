@@ -25,5 +25,8 @@ struct SceneConstantBuffer
 {
     XMMATRIX  viewToWorld;       // ray gen camera basis (also applies translation)
     XMFLOAT4  cameraPosition;    // .xyz = world-space eye position
-    XMFLOAT4  miscParams;        // .x = aspect ratio, .y = tan(fov/2), .z = unused, .w = unused
+    XMFLOAT4  miscParams;        // .x = aspect ratio, .y = tan(fov/2), .z/.w = unused
+    XMFLOAT4  lightDir;          // .xyz = world-space direction TO the sun (normalized),
+                                 // .w   = ambient floor [0..1] (so shadowed regions remain
+                                 //        readable instead of pitch black)
 };

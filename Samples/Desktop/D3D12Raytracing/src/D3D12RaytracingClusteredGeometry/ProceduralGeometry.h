@@ -252,4 +252,70 @@ namespace ProceduralGeometry
         }
         return m;
     }
+
+    // ------------------------------------------------------------------
+    // Flat XZ-plane built as a (tilesU x tilesV) grid of cluster tiles,
+    // each cluster being (tileQuadsU x tileQuadsV) quads in the plane's
+    // local frame (centred at origin, +Y normal). The N-cluster floor
+    // demonstrates that cluster geometry doesn't have to be curved -
+    // a flat ground plane benefits from CLAS just as much (still gets
+    // per-cluster opacity flags, BLAS-from-CLAS aggregation, and the
+    // memory savings of compressed1 / position-truncate).
+    //
+    // Output verts per cluster = (tileQuadsU+1) * (tileQuadsV+1); keep
+    // the product <= 256 so 8-bit indices remain valid.
+    // ------------------------------------------------------------------
+    inline Mesh GeneratePlaneSpatialTiles(
+        float halfSizeU, float halfSizeV,
+        int tilesU, int tilesV,
+        int tileQuadsU, int tileQuadsV,
+        unsigned int firstClusterID = 0)
+    {
+        Mesh m;
+        m.clusters.reserve((size_t)tilesU * tilesV);
+        const int rowSize = tileQuadsU + 1;
+        const float tileWidthU = 2.0f * halfSizeU / (float)tilesU;
+        const float tileWidthV = 2.0f * halfSizeV / (float)tilesV;
+        const float quadWidthU = tileWidthU / (float)tileQuadsU;
+        const float quadWidthV = tileWidthV / (float)tileQuadsV;
+
+        unsigned int clusterCounter = firstClusterID;
+        for (int tu = 0; tu < tilesU; ++tu)
+        for (int tv = 0; tv < tilesV; ++tv)
+        {
+            Cluster c;
+            c.clusterID = clusterCounter++;
+            const float baseU = -halfSizeU + (float)tu * tileWidthU;
+            const float baseV = -halfSizeV + (float)tv * tileWidthV;
+
+            // Vertices: (tileQuadsU+1) x (tileQuadsV+1) on the XZ plane (Y=0).
+            for (int li = 0; li <= tileQuadsU; ++li)
+            for (int lj = 0; lj <= tileQuadsV; ++lj)
+            {
+                c.positions.push_back({
+                    baseU + (float)li * quadWidthU,
+                    0.0f,
+                    baseV + (float)lj * quadWidthV
+                });
+            }
+            // Indices: two triangles per quad, both wound CCW when viewed from
+            // above (i.e. normal = +Y). Camera sits at +Y > 0 so it looks
+            // DOWN at the floor; without the +Y winding, RAY_FLAG_CULL_BACK_-
+            // FACING_TRIANGLES would silently hide the entire floor.
+            for (int li = 0; li < tileQuadsU; ++li)
+            for (int lj = 0; lj < tileQuadsV; ++lj)
+            {
+                uint8_t i00 = (uint8_t)(li     * rowSize + lj    );
+                uint8_t i01 = (uint8_t)(li     * rowSize + lj + 1);
+                uint8_t i10 = (uint8_t)((li+1) * rowSize + lj    );
+                uint8_t i11 = (uint8_t)((li+1) * rowSize + lj + 1);
+                c.indices.push_back(i00); c.indices.push_back(i01); c.indices.push_back(i11);
+                c.indices.push_back(i00); c.indices.push_back(i11); c.indices.push_back(i10);
+            }
+            m.totalTriangles += (unsigned int)tileQuadsU * tileQuadsV * 2;
+            m.totalVertices  += (unsigned int)(tileQuadsU + 1) * (tileQuadsV + 1);
+            m.clusters.push_back(std::move(c));
+        }
+        return m;
+    }
 }

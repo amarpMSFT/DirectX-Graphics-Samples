@@ -322,9 +322,17 @@ private:
                                  const uint8_t* data, UINT rowPitchBytes);
 
     // Shader entry-point names (must match Raytracing.hlsl).
+    // Shader entry-point names (must match Raytracing.hlsl). Two ray indices:
+    //   0 = primary ray  (Miss + ClusterHitGroup)
+    //   1 = shadow ray   (ShadowMiss + ShadowHitGroup -- the shadow hit group's
+    //                     closesthit is never invoked because shadow rays use
+    //                     SKIP_CLOSEST_HIT_SHADER, but DXR still requires a
+    //                     hit-group record per ray-contribution index)
     static const wchar_t* c_raygenName;
     static const wchar_t* c_closestHitName;
     static const wchar_t* c_missName;
+    static const wchar_t* c_shadowMissName;
     static const wchar_t* c_hitGroupName;
+    static const wchar_t* c_shadowHitGroupName;
 };
 

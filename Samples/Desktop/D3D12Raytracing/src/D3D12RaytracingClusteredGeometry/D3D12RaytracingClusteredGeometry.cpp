@@ -25,10 +25,12 @@ using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
 // ==== Shader entry-point names (must match Raytracing.hlsl) ====
-const wchar_t* D3D12RaytracingClusteredGeometry::c_raygenName     = L"RayGen";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_closestHitName = L"Hit";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_missName       = L"Miss";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_hitGroupName   = L"ClusterHitGroup";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_raygenName        = L"RayGen";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_closestHitName    = L"Hit";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_missName          = L"Miss";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowMissName    = L"ShadowMiss";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_hitGroupName      = L"ClusterHitGroup";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowHitGroupName= L"ShadowHitGroup";
 
 // =====================================================================================
 // Construction + command-line + lifecycle
@@ -163,7 +165,26 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     // is attached) the process exits with STATUS_BREAKPOINT (0xC0000005-ish)
     // without us ever seeing WHY - which makes WARP and other layered failures
     // very hard to diagnose. The callback runs in-process before the break.
+    //
+    // Also mute id=1328 (CREATERESOURCE_STATE_IGNORED) - this is a benign
+    // D3D12 quirk: buffer resources are always created in COMMON state
+    // regardless of pInitialState, and the debug layer reminds you per
+    // CreateCommittedResource. Filtering it via SetMessageFilter() leaves
+    // every other warning category active, so we still see real bugs.
     {
+        ComPtr<ID3D12InfoQueue> infoQueue0;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue0))))
+        {
+            D3D12_MESSAGE_ID denied[] = {
+                D3D12_MESSAGE_ID_CREATERESOURCE_STATE_IGNORED, // 1328
+            };
+            D3D12_INFO_QUEUE_FILTER filter = {};
+            filter.DenyList.NumIDs  = _countof(denied);
+            filter.DenyList.pIDList = denied;
+            HRESULT hrFilter = infoQueue0->AddStorageFilterEntries(&filter);
+            SampleLog::LogF(L"InfoQueue: muted id=1328 hr=0x%08X\n", (unsigned)hrFilter);
+        }
+
         ComPtr<ID3D12InfoQueue1> infoQueue1;
         if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue1))))
         {
@@ -174,6 +195,9 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
                    D3D12_MESSAGE_ID id,
                    LPCSTR desc, void* /*ctx*/)
                 {
+                    // Mute the persistent benign id=1328 in the callback path
+                    // too (storage-filter doesn't reach the callback).
+                    if (id == D3D12_MESSAGE_ID_CREATERESOURCE_STATE_IGNORED) return;
                     const wchar_t* sevStr =
                         sev == D3D12_MESSAGE_SEVERITY_CORRUPTION ? L"CORRUPTION" :
                         sev == D3D12_MESSAGE_SEVERITY_ERROR      ? L"ERROR" :
@@ -290,6 +314,19 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // Cube (one cluster per face).
     add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
         with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
+
+    // Floor plane: 6x6 cluster grid covering ±3 units in XZ at Y = -0.7.
+    // 36 clusters * 4*4 quads * 2 tris = 1152 floor triangles. The floor
+    // sits below every hex-arranged object's lowest extent (the smallest
+    // sphere descends to -0.55 + 0.4 worst case = -0.15) so nothing pokes
+    // through. Receives the directional-light shadow ray cast by hits on
+    // any other object once Stage B lands.
+    add(ProceduralGeometry::GeneratePlaneSpatialTiles(
+            /*halfSizeU*/3.0f, /*halfSizeV*/3.0f,
+            /*tilesU*/6,       /*tilesV*/6,
+            /*tileQuadsU*/4,   /*tileQuadsV*/4,
+            /*firstClusterID*/600),
+        XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 6x6 = 36 floor clusters
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -2319,22 +2356,36 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     lib->DefineExport(c_raygenName);
     lib->DefineExport(c_closestHitName);
     lib->DefineExport(c_missName);
+    lib->DefineExport(c_shadowMissName);
 
+    // Primary hit group: closest-hit only for now. Stage D adds an any-hit
+    // shader for stochastic translucency on the same hit group.
     auto hitGroup = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
     hitGroup->SetClosestHitShaderImport(c_closestHitName);
     hitGroup->SetHitGroupExport(c_hitGroupName);
     hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
+    // Shadow hit group: empty (no closest-hit, no any-hit). Shadow rays use
+    // SKIP_CLOSEST_HIT_SHADER + FORCE_OPAQUE so neither shader can run on a
+    // hit. The hit group still has to exist for ray-contribution-index 1.
+    auto shadowHitGroup = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    shadowHitGroup->SetHitGroupExport(c_shadowHitGroupName);
+    shadowHitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+    // Payload: max(Payload(float4), ShadowPayload(bool)) -> 16 bytes is enough.
     auto shaderConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
     shaderConfig->Config(/*payload*/ 4 * sizeof(float), /*attribs*/ 2 * sizeof(float));
-
     auto globalRS = pipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     globalRS->SetRootSignature(m_globalRootSignature.Get());
 
     // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for the shader to traverse a
     // BLAS built from CLAS. Without it, hits on a Cluster BLAS are undefined.
     auto pipelineConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-    pipelineConfig->Config(1, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    // MaxRecursionDepth = 2: primary ray (depth 0) -> shadow ray (depth 1).
+    // Stage C bumps to 2 (no change needed) for primary -> reflection -> shadow,
+    // and the spec lower-bounds 2 once you have either reflection or shadow,
+    // so 2 is the right number now.
+    pipelineConfig->Config(2, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -2345,20 +2396,36 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     SampleLog::Write(L"  >>> Build shader tables\n");
     ComPtr<ID3D12StateObjectProperties> props;
     ThrowIfFailed(m_dxrStateObject->QueryInterface(IID_PPV_ARGS(&props)));
-    void* rgID  = props->GetShaderIdentifier(c_raygenName);
-    void* missID= props->GetShaderIdentifier(c_missName);
-    void* hgID  = props->GetShaderIdentifier(c_hitGroupName);
+    void* rgID            = props->GetShaderIdentifier(c_raygenName);
+    void* missID          = props->GetShaderIdentifier(c_missName);
+    void* shadowMissID    = props->GetShaderIdentifier(c_shadowMissName);
+    void* hgID            = props->GetShaderIdentifier(c_hitGroupName);
+    void* shadowHgID      = props->GetShaderIdentifier(c_shadowHitGroupName);
     const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     const UINT recordSize = Align(idSize, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
-    auto makeTable = [&](void* shaderID, ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
+
+    // Single-record table (raygen).
+    auto makeTable1 = [&](void* shaderID, ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
     {
         std::vector<uint8_t> data(recordSize, 0);
         memcpy(data.data(), shaderID, idSize);
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
-    makeTable(rgID,   m_rayGenShaderTable,    L"raygen shader table");
-    makeTable(missID, m_missShaderTable,      L"miss shader table");
-    makeTable(hgID,   m_hitGroupShaderTable,  L"hit-group shader table");
+    // Two-record table (miss, hit-group). Records are at index 0 (primary) and
+    // index 1 (shadow); TraceRay's MissShaderIndex / RayContributionTo... pick
+    // which one to invoke.
+    auto makeTable2 = [&](void* shaderID0, void* shaderID1,
+                          ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
+    {
+        std::vector<uint8_t> data(recordSize * 2, 0);
+        memcpy(data.data() + 0,          shaderID0, idSize);
+        memcpy(data.data() + recordSize, shaderID1, idSize);
+        AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
+    };
+
+    makeTable1(rgID,                    m_rayGenShaderTable,   L"raygen shader table");
+    makeTable2(missID, shadowMissID,    m_missShaderTable,     L"miss shader table (primary + shadow)");
+    makeTable2(hgID,   shadowHgID,      m_hitGroupShaderTable, L"hit-group shader table (primary + shadow)");
 }
 
 void D3D12RaytracingClusteredGeometry::CreateDescriptorHeapAndRaytracingOutput()
@@ -2441,6 +2508,12 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     cb.miscParams.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60deg vertical FOV
     cb.miscParams.z = 0;
     cb.miscParams.w = 0;
+    // Sun in upper-back-right. Direction TO the light, normalized. .w is the
+    // ambient floor: even fully-shadowed pixels get this fraction of base
+    // colour so the scene reads instead of going pitch black.
+    XMVECTOR sunDir = XMVector3Normalize(XMVectorSet(0.45f, 0.75f, 0.50f, 0.0f));
+    XMStoreFloat4(&cb.lightDir, sunDir);
+    cb.lightDir.w = 0.25f;                                          // ambient floor
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
 }
 
@@ -2561,10 +2634,13 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     drd.RayGenerationShaderRecord.SizeInBytes  = m_rayGenShaderTable->GetDesc().Width;
     drd.MissShaderTable.StartAddress           = m_missShaderTable->GetGPUVirtualAddress();
     drd.MissShaderTable.SizeInBytes            = m_missShaderTable->GetDesc().Width;
-    drd.MissShaderTable.StrideInBytes          = m_missShaderTable->GetDesc().Width;
+    // Stride = single record size (32 B), not whole-table width. The miss
+    // table now has TWO records (primary + shadow); each TraceRay's
+    // MissShaderIndex selects which one by stepping `stride` bytes in.
+    drd.MissShaderTable.StrideInBytes          = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     drd.HitGroupTable.StartAddress             = m_hitGroupShaderTable->GetGPUVirtualAddress();
     drd.HitGroupTable.SizeInBytes              = m_hitGroupShaderTable->GetDesc().Width;
-    drd.HitGroupTable.StrideInBytes            = m_hitGroupShaderTable->GetDesc().Width;
+    drd.HitGroupTable.StrideInBytes            = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     drd.Width  = (UINT)bbDesc.Width;
     drd.Height = (UINT)bbDesc.Height;
     drd.Depth  = 1;

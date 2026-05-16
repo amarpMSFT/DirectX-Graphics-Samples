@@ -27,11 +27,16 @@ StructuredBuffer<MaterialDesc>    g_materials : register(t1);
 
 struct [raypayload] Payload
 {
-    // .rgb = output colour; .a = recursion depth as caller-supplied input
-    // (0 = primary ray, 1 = first bounce, ...). Closest-hit reads .a to
-    // decide whether to recurse further; both miss and closesthit overwrite
-    // .rgba on return so the caller doesn't depend on .a coming back.
-    float4 color : write(miss, closesthit, caller) : read(caller, closesthit);
+    float4 color : write(miss, closesthit) : read(caller);
+    // Explicit recursion-depth field. caller writes (raygen=0; bounced
+    // closesthit caller writes parentDepth+1), closesthit reads to decide
+    // whether to keep recursing. Kept separate from .color (rather than
+    // packed into .color.a) because the SM 6.10 raypayload qualifier's
+    // mixed write(caller, miss, closesthit) on the same field doesn't
+    // reliably propagate caller writes through to the closesthit on this
+    // driver; using a dedicated field with single-direction write(caller)
+    // + read(closesthit) qualifiers sidesteps the issue.
+    uint   depth : write(caller)        : read(closesthit);
 };
 struct [raypayload] ShadowPayload
 {
@@ -90,6 +95,7 @@ void RayGen()
 
     Payload p;
     p.color = float4(0, 0, 0, 1);
+    p.depth = 0;
     TraceRay(Scene,
         RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
         /*InstanceInclusionMask*/0xff,
@@ -211,15 +217,15 @@ void Hit(inout Payload p, in Attribs a)
     float3 surfaceColor = base * lit;
 
     float3 finalColor = surfaceColor;
-    // Recursion-cap via payload alpha. p.color.a was set by the caller to
-    // (current depth). REFLECTIVE bounces only at depth 0 (one mirror
+    // Recursion-cap via the dedicated payload .depth field (caller writes,
+    // closesthit reads). REFLECTIVE bounces only at depth 0 (one mirror
     // bounce). REFRACTIVE bounces at depths 0 AND 1: at depth 0 we refract
     // INTO the glass; at depth 1 the ray inside the glass hits the back
     // face and we refract OUT, so the camera sees the world behind the
     // glass (the proper thin-medium approximation). Depth 2 closesthits
     // render diffuse-only - their only TraceRay is the shadow ray, which
     // becomes depth 3 (the leaf, MaxRecursionDepth=3 just barely accepts).
-    const uint myDepth = (uint)p.color.a;
+    const uint myDepth = p.depth;
     if (myDepth == 0 && mat.kind == MAT_KIND_REFLECTIVE)
     {
         // One-bounce mirror reflection. Reflected ray uses back-face culling
@@ -260,6 +266,9 @@ void Hit(inout Payload p, in Attribs a)
                                           myDepth + 1);
         finalColor = lerp(surfaceColor, refractedRGB, mat.params.y);  // params.y = translucency
     }
+    // OPAQUE + STOCHASTIC: surfaceColor as-is. STOCHASTIC's "transparency" is
+    // delivered by the any-hit shader rejecting some hits on the way in,
+    // which means closest-hit never even runs for the rejected triangles.
     // OPAQUE + STOCHASTIC: surfaceColor as-is. STOCHASTIC's "transparency" is
     // delivered by the any-hit shader rejecting some hits on the way in,
     // which means closest-hit never even runs for the rejected triangles.

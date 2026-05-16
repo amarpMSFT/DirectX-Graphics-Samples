@@ -48,7 +48,7 @@ struct SceneConstantBuffer
 #define MAT_KIND_REFRACTIVE  2u
 #define MAT_KIND_STOCHASTIC  3u
 
-#define NUM_MATERIAL_SLOTS   8u   // 4 spheres + torus + cube + floor + animated
+#define NUM_MATERIAL_SLOTS   9u   // 4 spheres + torus + cube + floor + animated + klein
 
 struct MaterialDesc
 {

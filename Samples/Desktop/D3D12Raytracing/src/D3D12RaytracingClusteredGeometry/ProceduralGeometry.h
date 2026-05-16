@@ -318,4 +318,89 @@ namespace ProceduralGeometry
         }
         return m;
     }
+
+    // ------------------------------------------------------------------
+    // Klein bottle - figure-8 immersion in R^3.  A non-orientable closed
+    // surface (no inside/outside!), parametrised over (u,v) in [0, 2π]^2
+    // by:
+    //
+    //     half = u/2
+    //     r = a + cos(half)*sin(v) - sin(half)*sin(2v)
+    //     x = r * cos(u)
+    //     y = sin(half)*sin(v) + cos(half)*sin(2v)
+    //     z = r * sin(u)
+    //
+    // (Y up; the standard Klein-bottle "twisted donut" silhouette.)
+    //
+    // The figure-8 immersion DOES self-intersect in 3-space (an unavoidable
+    // consequence of squeezing a non-orientable surface into 3D), which is
+    // genuinely useful for translucency demos: refractive / stochastic rays
+    // pass into and out of multiple surface sheets, producing strikingly
+    // animated distortions and frosted-glass overlap.
+    //
+    // Mesh is decomposed into (tilesU x tilesV) cluster tiles in the same
+    // way as GenerateTorusSpatialTiles - one cluster per (tileU, tileV)
+    // patch, each cluster owning its own (tileQuadsU+1) x (tileQuadsV+1)
+    // local vertex buffer.
+    // ------------------------------------------------------------------
+    inline Mesh GenerateKleinBottleSpatialTiles(
+        float bottleScale,
+        int numU, int numV,
+        int tileUSize, int tileVSize,
+        unsigned int firstClusterID = 0)
+    {
+        Mesh m;
+        const int tilesU = numU / tileUSize;
+        const int tilesV = numV / tileVSize;
+        m.clusters.reserve((size_t)tilesU * tilesV);
+        const float kPi = 3.14159265358979323846f;
+        const float a   = 2.0f;            // figure-8 main radius
+
+        unsigned int clusterCounter = firstClusterID;
+        for (int tu = 0; tu < tilesU; ++tu)
+        for (int tv = 0; tv < tilesV; ++tv)
+        {
+            Cluster c;
+            c.clusterID = clusterCounter++;
+            const int rowSize = tileVSize + 1;
+
+            // Vertices on a (tileUSize+1) x (tileVSize+1) grid in (u,v)
+            // parameter space.
+            for (int li = 0; li <= tileUSize; ++li)
+            for (int lj = 0; lj <= tileVSize; ++lj)
+            {
+                const int gi = tu * tileUSize + li;
+                const int gj = tv * tileVSize + lj;
+                const float u = (float)gi / (float)numU * 2.0f * kPi;
+                const float v = (float)gj / (float)numV * 2.0f * kPi;
+                const float half = u * 0.5f;
+                const float ch = std::cos(half), sh = std::sin(half);
+                const float cv = std::cos(v),    sv = std::sin(v);
+                const float s2v = std::sin(2.0f * v);
+                const float r   = a + ch * sv - sh * s2v;
+                const float x   = r * std::cos(u);
+                const float y   = sh * sv + ch * s2v;
+                const float z   = r * std::sin(u);
+                c.positions.push_back({ bottleScale * x,
+                                        bottleScale * y,
+                                        bottleScale * z });
+            }
+            // Indices: two CCW triangles per quad (winding consistent with
+            // the parametric surface's natural normal direction).
+            for (int li = 0; li < tileUSize; ++li)
+            for (int lj = 0; lj < tileVSize; ++lj)
+            {
+                uint8_t i00 = (uint8_t)(li     * rowSize + lj    );
+                uint8_t i01 = (uint8_t)(li     * rowSize + lj + 1);
+                uint8_t i10 = (uint8_t)((li+1) * rowSize + lj    );
+                uint8_t i11 = (uint8_t)((li+1) * rowSize + lj + 1);
+                c.indices.push_back(i00); c.indices.push_back(i11); c.indices.push_back(i10);
+                c.indices.push_back(i00); c.indices.push_back(i01); c.indices.push_back(i11);
+            }
+            m.totalTriangles += (unsigned int)tileUSize * tileVSize * 2;
+            m.totalVertices  += (unsigned int)(tileUSize + 1) * (tileVSize + 1);
+            m.clusters.push_back(std::move(c));
+        }
+        return m;
+    }
 }

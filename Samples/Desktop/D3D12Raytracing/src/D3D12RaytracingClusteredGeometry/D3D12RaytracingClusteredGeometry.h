@@ -49,9 +49,15 @@ struct ClusterObject
     D3D12_GPU_VIRTUAL_ADDRESS                blasGPUVA = 0;
 
     // Per-object world placement (used by TLAS instance desc).
-    DirectX::XMFLOAT3                        worldPos    = { 0, 0, 0 };
-    float                                    worldScale  = 1.0f;
-    UINT                                     instanceID  = 0;
+    DirectX::XMFLOAT3                        worldPos      = { 0, 0, 0 };
+    float                                    worldScale    = 1.0f;
+    // Euler rotation in radians, applied as Rx * Ry * Rz before scale +
+    // translation. Used so the torus can present its donut hole to the
+    // camera and the Klein bottle's figure-8 lobe stands proud instead of
+    // being viewed straight-on. Defaults to identity for objects that
+    // don't care about orientation.
+    DirectX::XMFLOAT3                        worldRotEuler = { 0, 0, 0 };
+    UINT                                     instanceID    = 0;
 };
 
 class D3D12RaytracingClusteredGeometry : public DXSample

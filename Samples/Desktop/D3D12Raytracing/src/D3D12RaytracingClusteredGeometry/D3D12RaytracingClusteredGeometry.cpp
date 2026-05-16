@@ -276,13 +276,15 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // the constant axis).
     constexpr int kCompressedBitsPerComponent = 12;
 
-    auto add = [&](ProceduralGeometry::Mesh&& mesh, const XMFLOAT3& pos, float scale, UINT instanceID)
+    auto add = [&](ProceduralGeometry::Mesh&& mesh, const XMFLOAT3& pos, float scale, UINT instanceID,
+                   const XMFLOAT3& euler = XMFLOAT3(0,0,0))
     {
         ClusterObject obj;
-        obj.mesh        = std::move(mesh);
-        obj.worldPos    = pos;
-        obj.worldScale  = scale;
-        obj.instanceID  = instanceID;
+        obj.mesh          = std::move(mesh);
+        obj.worldPos      = pos;
+        obj.worldScale    = scale;
+        obj.worldRotEuler = euler;
+        obj.instanceID    = instanceID;
         m_objects.push_back(std::move(obj));
     };
 
@@ -309,9 +311,13 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.45f, 12, 24, /*tileLat*/3, /*tileLong*/4, 300),
         with_y(hex(3),  0.3f), 1.0f, 3);                                  // 4x6=24 clusters
 
-    // Torus.
+    // Torus, rotated ~60° around X so the donut hole faces camera-up rather
+    // than pointing straight down (where it'd be invisible from any orbiting
+    // camera angle). The +Y world axis is the orbit axis; the torus's
+    // generator built it lying flat in XZ.
     add(ProceduralGeometry::GenerateTorusSpatialTiles(0.55f, 0.18f, 32, 16, /*tileR*/4, /*tileS*/4, 400),
-        with_y(hex(4), -0.3f), 1.0f, 4);                                  // 8x4=32 clusters
+        with_y(hex(4), -0.3f), 1.0f, 4,
+        XMFLOAT3(1.0472f, 0.0f, 0.0f));                                   // ~60° around X
 
     // Cube (one cluster per face).
     add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
@@ -329,6 +335,23 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
             /*tileQuadsU*/4,   /*tileQuadsV*/4,
             /*firstClusterID*/600),
         XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 6x6 = 36 floor clusters
+
+    // Klein bottle - figure-8 immersion, parked OUTSIDE the hex group on
+    // the +X side so it doesn't dominate the default camera frame.  Tilted
+    // forward + slight yaw so the non-orientable figure-8 silhouette
+    // reads clearly from any orbiting camera angle.  STOCHASTIC
+    // translucency (frosted-glass per-triangle any-hit reject) gives a
+    // noisy partial-transparency look that highlights the surface's
+    // self-intersections - rays passing through the outer sheet hit the
+    // inner sheet (or another section of outer sheet) and produce
+    // naturally-layered visual complexity.
+    add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
+            /*bottleScale*/0.28f,
+            /*numU*/32, /*numV*/16,
+            /*tileUSize*/4, /*tileVSize*/4,
+            /*firstClusterID*/700),
+        XMFLOAT3(2.8f, 0.3f, -0.6f), 1.0f, 8,                             // 8x4 = 32 klein clusters
+        XMFLOAT3(0.6f, 0.4f, 0.0f));                                      // tilt forward + slight yaw
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -661,6 +684,7 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     set(5, MAT_KIND_REFLECTIVE,  0.40f, 0.0f, 0.0f);
     set(6, MAT_KIND_OPAQUE,      0.0f, 0.0f, 0.0f);
     set(7, MAT_KIND_REFRACTIVE,  0.0f, 0.70f, 1.50f);
+    set(8, MAT_KIND_STOCHASTIC,  0.0f, 0.55f, 0.0f);    // Klein bottle - frosted-glass
 
     AllocateUploadBuffer(device, m_materials.data(),
                          m_materials.size() * sizeof(MaterialDesc),
@@ -2155,7 +2179,15 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     for (UINT i = 0; i < N_static; ++i)
     {
         const auto& obj = m_objects[i];
+        // R * S * T order: rotate around object origin, then scale, then
+        // place. (XMMATRIX multiplication = right-applies-first under
+        // DirectXMath's row-vector convention - so this reads "scale,
+        // then rotate, then translate".)
+        XMMATRIX rot = XMMatrixRotationRollPitchYaw(obj.worldRotEuler.x,
+                                                    obj.worldRotEuler.y,
+                                                    obj.worldRotEuler.z);
         XMMATRIX m = XMMatrixScaling(obj.worldScale, obj.worldScale, obj.worldScale)
+                   * rot
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID                          = obj.instanceID;
@@ -2470,7 +2502,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
 
     // Payload: max(Payload(float4), ShadowPayload(bool)) -> 16 bytes is enough.
     auto shaderConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(/*payload*/ 4 * sizeof(float), /*attribs*/ 2 * sizeof(float));
+    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + sizeof(uint), /*attribs*/ 2 * sizeof(float));
     auto globalRS = pipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     globalRS->SetRootSignature(m_globalRootSignature.Get());
 

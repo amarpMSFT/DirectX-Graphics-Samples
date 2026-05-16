@@ -181,6 +181,9 @@ namespace ProceduralGeometry
         {
             Cluster c;
             c.clusterID = clusterCounter++;
+            c.gridU = (unsigned int)tR;
+            c.gridV = (unsigned int)tS;
+            c.matchedColorCid = c.clusterID;
             const int rLo = tR * tileRing;
             const int sLo = tS * tileSide;
 
@@ -697,7 +700,4 @@ namespace ProceduralGeometry
         return m;
     }
 }
-
-
-
 

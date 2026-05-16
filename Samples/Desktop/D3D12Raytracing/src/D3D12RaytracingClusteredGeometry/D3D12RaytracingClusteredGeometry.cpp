@@ -27,12 +27,21 @@ using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
 // ==== Shader entry-point names (must match Raytracing.hlsl) ====
-const wchar_t* D3D12RaytracingClusteredGeometry::c_raygenName        = L"RayGen";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_closestHitName    = L"Hit";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_missName          = L"Miss";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowMissName    = L"ShadowMiss";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_hitGroupName      = L"ClusterHitGroup";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowHitGroupName= L"ShadowHitGroup";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_raygenName            = L"RayGen";
+// Two specialised closesthit shaders + two primary hit groups:
+//   OpaqueHitGroup binds OpaqueHit, NO any-hit (any-hit dispatch is
+//   skipped entirely for opaque-only instances - significantly cheaper
+//   for chrome / pure-matte traversals).
+//   GlassHitGroup binds GlassHit + GlassAnyHit (anyhit handles
+//   stochastic translucency; closesthit handles Fresnel + refraction).
+const wchar_t* D3D12RaytracingClusteredGeometry::c_opaqueClosestHitName  = L"OpaqueHit";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_glassClosestHitName   = L"GlassHit";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_glassAnyHitName       = L"GlassAnyHit";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_missName              = L"Miss";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowMissName        = L"ShadowMiss";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_opaqueHitGroupName    = L"OpaqueHitGroup";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_glassHitGroupName     = L"GlassHitGroup";
+const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowHitGroupName    = L"ShadowHitGroup";
 
 // =====================================================================================
 // Construction + command-line + lifecycle
@@ -2333,28 +2342,46 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     // a fixed GVA (EXPLICIT_DESTINATIONS), so this array is good for the life
     // of the sample - only the TLAS BVH itself needs per-frame rebuild to
     // pick up the animated BLAS's new root bounds.
-    // Per-instance flags: instances whose material has translucency==0 AND
-    // refractivity==0 get FORCE_OPAQUE so any-hit never runs (cheaper
-    // traversal).  Reflective surfaces can still be FORCE_OPAQUE because
-    // reflection is composed in closesthit, not in any-hit.  Refractive
-    // and stochastic-translucent instances need any-hit to fire, so they
-    // get NONE.
-    auto flagsForMat = [](const MaterialDesc& mat) -> D3D12_RAYTRACING_INSTANCE_FLAGS
+    // Per-instance flags + hit-group pick.
+    //
+    // FORCE_OPAQUE: set when neither baseline material nor any per-cluster
+    // checker override introduces translucency or refractivity - then the
+    // any-hit dispatch is skipped at traversal time.
+    //
+    // HIT GROUP: opaque-only instances use OpaqueHitGroup (no any-hit
+    // shader bound at all - cheapest possible closesthit path).
+    // Anything that may refract or translucently-reject goes to GlassHit-
+    // Group (closesthit handles full Fresnel + refraction; any-hit handles
+    // stochastic translucency).
+    //
+    // The two decisions share the same predicate ("does this instance
+    // EVER need refraction or translucency?") - if no, OpaqueHitGroup +
+    // FORCE_OPAQUE; if yes, GlassHitGroup + NONE.
+    auto needsGlass = [](const MaterialDesc& mat, const ClusterObject& obj) -> bool
     {
-        const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
-        return isOpaqueLike
-            ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE
-            : D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+        if (mat.refractivity > 0.0f || mat.translucency > 0.0f)
+            return true;
+        if (obj.checker.enabled)
+        {
+            // Per-cluster checker override may introduce refractivity on
+            // a subset of clusters (e.g. sphere2: matte baseline + glass
+            // odd-parity tiles).  -1 sentinel = no override (keep baseline).
+            if (obj.checker.evenParity.overrideRefr > 0.0f) return true;
+            if (obj.checker.oddParity.overrideRefr  > 0.0f) return true;
+        }
+        return false;
     };
+    // Matches the hit-group shader table layout in
+    // CreateRaytracingPipelineAndShaderTables: opaque block at offset 0,
+    // glass block at offset 2 (2 records per block: primary + shadow).
+    constexpr UINT kHitGroupContribOpaque = 0;
+    constexpr UINT kHitGroupContribGlass  = 2;
 
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances(N_total);
+    UINT nOpaque = 0, nGlass = 0;
     for (UINT i = 0; i < N_static; ++i)
     {
         const auto& obj = m_objects[i];
-        // R * S * T order: rotate around object origin, then scale, then
-        // place. (XMMATRIX multiplication = right-applies-first under
-        // DirectXMath's row-vector convention - so this reads "scale,
-        // then rotate, then translate".)
         XMMATRIX rot = XMMatrixRotationRollPitchYaw(obj.worldRotEuler.x,
                                                     obj.worldRotEuler.y,
                                                     obj.worldRotEuler.z);
@@ -2362,11 +2389,15 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * rot
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
-        instances[i].InstanceID                          = obj.instanceID;
-        instances[i].InstanceMask                        = 0xFF;
-        instances[i].InstanceContributionToHitGroupIndex = 0;
-        instances[i].Flags = flagsForMat(m_materials[obj.instanceID]);
-        instances[i].AccelerationStructure               = obj.blasGPUVA;
+        instances[i].InstanceID  = obj.instanceID;
+        instances[i].InstanceMask= 0xFF;
+        const bool isGlass = needsGlass(m_materials[obj.instanceID], obj);
+        instances[i].InstanceContributionToHitGroupIndex =
+            isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
+        instances[i].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
+                                     : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        instances[i].AccelerationStructure = obj.blasGPUVA;
+        (isGlass ? nGlass : nOpaque)++;
     }
     if (m_animatedObjectEnabled)
     {
@@ -2374,12 +2405,21 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         XMMATRIX m = XMMatrixScaling(a.worldScale, a.worldScale, a.worldScale)
                    * XMMatrixTranslation(a.worldPos.x, a.worldPos.y, a.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[N_static].Transform), m);
-        instances[N_static].InstanceID                          = a.instanceID;
-        instances[N_static].InstanceMask                        = 0xFF;
-        instances[N_static].InstanceContributionToHitGroupIndex = 0;
-        instances[N_static].Flags = flagsForMat(m_materials[a.instanceID]);
-        instances[N_static].AccelerationStructure               = a.blasGPUVA;
+        instances[N_static].InstanceID  = a.instanceID;
+        instances[N_static].InstanceMask= 0xFF;
+        // Animated object has no ClusterObject scene config yet; treat by
+        // material only (currently refractive glass -> GlassHitGroup).
+        const auto& aMat = m_materials[a.instanceID];
+        const bool isGlass = (aMat.refractivity > 0.0f) || (aMat.translucency > 0.0f);
+        instances[N_static].InstanceContributionToHitGroupIndex =
+            isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
+        instances[N_static].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
+                                            : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        instances[N_static].AccelerationStructure = a.blasGPUVA;
+        (isGlass ? nGlass : nOpaque)++;
     }
+    SampleLog::LogF(L"[hitgroups] %u opaque-instance(s) -> OpaqueHitGroup (no any-hit), "
+                    L"%u glass-instance(s) -> GlassHitGroup\n", nOpaque, nGlass);
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
                          &m_tlasInstanceDescs, L"TLAS instance descs");
 
@@ -2666,16 +2706,38 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     D3D12_SHADER_BYTECODE libdxil = CD3DX12_SHADER_BYTECODE((void*)g_pRaytracing, ARRAYSIZE(g_pRaytracing));
     lib->SetDXILLibrary(&libdxil);
     lib->DefineExport(c_raygenName);
-    lib->DefineExport(c_closestHitName);
+    lib->DefineExport(c_opaqueClosestHitName);
+    lib->DefineExport(c_glassClosestHitName);
+    lib->DefineExport(c_glassAnyHitName);
     lib->DefineExport(c_missName);
     lib->DefineExport(c_shadowMissName);
 
-    // Primary hit group: closest-hit only for now. Stage D adds an any-hit
-    // shader for stochastic translucency on the same hit group.
-    auto hitGroup = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    hitGroup->SetClosestHitShaderImport(c_closestHitName);
-    hitGroup->SetHitGroupExport(c_hitGroupName);
-    hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+    // ---- OPAQUE primary hit group --------------------------------------
+    // Bound to instances whose material chain (baseline + every per-cluster
+    // checker override) keeps refractivity = 0 and translucency = 0.
+    // Currently: only sphere0 (chrome).
+    //
+    // NO any-hit shader binding - any-hit dispatch is skipped entirely
+    // by the runtime for traversals on this hit group.  Combined with the
+    // FORCE_OPAQUE TLAS instance flag this is the cheapest possible
+    // closesthit path: every triangle hit goes straight to OpaqueHit.
+    auto opaqueHG = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    opaqueHG->SetClosestHitShaderImport(c_opaqueClosestHitName);
+    opaqueHG->SetHitGroupExport(c_opaqueHitGroupName);
+    opaqueHG->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+    // ---- GLASS primary hit group ---------------------------------------
+    // Bound to any instance whose material chain includes refraction OR
+    // translucency at the baseline OR via per-cluster checker overrides.
+    // Currently: spheres 1/2/3, torus, cube, floor, animated, Klein.
+    //
+    // any-hit = GlassAnyHit (stochastic translucency reject).  Closest-
+    // hit = GlassHit (full Fresnel + refraction + reflection composition).
+    auto glassHG = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    glassHG->SetClosestHitShaderImport(c_glassClosestHitName);
+    glassHG->SetAnyHitShaderImport(c_glassAnyHitName);
+    glassHG->SetHitGroupExport(c_glassHitGroupName);
+    glassHG->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
     // Shadow hit group: empty (no closest-hit, no any-hit). Shadow rays use
     // SKIP_CLOSEST_HIT_SHADER + FORCE_OPAQUE so neither shader can run on a
@@ -2722,7 +2784,8 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     void* rgID            = props->GetShaderIdentifier(c_raygenName);
     void* missID          = props->GetShaderIdentifier(c_missName);
     void* shadowMissID    = props->GetShaderIdentifier(c_shadowMissName);
-    void* hgID            = props->GetShaderIdentifier(c_hitGroupName);
+    void* opaqueHgID      = props->GetShaderIdentifier(c_opaqueHitGroupName);
+    void* glassHgID       = props->GetShaderIdentifier(c_glassHitGroupName);
     void* shadowHgID      = props->GetShaderIdentifier(c_shadowHitGroupName);
     const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     const UINT recordSize = Align(idSize, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
@@ -2734,9 +2797,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         memcpy(data.data(), shaderID, idSize);
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
-    // Two-record table (miss, hit-group). Records are at index 0 (primary) and
-    // index 1 (shadow); TraceRay's MissShaderIndex / RayContributionTo... pick
-    // which one to invoke.
+    // Two-record table (miss).
     auto makeTable2 = [&](void* shaderID0, void* shaderID1,
                           ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
     {
@@ -2745,10 +2806,36 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         memcpy(data.data() + recordSize, shaderID1, idSize);
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
+    // ---- HIT-GROUP shader table layout ----
+    // 4 records, 2 contiguous (primary + shadow) blocks per material kind:
+    //
+    //   [0] OpaqueHitGroup    <-- primary for OPAQUE instances (InstanceContrib=0)
+    //   [1] ShadowHitGroup    <-- shadow  for OPAQUE instances (RayContrib=1)
+    //   [2] GlassHitGroup     <-- primary for GLASS  instances (InstanceContrib=2)
+    //   [3] ShadowHitGroup    <-- shadow  for GLASS  instances (RayContrib=1)
+    //
+    // Per-instance InstanceContributionToHitGroupIndex picks the block;
+    // shadow rays add RayContributionToHitGroupIndex=1 within the block.
+    // The shadow records share the same dummy hit-group identifier but
+    // physically live at two distinct table indices so the same RayContrib=1
+    // offset works from either block start.
+    auto makeTable4 = [&](void* r0, void* r1, void* r2, void* r3,
+                          ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
+    {
+        std::vector<uint8_t> data(recordSize * 4, 0);
+        memcpy(data.data() + 0 * recordSize, r0, idSize);
+        memcpy(data.data() + 1 * recordSize, r1, idSize);
+        memcpy(data.data() + 2 * recordSize, r2, idSize);
+        memcpy(data.data() + 3 * recordSize, r3, idSize);
+        AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
+    };
 
     makeTable1(rgID,                    m_rayGenShaderTable,   L"raygen shader table");
     makeTable2(missID, shadowMissID,    m_missShaderTable,     L"miss shader table (primary + shadow)");
-    makeTable2(hgID,   shadowHgID,      m_hitGroupShaderTable, L"hit-group shader table (primary + shadow)");
+    makeTable4(opaqueHgID, shadowHgID,
+               glassHgID,  shadowHgID,
+               m_hitGroupShaderTable,
+               L"hit-group shader table (opaque-primary, shadow, glass-primary, shadow)");
 }
 
 void D3D12RaytracingClusteredGeometry::CreateDescriptorHeapAndRaytracingOutput()

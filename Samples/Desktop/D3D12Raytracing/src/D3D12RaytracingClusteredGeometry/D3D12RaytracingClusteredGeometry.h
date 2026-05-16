@@ -434,11 +434,13 @@ private:
     //                     SKIP_CLOSEST_HIT_SHADER, but DXR still requires a
     //                     hit-group record per ray-contribution index)
     static const wchar_t* c_raygenName;
-    static const wchar_t* c_closestHitName;
-    static const wchar_t* c_anyHitName;
+    static const wchar_t* c_opaqueClosestHitName;
+    static const wchar_t* c_glassClosestHitName;
+    static const wchar_t* c_glassAnyHitName;
     static const wchar_t* c_missName;
     static const wchar_t* c_shadowMissName;
-    static const wchar_t* c_hitGroupName;
+    static const wchar_t* c_opaqueHitGroupName;
+    static const wchar_t* c_glassHitGroupName;
     static const wchar_t* c_shadowHitGroupName;
 };
 

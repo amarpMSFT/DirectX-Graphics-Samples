@@ -326,14 +326,14 @@ float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth, u
 }
 
 [shader("anyhit")]
-void AnyHit(inout Payload p, in Attribs a)
+void GlassAnyHit(inout Payload p, in Attribs a)
 {
-    // Stochastic translucency: probabilistic per-triangle reject. Only
-    // fires for instances that aren't FORCE_OPAQUE - which is set when
-    // BOTH translucency==0 AND refractivity==0.  So we get here for
-    // (translucency>0)  : maybe IgnoreHit
-    // (refractivity>0)  : always accept (closesthit handles refraction)
-    // (both>0)          : maybe IgnoreHit; if accepted, closesthit refracts
+    // Stochastic translucency for the GLASS hit group only.
+    // OpaqueHitGroup has NO any-hit shader bound - opaque-instance
+    // traversals skip the any-hit dispatch entirely (cheaper).
+    //   (translucency>0)  : maybe IgnoreHit
+    //   (refractivity>0)  : always accept (closesthit handles refraction)
+    //   (both>0)          : maybe IgnoreHit; if accepted, closesthit refracts
     MaterialDesc mat = g_materials[InstanceID()];
     if (mat.translucency > 0.0)
     {
@@ -345,224 +345,197 @@ void AnyHit(inout Payload p, in Attribs a)
     // Otherwise fall through, accept the hit.
 }
 
-[shader("closesthit")]
-void Hit(inout Payload p, in Attribs a)
+// ============================================================================
+// Shared closesthit context.  Loaded once at the top of either OpaqueHit
+// or GlassHit so the shared work (ClusterMeta load, per-cluster material
+// overrides, vertex-normal smoothing, shadow tracing, surface base
+// colour computation) lives in ONE place even though we ship TWO
+// specialised closesthit shaders.
+// ============================================================================
+struct HitContext
 {
-    // -------------------------------------------------------------------
-    // DATA-DRIVEN material + colour resolution.
-    //
-    // EVERY per-cluster decision (material override, cluster colour hash
-    // key, surface/refraction/reflection tint strength, interior-surface
-    // back-face refractivity boost) is read from a SINGLE per-cluster
-    // metadata buffer that the CPU populates at scene-build time from
-    // each generator's emitted Cluster grid info + the object's scene-
-    // config knobs (CheckerConfig, tint multipliers).  The shader has
-    // ZERO InstanceID() branches, ZERO cluster-id-range tests, ZERO
-    // parity formulas, ZERO oPos-based wall-tile-slot decoding.  Adding
-    // a new variant (different checker pattern, new material kind,
-    // different tint) is a CPU-only edit.
-    // -------------------------------------------------------------------
-    const uint        cid  = ClusterID();
-    const ClusterMeta meta = LoadClusterMeta(cid);
+    ClusterMeta  meta;
+    MaterialDesc mat;
+    float3       nWorld;        // world-space surface normal (back-face-flipped if allowBackFaceFlip)
+    float3       hitPos;        // world-space hit position
+    float3       base;          // baseColor * cluster tint * lit visibility (final surface colour)
+    float3       clusterCol;
+    float        clusterTint;   // global slider (g_scene.miscParams.w)
+};
 
-    MaterialDesc mat = g_materials[InstanceID()];
+void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
+{
+    const uint cid = ClusterID();
+    ctx.meta = LoadClusterMeta(cid);
+    ctx.mat  = g_materials[InstanceID()];
 
-    // Apply per-cluster material overrides (sentinel <0 = use baseline).
-    if (meta.overrideRefl >= 0.0) mat.reflectivity = meta.overrideRefl;
-    if (meta.overrideRefr >= 0.0) mat.refractivity = meta.overrideRefr;
-    if (meta.overrideIor  >= 0.0) mat.ior          = meta.overrideIor;
-    mat.baseColor.xyz *= meta.baseColorScale;
+    // Per-cluster material overrides (sentinel <0 = no override).
+    if (ctx.meta.overrideRefl >= 0.0) ctx.mat.reflectivity = ctx.meta.overrideRefl;
+    if (ctx.meta.overrideRefr >= 0.0) ctx.mat.refractivity = ctx.meta.overrideRefr;
+    if (ctx.meta.overrideIor  >= 0.0) ctx.mat.ior          = ctx.meta.overrideIor;
+    ctx.mat.baseColor.xyz *= ctx.meta.baseColorScale;
 
-    // Interior surface = part of an enclosed glass volume (slab faces).
-    // Back-face hits from inside the glass should appear MORE opaque so
-    // the interior surface reads as visible instead of washing out with
-    // the transmitted exterior view.
-    if ((meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
+    // Interior-surface back-face refractivity boost (slab faces only;
+    // shader skips the test cheaply when the flag bit is 0).
+    if ((ctx.meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
         HitKind() == HIT_KIND_TRIANGLE_BACK_FACE &&
-        mat.refractivity > 0.0)
+        ctx.mat.refractivity > 0.0)
     {
-        mat.refractivity *= 0.4;
+        ctx.mat.refractivity *= 0.4;
     }
 
-    // Cluster-rainbow palette is gated on a single visualisation knob -
-    // miscParams.w in the scene CB.  >0 lets the per-cluster cosine
-    // palette tint the base colour (so the user can SEE the cluster
-    // boundaries which is the whole point of this sample); 0 makes
-    // material colours fully take over.
-    const float clusterTint = saturate(g_scene.miscParams.w);
-    // Cluster colour lookup uses meta.colorIndex - the CPU sets this to
-    // the matching top-tile cid for slab bottom + wall sub-clusters so
-    // the entire slab volume column reads as one unit; otherwise it's
-    // just the cluster's own cid.
-    const float3 clusterCol = (meta.colorIndex != 0xFFFFFFFFu)
-                                ? ClusterColor(meta.colorIndex)
-                                : float3(0.6, 0.6, 0.6);
-    // Surface base = baseColor * lerp(white, clusterCol, clusterTint * meta.surfTintMul).
-    // meta.surfTintMul is the per-object knob (default 1.0; floor uses 0.40
-    // so its translucent tiles read as pale glass not saturated bricks).
-    const float surfTint = clusterTint * meta.surfTintMul;
-    const float3 base    = mat.baseColor.xyz * lerp(float3(1, 1, 1), clusterCol, surfTint);
+    // Cluster colour + surface base.
+    ctx.clusterTint = saturate(g_scene.miscParams.w);
+    ctx.clusterCol  = (ctx.meta.colorIndex != 0xFFFFFFFFu)
+                        ? ClusterColor(ctx.meta.colorIndex)
+                        : float3(0.6, 0.6, 0.6);
+    const float  surfTint  = ctx.clusterTint * ctx.meta.surfTintMul;
+    const float3 baseUnlit = ctx.mat.baseColor.xyz
+                            * lerp(float3(1, 1, 1), ctx.clusterCol, surfTint);
 
-    // World-space surface normal.  Per-vertex normals live in the side-
-    // channel keyed by (ClusterID, PrimitiveIndex):
-    //   - g_clusterOffsets stores (vertOff, idxOff) per cluster, 8 B/entry
-    //   - g_clusterIndices stores 1 uint32 per index (uint8 widened to
-    //     uint32 on upload for clean ByteAddressBuffer.Load access)
-    //   - g_clusterNormals stores float3 padded to 16 bytes per vertex
-    // We compute byte addresses explicitly via ByteAddressBuffer because
-    // root-descriptor StructuredBuffer<vector-of-something> has
-    // implementation-defined stride padding behaviour - we hit a bug
-    // where StructuredBuffer<uint2>'s root-SRV access returned garbage
-    // offsets even though the element type is 8 bytes packed on both
-    // sides.  Byte loads remove the stride ambiguity.
-    uint primIdx     = PrimitiveIndex();
-    uint2 off        = g_clusterOffsets.Load2(cid * 8);                   // (vertOff, idxOff)
-    uint  idxBase    = (off.y + primIdx * 3) * 4;                         // 4 B per uint32 index
-    uint  i0         = g_clusterIndices.Load(idxBase + 0);
-    uint  i1         = g_clusterIndices.Load(idxBase + 4);
-    uint  i2         = g_clusterIndices.Load(idxBase + 8);
-    float3 n0        = asfloat(g_clusterNormals.Load3((off.x + i0) * 16));
-    float3 n1        = asfloat(g_clusterNormals.Load3((off.x + i1) * 16));
-    float3 n2        = asfloat(g_clusterNormals.Load3((off.x + i2) * 16));
-    // a.bary is (w1, w2); w0 = 1 - w1 - w2 (DXR convention).
-    float  bw1       = a.bary.x;
-    float  bw2       = a.bary.y;
-    float  bw0       = 1.0 - bw1 - bw2;
-    float3 nObj      = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
-    // ObjectToWorld3x4()'s 3x3 sub-matrix is rotation/scale only.  All
-    // our instances are uniform-scale so direct mul is correct here; for
-    // non-uniform scale we'd need the inverse-transpose of the upper-3x3.
-    float3 nWorld = normalize(mul((float3x3)ObjectToWorld3x4(), nObj));
+    // World-space surface normal: smoothed via per-vertex cluster-normal
+    // side-channel keyed by (ClusterID, PrimitiveIndex).
+    uint primIdx = PrimitiveIndex();
+    uint2 off    = g_clusterOffsets.Load2(cid * 8);
+    uint  idxBase= (off.y + primIdx * 3) * 4;
+    uint  i0     = g_clusterIndices.Load(idxBase + 0);
+    uint  i1     = g_clusterIndices.Load(idxBase + 4);
+    uint  i2     = g_clusterIndices.Load(idxBase + 8);
+    float3 n0    = asfloat(g_clusterNormals.Load3((off.x + i0) * 16));
+    float3 n1    = asfloat(g_clusterNormals.Load3((off.x + i1) * 16));
+    float3 n2    = asfloat(g_clusterNormals.Load3((off.x + i2) * 16));
+    float  bw1   = a.bary.x;
+    float  bw2   = a.bary.y;
+    float  bw0   = 1.0 - bw1 - bw2;
+    float3 nObj  = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
+    ctx.nWorld   = normalize(mul((float3x3)ObjectToWorld3x4(), nObj));
 
-    // Flip the normal if we hit a back face (refractive surfaces let rays
-    // enter and we may end up reading the wrong side).
-    if (HitKind() == HIT_KIND_TRIANGLE_BACK_FACE)
-        nWorld = -nWorld;
+    // Glass surfaces can be hit on the back face (refraction inside the
+    // volume); flip the normal so it points TOWARD the incoming ray and
+    // HLSL refract() sees the geometry HLSL expects.  Opaque surfaces
+    // shouldn't see back faces (FORCE_OPAQUE + back-face culling on
+    // reflection rays), so the caller passes allowBackFaceFlip=false.
+    if (allowBackFaceFlip && HitKind() == HIT_KIND_TRIANGLE_BACK_FACE)
+        ctx.nWorld = -ctx.nWorld;
 
-    float3 hitPos = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
-    float3 toSun  = normalize(g_scene.lightDir.xyz);
-    float  NdotL  = saturate(dot(nWorld, toSun));
+    ctx.hitPos       = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
+    float3 toSun     = normalize(g_scene.lightDir.xyz);
+    float  NdotL     = saturate(dot(ctx.nWorld, toSun));
+    float  visibility= ShadowVisibility(ctx.hitPos, ctx.nWorld, toSun);
+    float  ambient   = g_scene.lightDir.w;
+    float  lit       = ambient + (1.0 - ambient) * NdotL * visibility;
+    ctx.base         = baseUnlit * lit;
+}
 
-    float visibility = ShadowVisibility(hitPos, nWorld, toSun);
-    float ambient    = g_scene.lightDir.w;
-    float lit        = ambient + (1.0 - ambient) * NdotL * visibility;
-    float3 surfaceColor = base * lit;
+// ============================================================================
+// OpaqueHit - specialised closesthit for instances whose materials are
+// FORCE_OPAQUE everywhere (chrome, polished metal, pure matte).
+//
+// No refraction logic.  No Fresnel composition.  No back-face handling.
+// Just lit-surface + optional single mirror reflection bounce.  Paired
+// with OpaqueHitGroup which has NO any-hit shader bound - so the
+// any-hit dispatch is skipped entirely for opaque traversals (the
+// "make-it-fast-for-the-chrome-ball" path the user asked for).
+//
+// Per-cluster material variation via ClusterMeta still works as long
+// as the overrides keep refractivity at 0 (mirror or matte).
+// ============================================================================
+[shader("closesthit")]
+void OpaqueHit(inout Payload p, in Attribs a)
+{
+    HitContext ctx;
+    LoadHitContext(a, /*allowBackFaceFlip*/false, ctx);
 
-    // Compose optical effects.  Order: surface -> refraction -> reflection.
-    // Each effect is a `lerp` so it composites over whatever's already in
-    // finalColor at that point.  Recursion-cap via the dedicated payload
-    // .depth field (caller writes, closesthit reads):
-    //
-    //   - reflectivity bounces at depths <= 2 (one bounce on the front
-    //     face of the surface AND one on the inside back face for glass,
-    //     so a glass volume produces TWO visible reflection layers - the
-    //     surface highlight and the back-wall internal reflection).
-    //     Reflection rays use RAY_FLAG_NONE so they can hit BOTH front
-    //     and back faces (essential for internal reflection inside a
-    //     glass volume to see the opposite inner wall).
-    //   - refractivity bounces at depths <= 4 (enter glass + exit
-    //     glass + chain through 2-3 more glass volumes; the inside-the-
-    //     glass closesthit at depth 1 hits the BACK face and refracts
-    //     OUT, so the camera sees the world behind the glass).  Already
-    //     uses RAY_FLAG_NONE so inside-glass rays see the back face.
-    //
-    // Pipeline MaxRecursionDepth=8 covers the worst-case chain.
+    float3 finalColor = ctx.base;
+
+    if (ctx.mat.reflectivity > 0.0 && p.depth <= 2)
+    {
+        // Mirror bounce.  Opaque-only path: reflection ray uses
+        // RAY_FLAG_CULL_BACK_FACING_TRIANGLES (we're in air, never
+        // inside a glass volume on an opaque-instance reflection).
+        float3 reflectDir   = reflect(WorldRayDirection(), ctx.nWorld);
+        float3 reflectedRGB = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
+                                          reflectDir,
+                                          RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+                                          p.depth + 1, /*inGlass*/0u);
+        float3 reflectTint  = lerp(float3(1, 1, 1), ctx.clusterCol,
+                                   ctx.clusterTint * ctx.meta.reflTintMul);
+        finalColor = lerp(finalColor, reflectedRGB * reflectTint, ctx.mat.reflectivity);
+    }
+
+    p.color = float4(finalColor, 1);
+}
+
+// ============================================================================
+// GlassHit - full Fresnel-Schlick closesthit for any instance with
+// refraction in its material chain (baseline OR per-cluster checker
+// override).  Paired with GlassHitGroup which has GlassAnyHit bound.
+// ============================================================================
+[shader("closesthit")]
+void GlassHit(inout Payload p, in Attribs a)
+{
+    HitContext ctx;
+    LoadHitContext(a, /*allowBackFaceFlip*/true, ctx);
+
     const uint myDepth = p.depth;
-    float3 finalColor = surfaceColor;
+    float3 finalColor  = ctx.base;
 
-    // ===================================================================
-    // Fresnel-Schlick: reflection probability is angle-dependent.
-    //   F0 = reflectance at normal incidence (= mat.reflectivity)
-    //   F  = F0 + (1-F0) * (1 - N.V)^5
-    // F drives the reflection-mix weight; (1-F)*Tnorm drives the
-    // transmission-mix weight (Tnorm normalises so the normal-incidence
-    // look matches what we had before the Fresnel switch).
-    // ===================================================================
-    float NdotV  = saturate(dot(nWorld, -WorldRayDirection()));
-    float F0     = mat.reflectivity;
-    float F      = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
-    float Tnorm  = (mat.refractivity > 0.0 && F0 < 0.999) ? (mat.refractivity / (1.0 - F0)) : 0.0;
-    float Tw     = (1.0 - F) * Tnorm;
+    // Fresnel-Schlick weighting (angle-dependent reflection probability).
+    float NdotV = saturate(dot(ctx.nWorld, -WorldRayDirection()));
+    float F0    = ctx.mat.reflectivity;
+    float F     = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    float Tnorm = (ctx.mat.refractivity > 0.0 && F0 < 0.999)
+                    ? (ctx.mat.refractivity / (1.0 - F0)) : 0.0;
+    float Tw    = (1.0 - F) * Tnorm;
 
     bool tirHappened = false;
 
-    if (mat.refractivity > 0.0 && myDepth <= 4)
+    if (ctx.mat.refractivity > 0.0 && myDepth <= 4)
     {
-        // Snell ratio eta = n_outside / n_inside for entering, the
-        // inverse for exiting. We assume air (n=1) outside.  HitKind()
-        // told us which face we hit; we already flipped nWorld so the
-        // normal points TOWARD the incoming ray's origin, which is what
-        // HLSL refract() expects.
-        float eta  = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? (1.0 / mat.ior) : mat.ior;
+        float  eta        = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE)
+                                ? (1.0 / ctx.mat.ior) : ctx.mat.ior;
         float3 incident   = WorldRayDirection();
-        float3 refractDir = refract(incident, nWorld, eta);
-        // Tint the refracted RGB by the cluster colour (stained-glass).
-        // Strength = clusterTint * meta.refrTintMul (default 0.50; floor
-        // dials to 0.25 so translucent tiles read cleanly through).
-        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * meta.refrTintMul);
+        float3 refractDir = refract(incident, ctx.nWorld, eta);
+        float3 refractTint= lerp(float3(1, 1, 1), ctx.clusterCol,
+                                 ctx.clusterTint * ctx.meta.refrTintMul);
 
         if (dot(refractDir, refractDir) < 0.001)
         {
-            // Total internal reflection: refract() returns 0; fall back
-            // to a mirror reflection of the incoming ray (stays inside
-            // the glass volume - so childInGlass below stays at the
-            // CURRENT-ray value, not the toggled one).  TIR captures
-            // 100%% of the light (all reflects, none transmits), so we
-            // mix it with weight 1 and SKIP the separate reflection
-            // branch below to avoid double-counting the same bounce.
+            // Total internal reflection: full mirror, stays in same medium.
             tirHappened = true;
-            refractDir = reflect(incident, nWorld);
-            uint childInGlass = p.inGlass;       // TIR keeps us in the same medium
+            refractDir = reflect(incident, ctx.nWorld);
+            uint childInGlass = p.inGlass;
             uint cullFlags    = childInGlass ? RAY_FLAG_NONE
                                               : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
-            float3 tirRGB     = TraceBounce(hitPos + nWorld * 0.001,
-                                            refractDir,
-                                            cullFlags,
+            float3 tirRGB     = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
+                                            refractDir, cullFlags,
                                             myDepth + 1, childInGlass);
             finalColor = lerp(finalColor, tirRGB * refractTint, 1.0);
         }
         else
         {
-            // True refraction with Fresnel-weighted contribution.
-            // (1-F) drops at grazing angles -> sides of glass go from
-            // mostly-transmissive (normal incidence) to mostly-reflective
-            // (grazing) - the classic "Fresnel rim" on a glass ball.
+            // True refraction with Fresnel-weighted transmission.
             uint childInGlass = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? 1u : 0u;
             uint cullFlags    = childInGlass ? RAY_FLAG_NONE
                                               : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
-            float3 refractedRGB = TraceBounce(hitPos - nWorld * 0.001,
-                                              refractDir,
-                                              cullFlags,
+            float3 refractedRGB = TraceBounce(ctx.hitPos - ctx.nWorld * 0.001,
+                                              refractDir, cullFlags,
                                               myDepth + 1, childInGlass);
             finalColor = lerp(finalColor, refractedRGB * refractTint, Tw);
         }
     }
 
-    if (!tirHappened && mat.reflectivity > 0.0 && myDepth <= 2)
+    if (!tirHappened && ctx.mat.reflectivity > 0.0 && myDepth <= 2)
     {
-        // Mirror bounce.  Reflection STAYS in the same medium as the
-        // current ray (ray hits a surface, bounces back into the same
-        // half-space it came from), so childInGlass = p.inGlass.  Cull
-        // flags chosen to match: in-air bounces use back-face culling,
-        // in-glass bounces (e.g. inside the slab reflecting off the
-        // opposite inner wall) need RAY_FLAG_NONE.
         uint childInGlass = p.inGlass;
         uint cullFlags    = childInGlass ? RAY_FLAG_NONE
                                           : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
-        float3 reflectDir   = reflect(WorldRayDirection(), nWorld);
-        float3 reflectedRGB = TraceBounce(hitPos + nWorld * 0.001,
-                                          reflectDir,
-                                          cullFlags,
+        float3 reflectDir   = reflect(WorldRayDirection(), ctx.nWorld);
+        float3 reflectedRGB = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
+                                          reflectDir, cullFlags,
                                           myDepth + 1, childInGlass);
-        // Tint the reflected RGB by the cluster colour.  Strength =
-        // clusterTint * meta.reflTintMul.  Defaults:
-        //   chrome / glass spheres: meta.reflTintMul ~ 1.08 (effective
-        //     ~0.70 at default clusterTint=0.65) - high tint so the
-        //     cluster grid reads on near-perfect mirrors.
-        //   floor: meta.reflTintMul ~ 0.31 (effective ~0.20) - LOW tint
-        //     so the directional sky/horizon variation dominates over
-        //     cluster identity on the mirror tiles.
-        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * meta.reflTintMul);
+        float3 reflectTint  = lerp(float3(1, 1, 1), ctx.clusterCol,
+                                   ctx.clusterTint * ctx.meta.reflTintMul);
         finalColor = lerp(finalColor, reflectedRGB * reflectTint, F);
     }
 

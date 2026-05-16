@@ -526,17 +526,12 @@ namespace ProceduralGeometry
             }
             else
             {
-                // Smooth narrow ramp: cos²((u-π)/2) goes from 1 (at u=π,
-                // perfect match with body) smoothly to 0 (at u=2π).  Map
-                // to (1 -> kHandleNarrow) so handleScale starts at full
-                // width AT THE JOIN (slope of cos² is 0 there too -> no
-                // visible kink) and tapers smoothly to kHandleNarrow at
-                // the thin end.
-                const float t = std::cos((u - kPi) * 0.5f);
-                const float handleScale = kHandleNarrow + (1.0f - kHandleNarrow) * t * t;
-                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi) * handleScale;
-                z = -kVscale * su                                     + thinShift;
-                y = r * std::sin(v) * handleScale;
+                // No additional handle taper - we narrowed the global r
+                // function (4.0 -> 2.5) so body+handle are uniformly
+                // slim, no wide-flange-at-the-join discontinuity.
+                x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
+                z = -kVscale * su                          + thinShift;
+                y = r * std::sin(v);
             }
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention
         };
@@ -614,6 +609,7 @@ namespace ProceduralGeometry
         return m;
     }
 }
+
 
 
 

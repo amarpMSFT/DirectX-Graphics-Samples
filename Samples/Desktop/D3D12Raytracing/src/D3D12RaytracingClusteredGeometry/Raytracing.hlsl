@@ -478,11 +478,11 @@ void Hit(inout Payload p, in Attribs a)
         // boundaries are VISIBLE through glass (acts like a stained-
         // glass filter - the cluster decomposition shows up as colour
         // variation in the refracted view, not just on the thin
-        // surface contribution).  Third-strength relative to the
-        // surface tint - just enough that you can SEE the cluster
-        // grid through glass without it dominating the view.  Shared
-        // between TIR and true-refraction branches below.
-        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * 0.33);
+        // surface contribution).  Half-strength relative to the surface
+        // tint so the stained-glass effect is clearly visible without
+        // drowning out what's seen THROUGH the glass.  Shared between
+        // TIR and true-refraction branches below.
+        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * 0.50);
 
         if (dot(refractDir, refractDir) < 0.001)
         {

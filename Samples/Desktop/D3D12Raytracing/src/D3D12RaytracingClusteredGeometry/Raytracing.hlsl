@@ -307,6 +307,48 @@ void Hit(inout Payload p, in Attribs a)
     MaterialDesc mat = g_materials[InstanceID()];
 
     uint cid = ClusterID();
+
+    // ---- Per-cluster material override demo --------------------------
+    // Sphere2 (instanceID=2, the matte aqua opaque sphere) gets a CHECKER
+    // pattern: alternate clusters are "matte aqua" (default material) vs
+    // "translucent aqua glass" (refractive override).  Demonstrates that
+    // material can vary PER CLUSTER inside a single BLAS - a useful
+    // pattern for things like decals, damage, or mosaic tiles, since
+    // each cluster has its own ClusterID() and the closesthit can use
+    // it to look up cluster-specific data.
+    //
+    // Sphere2 mesh: numLat=16 numLong=32 tileLat=4 tileLong=4 ->
+    // tilesLat=4, tilesLong=8 -> 32 clusters with IDs 200..231.
+    // Cluster (latIdx, longIdx) has localID = latIdx*8 + longIdx.
+    // Checker = (latIdx + longIdx) parity.
+    if (InstanceID() == 2)
+    {
+        const uint kSphere2FirstCid = 200;
+        const uint kSphere2TilesLong = 8;
+        uint local   = cid - kSphere2FirstCid;
+        uint latIdx  = local / kSphere2TilesLong;
+        uint longIdx = local % kSphere2TilesLong;
+        bool isB     = ((latIdx + longIdx) & 1u) != 0u;
+        if (isB)
+        {
+            // Translucent variant: glass refraction overrides the matte
+            // baseline.  Note the per-instance FORCE_OPAQUE flag is
+            // still set (the BLAS instance was built that way), so any-
+            // hit doesn't fire here, but refraction (which doesn't need
+            // any-hit, just back-face hits) works fine.
+            mat.refractivity = 0.85;
+            mat.ior          = 1.50;
+        }
+        else
+        {
+            // Matte variant: brighten the cluster-tint so the matte
+            // halves of the checker pattern read as VIBRANT colour
+            // tiles, distinct from the translucent ones.
+            mat.baseColor.xyz = saturate(mat.baseColor.xyz * 1.45);
+        }
+    }
+    // ------------------------------------------------------------------
+
     // Cluster-rainbow palette is gated on a single visualisation knob -
     // miscParams.w in the scene CB.  >0 lets the per-cluster cosine
     // palette tint the base colour (so the user can SEE the cluster

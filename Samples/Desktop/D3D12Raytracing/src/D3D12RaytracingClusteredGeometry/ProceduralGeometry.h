@@ -500,13 +500,27 @@ namespace ProceduralGeometry
             float x, z;
             if (u < kPi)
             {
+                // Body half.  The standard parametric has a v-dependent
+                // z-slope (6·cos(v)) at u=π that the handle half DOESN'T
+                // have, producing a kink along the v=0 and v=π lines
+                // where the two pieces meet.  Multiply that v-cosine z
+                // term by cos²(u/2) so it (and its derivative) decay to
+                // ZERO as u -> π:
+                //   cos²(u/2) at u=0 = 1   (no change at body neck)
+                //   cos²(u/2) at u=π = 0   (term vanishes at body-handle join)
+                //   d/du[sin(u)·cos²(u/2)]|_{u=π} = 0  (slopes match!)
+                // Bottle becomes globally C¹-smooth across u=π; visually
+                // the body bulb is a touch less round near the join but
+                // the handle blends in seamlessly.
+                const float halfCos = std::cos(u * 0.5f);
+                const float kSmooth = halfCos * halfCos;
                 x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                z = -kVscale * su           - r * su * cv + entryShift;
+                z = -kVscale * su           - r * su * cv * kSmooth + entryShift;
             }
             else
             {
                 x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -kVscale * su                          + entryShift;
+                z = -kVscale * su                                     + entryShift;
             }
             const float y = r * std::sin(v);
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention

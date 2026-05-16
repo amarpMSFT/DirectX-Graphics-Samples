@@ -375,13 +375,23 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
     if (ctx.meta.overrideIor  >= 0.0) ctx.mat.ior          = ctx.meta.overrideIor;
     ctx.mat.baseColor.xyz *= ctx.meta.baseColorScale;
 
-    // Interior-surface back-face refractivity boost (slab faces only;
-    // shader skips the test cheaply when the flag bit is 0).
+    // Interior-surface back-face refractivity reduction.  Tunable per
+    // cluster via the CLUSTER_META_FLAG_INTERIOR_SURFACE bit; when set,
+    // back-face hits on this cluster lose a fraction of their refractivity
+    // so the interior surface reads as visible instead of washing out
+    // with the transmitted exterior.  The multiplier 0.85 here is a
+    // SUBTLE attenuation - the bottom face of a slab tile picks up just
+    // enough surface tint to be silhouetted against the sand below,
+    // without overwhelming the "see through to the world below" look
+    // that makes the translucent tile read as clear glass.
+    // (Older values around 0.4 made the slab interior feel SEMI-OPAQUE
+    // from inside; that was the source of the "tiles aren't translucent
+    // enough" complaint.)
     if ((ctx.meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
         HitKind() == HIT_KIND_TRIANGLE_BACK_FACE &&
         ctx.mat.refractivity > 0.0)
     {
-        ctx.mat.refractivity *= 0.4;
+        ctx.mat.refractivity *= 0.85;
     }
 
     // Cluster colour + surface base.

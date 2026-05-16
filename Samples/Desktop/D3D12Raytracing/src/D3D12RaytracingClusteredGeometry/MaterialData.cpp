@@ -39,8 +39,10 @@ namespace MaterialData
         {  { 0.95f, 0.80f, 0.55f, 0.0f }, 0.10f, 0.78f, 1.50f, 0.0f },
         //   slot 5 - cube translucent copper-tinted glass
         {  { 0.92f, 0.78f, 0.60f, 0.0f }, 0.10f, 0.82f, 1.50f, 0.0f },
-        //   slot 6 - floor glass slab (per-tile checker via scene config)
-        {  { 0.85f, 0.92f, 0.95f, 0.0f }, 0.06f, 0.80f, 1.50f, 0.0f },
+        //   slot 6 - floor glass slab (per-tile checker via scene config).
+        //             High refractivity (0.93) so translucent tiles read as
+        //             clear glass you can see through to the bottom + sand.
+        {  { 0.85f, 0.92f, 0.95f, 0.0f }, 0.06f, 0.93f, 1.50f, 0.0f },
         //   slot 7 - animated clear glass
         {  { 0.85f, 0.90f, 1.00f, 0.0f }, 0.08f, 0.78f, 1.5f,  0.0f },
         //   slot 8 - Klein bottle clear glass

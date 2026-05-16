@@ -139,7 +139,21 @@ namespace SceneData
               .slabThickness = 0.28f },
             600,
             { 0.0f, -0.7f, 0.0f }, {0,0,0}, 1.0f, 6,
-            {}, /*surf*/1.0f, /*refr*/1.0f, /*refl*/0.31f
+            // Floor TINT multipliers - LOW so the translucent tile reads
+            // as truly clear glass: you see THROUGH to the sand below,
+            // tinted only subtly by the cluster colour.  The mirror tiles
+            // (odd-parity override) stay sky-coloured because reflection
+            // is tinted at its own (low) multiplier.
+            //   surf = 0.65 * 0.25 = 0.16   (subtle tile colour on the
+            //                                front surface contribution)
+            //   refr = 0.65 * 0.35 = 0.23   (subtle stained-glass tint on
+            //                                the see-through to sand;
+            //                                low so the sand BEIGE
+            //                                dominates and the cluster
+            //                                colour is a hint, not a wash)
+            //   refl = 0.65 * 0.31 = 0.20   (mirror tiles read sky/horizon,
+            //                                not cluster identity)
+            {}, /*surf*/0.25f, /*refr*/0.35f, /*refl*/0.31f
         };
         floorObj.checker.enabled = true;
         floorObj.checker.oddParity.overrideRefl = 0.85f;

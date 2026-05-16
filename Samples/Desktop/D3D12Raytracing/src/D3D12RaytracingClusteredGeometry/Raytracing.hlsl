@@ -170,23 +170,29 @@ void RayGen()
     // the stochastic any-hit also returns N different random values per
     // pixel - 4x supersampling does free noise reduction on the frosted-
     // glass surfaces in addition to edge antialiasing.
-    static const float2 kSubPixel4[4] = {
-        float2(0.125, 0.625),
-        float2(0.375, 0.125),
-        float2(0.625, 0.875),
-        float2(0.875, 0.375),
+    //
+    // WARP-WORKAROUND: WARP's DXIL compiler asserts on arrays whose
+    // element type is a VECTOR (float2 here) - shaderinfo.cpp(2504)
+    // requires scalar float / integer / 64-bit / 16-bit elements.  So
+    // the arrays below are FLATTENED to scalar floats (pairs of x,y).
+    // (See also ClusterColor()'s WARP workaround comment.)
+    static const float kSubPixel4[8] = {
+        0.125, 0.625,    // sample 0
+        0.375, 0.125,    // sample 1
+        0.625, 0.875,    // sample 2
+        0.875, 0.375,    // sample 3
     };
-    static const float2 kSubPixel2[2] = {
-        float2(0.25, 0.25),
-        float2(0.75, 0.75),
+    static const float kSubPixel2[4] = {
+        0.25, 0.25,      // sample 0
+        0.75, 0.75,      // sample 1
     };
 
     float3 accum = float3(0, 0, 0);
     for (uint s = 0; s < samples; ++s)
     {
         float2 sub;
-        if      (samples == 4) sub = kSubPixel4[s];
-        else if (samples == 2) sub = kSubPixel2[s];
+        if      (samples == 4) sub = float2(kSubPixel4[s*2], kSubPixel4[s*2+1]);
+        else if (samples == 2) sub = float2(kSubPixel2[s*2], kSubPixel2[s*2+1]);
         else                   sub = float2(0.5, 0.5);
 
         float2 ndc = ((float2(pixel) + sub) / float2(dim)) * 2.0 - 1.0;
@@ -470,7 +476,12 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
     float  NdotL     = saturate(dot(ctx.nWorld, toSun));
     float  visibility= ShadowVisibility(ctx.hitPos, ctx.nWorld, toSun);
     float  ambient   = g_scene.lightDir.w;
-    float  lit       = ambient + (1.0 - ambient) * NdotL * visibility;
+    // Sun is intentionally a bit "hot" (1.2x) so lit surfaces overshoot
+    // 1.0 and clip toward white - reads as brighter direct sunlight
+    // against the lower ambient floor.  Net effect: lit-vs-shadow contrast
+    // higher than ambient=0.15 / sun=1.0 alone would give.
+    const float sunStrength = 1.20;
+    float  lit       = ambient + sunStrength * (1.0 - ambient) * NdotL * visibility;
     ctx.base         = baseUnlit * lit;
 }
 

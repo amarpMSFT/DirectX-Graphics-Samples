@@ -102,6 +102,12 @@ namespace SceneData
         float surfTintMul = 1.0f;
         float refrTintMul = 0.50f;
         float reflTintMul = 1.08f;
+
+        // True for non-orientable / self-intersecting surfaces.  Drives
+        // D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE on the
+        // TLAS instance.  Defaults to false; set true in BuildSceneDefinition
+        // for the Klein bottle.
+        bool nonOrientable = false;
     };
 
     // Returns the full scene definition.  Function-returns-vector rather

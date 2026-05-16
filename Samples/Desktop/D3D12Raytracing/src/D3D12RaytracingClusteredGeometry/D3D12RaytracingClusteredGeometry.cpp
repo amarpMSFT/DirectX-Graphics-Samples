@@ -368,6 +368,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
         obj.surfTintMul   = s.surfTintMul;
         obj.refrTintMul   = s.refrTintMul;
         obj.reflTintMul   = s.reflTintMul;
+        obj.nonOrientable = s.nonOrientable;
         m_objects.push_back(std::move(obj));
     }
 
@@ -2396,6 +2397,16 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
         instances[i].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
                                      : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        // Non-orientable / self-intersecting surfaces need double-sided
+        // traversal: their triangle winding doesn't have a consistent
+        // global "outward" (Klein bottle's classic problem), and culling
+        // any "back-facing" triangles leaves visible holes along the
+        // orientation seam.  This per-instance flag overrides the ray's
+        // RAY_FLAG_CULL_BACK_FACING_TRIANGLES so only THIS instance pays
+        // the cost; orientable meshes (sphere, torus, cube, slab) keep
+        // their fast single-sided traversal.
+        if (m_objects[i].nonOrientable)
+            instances[i].Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
         instances[i].AccelerationStructure = obj.blasGPUVA;
         (isGlass ? nGlass : nOpaque)++;
     }

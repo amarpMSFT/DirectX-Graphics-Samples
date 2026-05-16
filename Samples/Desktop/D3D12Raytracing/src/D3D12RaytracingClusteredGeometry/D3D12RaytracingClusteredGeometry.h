@@ -80,6 +80,14 @@ struct ClusterObject
     float surfTintMul = 1.0f;
     float refrTintMul = 0.50f;
     float reflTintMul = 1.08f;
+
+    // True for non-orientable / self-intersecting surfaces (Klein bottle)
+    // that need D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE on
+    // their TLAS instance.  Back-face culling is fine and faster for
+    // every orientable mesh in this scene (sphere, torus, cube, slab),
+    // so we only pay the double-sided-traversal cost on the one instance
+    // that needs it.
+    bool nonOrientable = false;
 };
 
 class D3D12RaytracingClusteredGeometry : public DXSample

@@ -205,6 +205,12 @@ void RayGen()
         p.color   = float4(0, 0, 0, 1);
         p.depth   = 0;
         p.inGlass = 0;       // primary rays start in air
+        // Keep CULL_BACK_FACING_TRIANGLES globally for the cheap path on
+        // every orientable instance.  Non-orientable instances (Klein
+        // bottle) carry D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE
+        // on the BLAS instance, which overrides this ray flag for those
+        // specific instances - they get double-sided traversal, the rest
+        // don't pay any cost.
         TraceRay(Scene,
             RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
             /*InstanceInclusionMask*/0xff,
@@ -364,7 +370,8 @@ struct HitContext
 {
     ClusterMeta  meta;
     MaterialDesc mat;
-    float3       nWorld;        // world-space surface normal (back-face-flipped if allowBackFaceFlip)
+    float3       nWorld;        // world-space surface normal, flipped if needed so it always points TOWARD the ray's origin (refract() expects this convention)
+    bool         entering;      // true if the ray approaches the side the SMOOTH normal points toward (= entering the medium the smooth normal points OUT of).  Derived from sign(dot(rayDir, nWorld_preflip)) - robust on non-orientable surfaces where HitKind() can disagree with the smooth normal at a seam (Klein bottle's body↔handle u=π join is the canonical case).
     float3       hitPos;        // world-space hit position
     float3       base;          // baseColor * cluster tint * lit visibility (final surface colour)
     float3       clusterCol;
@@ -383,36 +390,10 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
     if (ctx.meta.overrideIor  >= 0.0) ctx.mat.ior          = ctx.meta.overrideIor;
     ctx.mat.baseColor.xyz *= ctx.meta.baseColorScale;
 
-    // Interior-surface back-face refractivity reduction.  Tunable per
-    // cluster via the CLUSTER_META_FLAG_INTERIOR_SURFACE bit; when set,
-    // back-face hits on this cluster lose a fraction of their refractivity
-    // so the interior surface reads as visible instead of washing out
-    // with the transmitted exterior.  The multiplier 0.85 here is a
-    // SUBTLE attenuation - the bottom face of a slab tile picks up just
-    // enough surface tint to be silhouetted against the sand below,
-    // without overwhelming the "see through to the world below" look
-    // that makes the translucent tile read as clear glass.
-    // (Older values around 0.4 made the slab interior feel SEMI-OPAQUE
-    // from inside; that was the source of the "tiles aren't translucent
-    // enough" complaint.)
-    if ((ctx.meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
-        HitKind() == HIT_KIND_TRIANGLE_BACK_FACE &&
-        ctx.mat.refractivity > 0.0)
-    {
-        ctx.mat.refractivity *= 0.85;
-    }
-
-    // Cluster colour + surface base.
-    ctx.clusterTint = saturate(g_scene.miscParams.w);
-    ctx.clusterCol  = (ctx.meta.colorIndex != 0xFFFFFFFFu)
-                        ? ClusterColor(ctx.meta.colorIndex)
-                        : float3(0.6, 0.6, 0.6);
-    const float  surfTint  = ctx.clusterTint * ctx.meta.surfTintMul;
-    const float3 baseUnlit = ctx.mat.baseColor.xyz
-                            * lerp(float3(1, 1, 1), ctx.clusterCol, surfTint);
-
+    // ============================================================================
     // World-space surface normal: smoothed via per-vertex cluster-normal
     // side-channel keyed by (ClusterID, PrimitiveIndex).
+    // ============================================================================
     uint primIdx = PrimitiveIndex();
     uint2 off    = g_clusterOffsets.Load2(cid * 8);
     uint  idxBase= (off.y + primIdx * 3) * 4;
@@ -428,13 +409,58 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
     float3 nObj  = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
     ctx.nWorld   = normalize(mul((float3x3)ObjectToWorld3x4(), nObj));
 
-    // Glass surfaces can be hit on the back face (refraction inside the
-    // volume); flip the normal so it points TOWARD the incoming ray and
-    // HLSL refract() sees the geometry HLSL expects.  Opaque surfaces
-    // shouldn't see back faces (FORCE_OPAQUE + back-face culling on
-    // reflection rays), so the caller passes allowBackFaceFlip=false.
-    if (allowBackFaceFlip && HitKind() == HIT_KIND_TRIANGLE_BACK_FACE)
+    // ENTERING vs EXITING decision: use the SMOOTH NORMAL's direction,
+    // not HitKind().  Reason: triangle winding (which determines
+    // HitKind's "front face") is a PER-TRIANGLE GEOMETRIC property,
+    // but for non-orientable surfaces (Klein bottle) it disagrees with
+    // the smooth normal direction at the body↔handle seam.  The smooth
+    // normal is derived from the parametric formula (Pu × Pv) and is
+    // locally continuous WITHIN each cluster, and (per our analysis)
+    // happens to point in CONSISTENT directions across the body↔handle
+    // seam too.  HitKind() at the seam can flip - triangles that
+    // SHOULD render to the camera get culled or refract wrongly,
+    // producing a closed-curve artifact bounded by the seam.
+    //
+    // Convention: nWorld_preflip points "outward" per the parametric
+    // (= away from the medium the surface encloses).  Then:
+    //   dot(rayDir, n) < 0  ⇒ ray approaches against the normal ⇒
+    //                          ray approaches from OUTSIDE ⇒ ENTERING.
+    //   dot(rayDir, n) > 0  ⇒ ray approaches with the normal ⇒
+    //                          ray approaches from INSIDE ⇒ EXITING.
+    const float3 rayDirW = WorldRayDirection();
+    ctx.entering = (dot(rayDirW, ctx.nWorld) < 0.0);
+
+    // Flip the normal so it always points TOWARD the ray's origin.
+    // refract() expects the normal to point INTO the medium the ray
+    // is currently in.  Entering: nWorld already points back at ray
+    // (no flip).  Exiting: nWorld points along the ray (flip).
+    if (allowBackFaceFlip && !ctx.entering)
         ctx.nWorld = -ctx.nWorld;
+
+    // Interior-surface back-face refractivity reduction.  Tunable per
+    // cluster via the CLUSTER_META_FLAG_INTERIOR_SURFACE bit; when set,
+    // back-face hits on this cluster lose a fraction of their refractivity
+    // so the interior surface reads as visible instead of washing out
+    // with the transmitted exterior.  The multiplier 0.85 here is a
+    // SUBTLE attenuation - the bottom face of a slab tile picks up just
+    // enough surface tint to be silhouetted against the sand below,
+    // without overwhelming the "see through to the world below" look
+    // that makes the translucent tile read as clear glass.
+    if ((ctx.meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
+        !ctx.entering &&
+        ctx.mat.refractivity > 0.0)
+    {
+        ctx.mat.refractivity *= 0.85;
+    }
+
+    // Cluster colour + surface base.
+    ctx.clusterTint = saturate(g_scene.miscParams.w);
+    ctx.clusterCol  = (ctx.meta.colorIndex != 0xFFFFFFFFu)
+                        ? ClusterColor(ctx.meta.colorIndex)
+                        : float3(0.6, 0.6, 0.6);
+    const float  surfTint  = ctx.clusterTint * ctx.meta.surfTintMul;
+    const float3 baseUnlit = ctx.mat.baseColor.xyz
+                            * lerp(float3(1, 1, 1), ctx.clusterCol, surfTint);
 
     ctx.hitPos       = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     float3 toSun     = normalize(g_scene.lightDir.xyz);
@@ -471,6 +497,8 @@ void OpaqueHit(inout Payload p, in Attribs a)
         // Mirror bounce.  Opaque-only path: reflection ray uses
         // RAY_FLAG_CULL_BACK_FACING_TRIANGLES (we're in air, never
         // inside a glass volume on an opaque-instance reflection).
+        // The Klein-bottle BLAS instance disables culling per-instance
+        // so this still works when the reflection bounces toward it.
         float3 reflectDir   = reflect(WorldRayDirection(), ctx.nWorld);
         float3 reflectedRGB = TraceBounce(ctx.hitPos + ctx.nWorld * 0.001,
                                           reflectDir,
@@ -528,7 +556,7 @@ void GlassHit(inout Payload p, in Attribs a)
         //                           bottle - the handle crossing through
         //                           the body's interior shouldn't refract
         //                           since both are the same medium.
-        const bool entering   = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE);
+        const bool entering   = ctx.entering;
         const uint oldDepth   = p.inGlass;
         const uint newDepth   = entering ? (oldDepth + 1u)
                                           : (oldDepth > 0u ? oldDepth - 1u : 0u);

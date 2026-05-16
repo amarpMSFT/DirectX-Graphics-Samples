@@ -173,7 +173,8 @@ namespace SceneData
               .kleinTileUSize = 4, .kleinTileVSize = 4 },
             700,
             { -1.55f, 1.55f, -0.30f }, { 0.20f, 0.55f, 0.0f }, 1.0f, 8,
-            {}, 1.0f, 0.50f, 1.08f
+            {}, 1.0f, 0.50f, 1.08f,
+            /*nonOrientable*/true   // Klein bottle - needs TRIANGLE_CULL_DISABLE
         });
 
         return scene;

@@ -329,7 +329,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
 
     // Spheres around the hex.
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 32, 64, /*tileLat*/4, /*tileLong*/8, 0),
-        with_y(hex(0),  0.1f), 1.0f, 0);                                  // 8x8=64 clusters
+        with_y(hex(0),  0.40f), 1.0f, 0);                                  // 8x8=64 clusters - lifted (sphere r=0.85, floor top at y=-0.56) so bottom is at y=-0.45, clear of floor
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
         with_y(hex(1),  0.4f), 1.0f, 1);                                  // 6x8=48 clusters
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),

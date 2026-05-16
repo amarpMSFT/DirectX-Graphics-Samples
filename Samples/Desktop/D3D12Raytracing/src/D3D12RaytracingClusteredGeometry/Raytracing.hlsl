@@ -222,8 +222,11 @@ void Miss(inout Payload p)
     // Ground band below the horizon - moderately darker at the horizon
     // for atmospheric perspective, full sand colour up close.  Soft
     // falloff so the dark band reads as haze, not as a black void.
-    float3 ground   = lerp(float3(0.55, 0.46, 0.32),    // moderately dark sand at the horizon (FAR)
-                           float3(0.94, 0.84, 0.62),    // bright sand under foot          (NEAR)
+    // Desaturated palette - reads as warm beige/khaki, not punchy
+    // orange-brown (the previous gradient was too saturated and pulled
+    // the eye away from the colourful clustered objects above it).
+    float3 ground   = lerp(float3(0.50, 0.47, 0.42),    // moderately dark, low-saturation beige at horizon (FAR)
+                           float3(0.86, 0.82, 0.74),    // light warm beige under foot                       (NEAR)
                            saturate(-y * 4.0));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the

@@ -319,7 +319,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // around Y, so every angle frames the whole group evenly (no view ends up
     // with one giant object in front and the rest tiny behind it).
     // Hex coordinates: x = R cos(theta), z = R sin(theta), six positions 60° apart.
-    constexpr float R = 2.20f;
+    constexpr float R = 2.55f;                                                // outer hex radius (was 2.20) - objects spaced further apart for breathing room.  Max object extent (R + sphere0 radius 0.85) = 3.40, safely inside slab halfSize 3.5.
     auto hex = [&](int i) {
         float th = (float)i * (2.0f * (float)M_PI / 6.0f);
         return XMFLOAT3(R * std::cos(th), 0.0f, R * std::sin(th));
@@ -717,7 +717,7 @@ void D3D12RaytracingClusteredGeometry::BuildMaterials()
     set(3,    0.85f, 0.65f, 1.00f, 0.10f, 0.78f, 1.50f, 0.0f); // sphere3  amethyst glass
     set(4,    0.95f, 0.80f, 0.55f, 0.10f, 0.78f, 1.50f, 0.0f); // torus    amber glass
     set(5,    0.92f, 0.78f, 0.60f, 0.10f, 0.82f, 1.50f, 0.0f); // cube     translucent copper-tinted glass (heavily see-through)
-    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.55f, 1.50f, 0.0f); // floor    glass SLAB - reduced refractivity so the per-cluster surface tint dominates -> reads as a 6x6 GRID OF COLOURED BRICKS
+    set(6,    0.85f, 0.92f, 0.95f, 0.06f, 0.80f, 1.50f, 0.0f); // floor    glass SLAB - HIGH refractivity so the TRANSLUCENT tiles read clearly as "windows" you can see through (top -> bottom face -> sand below), with the SHINY tiles' mirror behaviour as the clear visual contrast.  Mirror tiles (parity isB=true) still get the per-cluster reflectivity=0.85 override at runtime.
     set(7,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // animated clear glass
     set(8,    0.85f, 0.90f, 1.00f, 0.08f, 0.78f, 1.5f,  0.0f); // klein    clear glass
 

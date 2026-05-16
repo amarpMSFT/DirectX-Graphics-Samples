@@ -117,9 +117,18 @@ namespace SceneData
         // FLOOR - glass slab CHECKER (top + bottom + 4 walls share cluster
         // colour + material per (tu, tv) column).  Odd-parity tiles are
         // MIRROR override; even-parity keep baseline translucent glass.
-        // Reduced tint multipliers so translucent tiles read as pale
-        // glass and mirror tiles' sky-direction variation dominates over
-        // cluster identity.
+        //
+        // Tint multipliers - tuned for READABLE per-tile colour variation
+        // without saturating into "coloured bricks".  At clusterTint=0.65:
+        //   surf = 0.65 * 0.65 = 0.42   (clear per-tile colour on
+        //                                translucent tiles)
+        //   refr = 0.65 * 0.45 = 0.29   (stained-glass through translucent
+        //                                tile to the bottom face)
+        //   refl = 0.65 * 0.31 = 0.20   (mirror tiles read directional
+        //                                sky / horizon, NOT cluster
+        //                                identity - keeps mirror parity
+        //                                visually distinct from the
+        //                                translucent parity)
         // ----------------------------------------------------------------
         ObjectSpec floorObj = {
             "floor_glass_slab_checker",
@@ -130,7 +139,7 @@ namespace SceneData
               .slabThickness = 0.28f },
             600,
             { 0.0f, -0.7f, 0.0f }, {0,0,0}, 1.0f, 6,
-            {}, /*surf*/0.40f, /*refr*/0.25f, /*refl*/0.31f
+            {}, /*surf*/1.0f, /*refr*/1.0f, /*refl*/0.31f
         };
         floorObj.checker.enabled = true;
         floorObj.checker.oddParity.overrideRefl = 0.85f;

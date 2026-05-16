@@ -450,7 +450,24 @@ void Hit(inout Payload p, in Attribs a)
             }
             // else: keep the baseline translucent glass slab material.
         }
+        // For BACK-FACE hits on the slab (ray is INSIDE the glass volume
+        // hitting an interior surface from within - e.g. the camera ray
+        // refracted through a translucent top tile and is now hitting
+        // the matching bottom tile from inside), boost the surface
+        // contribution by dropping refractivity.  Without this the
+        // bottom face's cluster colour shows up as only ~14%% of the
+        // exit pixel (mostly the sand beyond), so the user cannot SEE
+        // the bottom face's checker pattern through the slab.  Cutting
+        // refractivity to 40%% of baseline raises surface contribution
+        // to ~50%% which lets the matching bottom-tile colour read
+        // distinctly as an "inner glass layer" instead of just being
+        // a tiny tint over sand.
+        if (HitKind() == HIT_KIND_TRIANGLE_BACK_FACE && mat.refractivity > 0.0)
+        {
+            mat.refractivity *= 0.4;
+        }
     }
+    // ------------------------------------------------------------------
     // ------------------------------------------------------------------
 
     // Cluster-rainbow palette is gated on a single visualisation knob -

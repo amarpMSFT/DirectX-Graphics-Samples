@@ -481,7 +481,7 @@ namespace ProceduralGeometry
         // unchanged.  Result: handle exits/re-enters the body about 75%
         // from the top (closer to the body's bottom) instead of at
         // mid-height.
-        const float kEntryDown = 10.0f;
+        const float kEntryDown = 0.0f;
         const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle

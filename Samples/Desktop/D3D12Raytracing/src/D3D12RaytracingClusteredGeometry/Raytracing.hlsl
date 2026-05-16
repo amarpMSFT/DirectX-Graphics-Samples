@@ -335,7 +335,8 @@ void Hit(inout Payload p, in Attribs a)
             // baseline.  Note the per-instance FORCE_OPAQUE flag is
             // still set (the BLAS instance was built that way), so any-
             // hit doesn't fire here, but refraction (which doesn't need
-            // any-hit, just back-face hits) works fine.
+            // any-hit, just back-face hits via RAY_FLAG_NONE on the
+            // child trace) works fine.
             mat.refractivity = 0.85;
             mat.ior          = 1.50;
         }
@@ -346,6 +347,30 @@ void Hit(inout Payload p, in Attribs a)
             // tiles, distinct from the translucent ones.
             mat.baseColor.xyz = saturate(mat.baseColor.xyz * 1.45);
         }
+    }
+    // Sphere1 (instanceID=1, the clear-glass-densest sphere) gets its
+    // OWN checker pattern - alternate between SHINY MIRROR and the
+    // baseline TRANSLUCENT glass.  Same parity-on-(lat+long) idea as
+    // sphere2.  Sphere1 mesh: numLat=24 numLong=48 tileLat=4 tileLong=6
+    // -> tilesLat=6, tilesLong=8 -> 48 clusters with IDs 100..147.
+    if (InstanceID() == 1)
+    {
+        const uint kSphere1FirstCid = 100;
+        const uint kSphere1TilesLong = 8;
+        uint local   = cid - kSphere1FirstCid;
+        uint latIdx  = local / kSphere1TilesLong;
+        uint longIdx = local % kSphere1TilesLong;
+        bool isB     = ((latIdx + longIdx) & 1u) != 0u;
+        if (isB)
+        {
+            // Shiny mirror variant: mirror-opaque override.  Refraction
+            // is killed (refr=0) so this cluster shows just the cluster-
+            // tinted base color + a strong reflection.
+            mat.reflectivity = 0.90;
+            mat.refractivity = 0.0;
+            mat.ior          = 0.0;
+        }
+        // else: keep the baseline translucent glass material.
     }
     // ------------------------------------------------------------------
 

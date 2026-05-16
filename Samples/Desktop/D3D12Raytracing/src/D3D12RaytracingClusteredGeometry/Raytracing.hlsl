@@ -198,10 +198,11 @@ void Miss(inout Payload p)
                                                            // the dome reads
                                                            // BLUE not orange.
 
-    // Ground band below the horizon - desaturated stone-grey (not warm
-    // sunset brown - the sun is up, this is daytime).
-    float3 ground   = lerp(float3(0.32, 0.32, 0.30),
-                           float3(0.10, 0.10, 0.09),
+    // Ground band below the horizon - light SAND tan, deepening to a
+    // warmer, slightly darker sand as you look further down.  Sun is up
+    // so the desert reads bright at the horizon line.
+    float3 ground   = lerp(float3(0.88, 0.78, 0.58),    // light sand at horizon edge
+                           float3(0.62, 0.50, 0.34),    // warmer/darker sand below
                            saturate(-y * 1.4));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the

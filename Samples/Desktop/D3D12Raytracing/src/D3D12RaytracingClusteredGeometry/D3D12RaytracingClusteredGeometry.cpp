@@ -2739,11 +2739,11 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // Slowly orbit around the scene center. Period = 30s for a full revolution.
     const double t = m_animSeconds;
     const float  angle  = float(t * (2.0 * M_PI / 30.0));
-    const float  radius = 6.0f;
+    const float  radius = 8.0f;                                 // was 6.0 - dollied back so more of the floor fits in frame
     const float  height = 0.8f;
     XMVECTOR eye = XMVectorSet(radius * std::sin(angle), height,
                                -radius * std::cos(angle), 1.0f);
-    XMVECTOR at  = XMVectorSet(0.5f, 0.2f, 0.0f, 1.0f);   // scene centre
+    XMVECTOR at  = XMVectorSet(0.5f, 1.20f, 0.0f, 1.0f);   // look-at lifted (was 0.2) so the camera tilts UP slightly -> horizon falls into the lower portion of the frame and aligns visually with the floor's back edge instead of leaving a thin sand strip above it
     XMVECTOR up  = XMVectorSet(0, 1, 0, 0);
 
     XMMATRIX view = XMMatrixLookAtLH(eye, at, up);

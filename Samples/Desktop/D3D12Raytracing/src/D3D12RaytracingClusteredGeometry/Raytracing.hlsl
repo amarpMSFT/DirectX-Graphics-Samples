@@ -393,15 +393,34 @@ void Hit(inout Payload p, in Attribs a)
     // Slab layout (see GeneratePlaneSpatialTiles slab branch):
     //   600..635 : top    6x6 = 36 clusters
     //   636..671 : bottom 6x6 = 36 clusters (mirror of top, normal -Y)
-    //   672..675 : 4 side walls (left as-is, baseline glass)
+    //   672..675 : 4 side walls - one big cluster spanning the whole edge
     // Same parity formula on (tu, tv) as the spheres so the top + bottom
     // checker stay aligned (a "tile" looks the same material from above
-    // and below).
+    // and below).  Side walls: remap to the adjacent top tile's cid using
+    // the object-space hit position so the wall slice picks up the SAME
+    // colour AND material as the floor tile it abuts (no visible seam).
     if (InstanceID() == 6)
     {
-        const uint kFloorFirstCid = 600;
-        const uint kFloorTilesV   = 6;
+        const uint kFloorFirstCid = 600u;
+        const uint kFloorTilesV   = 6u;
         const uint kTopBottomEnd  = kFloorFirstCid + 2u * 36u; // 672 = first wall
+
+        // SIDE WALLS: remap cid -> adjacent top tile cid.
+        if (cid >= 672u && cid <= 675u)
+        {
+            // Object-space hit position.  Slab is centered at origin in
+            // object space, halfSize 3.5 in both X and Z, scale=1.0.
+            float3 oPos = ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection();
+            const float kHalf  = 3.5;
+            const float kTileW = (2.0 * kHalf) / 6.0;          // ~1.167 units per tile
+            int tu, tv;
+            if (cid == 672u)        { tu = 0;                                                tv = clamp((int)floor((oPos.z + kHalf) / kTileW), 0, 5); }
+            else if (cid == 673u)   { tu = 5;                                                tv = clamp((int)floor((oPos.z + kHalf) / kTileW), 0, 5); }
+            else if (cid == 674u)   { tu = clamp((int)floor((oPos.x + kHalf) / kTileW), 0, 5); tv = 0;                                                }
+            else /* cid == 675 */   { tu = clamp((int)floor((oPos.x + kHalf) / kTileW), 0, 5); tv = 5;                                                }
+            cid = kFloorFirstCid + (uint)tu * kFloorTilesV + (uint)tv;
+        }
+
         if (cid < kTopBottomEnd)
         {
             // Local index within either the top set (0..35) or the bottom
@@ -418,9 +437,8 @@ void Hit(inout Payload p, in Attribs a)
             }
             // else: keep the baseline translucent glass slab material.
         }
-        // Side walls (cid 672..675) untouched - baseline glass; gives the
-        // slab a continuous translucent edge regardless of the tile parity.
     }
+    // ------------------------------------------------------------------
     // ------------------------------------------------------------------
 
     // Cluster-rainbow palette is gated on a single visualisation knob -
@@ -500,6 +518,22 @@ void Hit(inout Payload p, in Attribs a)
     const uint myDepth = p.depth;
     float3 finalColor = surfaceColor;
 
+    // ===================================================================
+    // Fresnel-Schlick: reflection probability is angle-dependent.
+    //   F0 = reflectance at normal incidence (= mat.reflectivity)
+    //   F  = F0 + (1-F0) * (1 - N.V)^5
+    // F drives the reflection-mix weight; (1-F)*Tnorm drives the
+    // transmission-mix weight (Tnorm normalises so the normal-incidence
+    // look matches what we had before the Fresnel switch).
+    // ===================================================================
+    float NdotV  = saturate(dot(nWorld, -WorldRayDirection()));
+    float F0     = mat.reflectivity;
+    float F      = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+    float Tnorm  = (mat.refractivity > 0.0 && F0 < 0.999) ? (mat.refractivity / (1.0 - F0)) : 0.0;
+    float Tw     = (1.0 - F) * Tnorm;
+
+    bool tirHappened = false;
+
     if (mat.refractivity > 0.0 && myDepth <= 4)
     {
         // Snell ratio eta = n_outside / n_inside for entering, the
@@ -525,7 +559,11 @@ void Hit(inout Payload p, in Attribs a)
             // Total internal reflection: refract() returns 0; fall back
             // to a mirror reflection of the incoming ray (stays inside
             // the glass volume - so childInGlass below stays at the
-            // CURRENT-ray value, not the toggled one).
+            // CURRENT-ray value, not the toggled one).  TIR captures
+            // 100%% of the light (all reflects, none transmits), so we
+            // mix it with weight 1 and SKIP the separate reflection
+            // branch below to avoid double-counting the same bounce.
+            tirHappened = true;
             refractDir = reflect(incident, nWorld);
             uint childInGlass = p.inGlass;       // TIR keeps us in the same medium
             uint cullFlags    = childInGlass ? RAY_FLAG_NONE
@@ -534,13 +572,14 @@ void Hit(inout Payload p, in Attribs a)
                                             refractDir,
                                             cullFlags,
                                             myDepth + 1, childInGlass);
-            finalColor = lerp(finalColor, tirRGB * refractTint, mat.refractivity);
+            finalColor = lerp(finalColor, tirRGB * refractTint, 1.0);
         }
         else
         {
-            // True refraction: the new ray crosses the interface so its
-            // medium toggles.  Front-face entry from air -> child is in
-            // glass.  Back-face exit from glass -> child is in air.
+            // True refraction with Fresnel-weighted contribution.
+            // (1-F) drops at grazing angles -> sides of glass go from
+            // mostly-transmissive (normal incidence) to mostly-reflective
+            // (grazing) - the classic "Fresnel rim" on a glass ball.
             uint childInGlass = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? 1u : 0u;
             uint cullFlags    = childInGlass ? RAY_FLAG_NONE
                                               : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
@@ -548,11 +587,11 @@ void Hit(inout Payload p, in Attribs a)
                                               refractDir,
                                               cullFlags,
                                               myDepth + 1, childInGlass);
-            finalColor = lerp(finalColor, refractedRGB * refractTint, mat.refractivity);
+            finalColor = lerp(finalColor, refractedRGB * refractTint, Tw);
         }
     }
 
-    if (mat.reflectivity > 0.0 && myDepth <= 2)
+    if (!tirHappened && mat.reflectivity > 0.0 && myDepth <= 2)
     {
         // Mirror bounce.  Reflection STAYS in the same medium as the
         // current ray (ray hits a surface, bounces back into the same
@@ -568,15 +607,20 @@ void Hit(inout Payload p, in Attribs a)
                                           reflectDir,
                                           cullFlags,
                                           myDepth + 1, childInGlass);
-        // Tint the reflected RGB by the cluster colour (with a small
-        // white blend) so the per-cluster decomposition reads on
-        // mirror-shiny surfaces.  On chrome (refl=0.95) the surface
-        // contribution is only 5%, so without this the cluster grid
-        // would be invisible on the mirror ball.  ~70%% tint strength
-        // is loud enough to make the cluster checker obvious without
-        // turning every reflection into a pure colour wash.
-        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, 0.70);
-        finalColor = lerp(finalColor, reflectedRGB * reflectTint, mat.reflectivity);
+        // Cluster-tint strength on REFLECTIONS:
+        //   chrome (sphere0) and most surfaces: 0.70 - high tint so the
+        //     cluster grid reads on a near-perfect mirror (chrome would
+        //     otherwise show only the mirrored scene, with no per-cluster
+        //     visual differentiation).
+        //   floor (instanceID=6): LOW tint (0.20) so the directional
+        //     sky-gradient variation dominates - top tiles reflect
+        //     vertically -> zenith deep blue, side tiles reflect
+        //     horizontally -> horizon light blue + other objects.
+        //     This is what makes the floor's top vs side visually
+        //     distinct as MIRROR surfaces with the same cluster identity.
+        float tintStrength = (InstanceID() == 6u) ? 0.20 : 0.70;
+        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, tintStrength);
+        finalColor = lerp(finalColor, reflectedRGB * reflectTint, F);
     }
 
     p.color = float4(finalColor, 1);

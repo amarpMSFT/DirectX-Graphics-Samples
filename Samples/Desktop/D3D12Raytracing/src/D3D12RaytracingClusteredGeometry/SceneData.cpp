@@ -36,8 +36,8 @@ namespace SceneData
         scene.push_back({
             "sphere0_chrome",
             GenKind::UVSphere,
-            { .sphereRadius = 0.85f, .sphereNumLat = 32, .sphereNumLong = 64,
-              .sphereTileLat = 4,    .sphereTileLong = 8 },
+            { .sphereRadius = 0.85f, .sphereNumLat = 64, .sphereNumLong = 128,
+              .sphereTileLat = 8,    .sphereTileLong = 16 },
             /*firstClusterID*/0,
             with_y(hex(0), 0.40f), {0,0,0}, 1.0f, /*instanceID*/0,
             {}, 1.0f, 0.50f, 1.08f
@@ -47,8 +47,8 @@ namespace SceneData
         ObjectSpec s1 = {
             "sphere1_mirror_translucent_checker",
             GenKind::UVSphere,
-            { .sphereRadius = 0.60f, .sphereNumLat = 24, .sphereNumLong = 48,
-              .sphereTileLat = 4,    .sphereTileLong = 6 },
+            { .sphereRadius = 0.60f, .sphereNumLat = 48, .sphereNumLong = 96,
+              .sphereTileLat = 8,    .sphereTileLong = 12 },
             100,
             with_y(hex(1), 0.4f), {0,0,0}, 1.0f, 1,
             {}, 1.0f, 0.50f, 1.08f
@@ -63,8 +63,8 @@ namespace SceneData
         ObjectSpec s2 = {
             "sphere2_matte_translucent_checker",
             GenKind::UVSphere,
-            { .sphereRadius = 0.55f, .sphereNumLat = 16, .sphereNumLong = 32,
-              .sphereTileLat = 4,    .sphereTileLong = 4 },
+            { .sphereRadius = 0.55f, .sphereNumLat = 32, .sphereNumLong = 64,
+              .sphereTileLat = 8,    .sphereTileLong = 8 },
             200,
             with_y(hex(2), -0.1f), {0,0,0}, 1.0f, 2,
             {}, 1.0f, 0.50f, 1.08f
@@ -79,8 +79,8 @@ namespace SceneData
         scene.push_back({
             "sphere3_amethyst_glass",
             GenKind::UVSphere,
-            { .sphereRadius = 0.45f, .sphereNumLat = 12, .sphereNumLong = 24,
-              .sphereTileLat = 3,    .sphereTileLong = 4 },
+            { .sphereRadius = 0.45f, .sphereNumLat = 24, .sphereNumLong = 48,
+              .sphereTileLat = 6,    .sphereTileLong = 8 },
             300,
             with_y(hex(3), 0.3f), {0,0,0}, 1.0f, 3,
             {}, 1.0f, 0.50f, 1.08f
@@ -94,8 +94,8 @@ namespace SceneData
             "torus_amber_glass",
             GenKind::Torus,
             { .torusMajor = 0.55f, .torusMinor = 0.18f,
-              .torusRingSegs = 32, .torusSideSegs = 16,
-              .torusTileRing = 4,  .torusTileSide = 4 },
+              .torusRingSegs = 64, .torusSideSegs = 32,
+              .torusTileRing = 8,  .torusTileSide = 8 },
             400,
             with_y(hex(4), 0.2f), {1.0472f, 0.0f, 0.0f}, 1.0f, 4,
             {}, 1.0f, 0.50f, 1.08f
@@ -107,7 +107,7 @@ namespace SceneData
         scene.push_back({
             "cube_copper_glass",
             GenKind::Cube,
-            { .cubeHalfExtent = 0.45f, .cubeFaceSubdiv = 8, .cubeTileSize = 8 },
+            { .cubeHalfExtent = 0.45f, .cubeFaceSubdiv = 11, .cubeTileSize = 11 },
             500,
             with_y(hex(5), 0.0f), {0,0,0}, 1.0f, 5,
             {}, 1.0f, 0.50f, 1.08f
@@ -169,8 +169,8 @@ namespace SceneData
         scene.push_back({
             "klein_clear_glass",
             GenKind::Klein,
-            { .kleinScale = 0.65f, .kleinNumU = 32, .kleinNumV = 16,
-              .kleinTileUSize = 4, .kleinTileVSize = 4 },
+            { .kleinScale = 0.65f, .kleinNumU = 64, .kleinNumV = 32,
+              .kleinTileUSize = 8, .kleinTileVSize = 8 },
             700,
             { -1.55f, 1.55f, -1.00f }, { 0.90f, 0.55f, -0.55f }, 1.0f, 8,
             {}, 1.0f, 0.50f, 1.08f,

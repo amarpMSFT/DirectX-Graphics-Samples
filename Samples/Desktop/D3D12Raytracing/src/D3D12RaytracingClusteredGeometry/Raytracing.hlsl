@@ -206,11 +206,12 @@ void Miss(inout Payload p)
                                                            // the dome reads
                                                            // BLUE not orange.
 
-    // Ground band below the horizon - light SAND tan, deepening to a
-    // warmer, slightly darker sand as you look further down.  Sun is up
-    // so the desert reads bright at the horizon line.
-    float3 ground   = lerp(float3(0.88, 0.78, 0.58),    // light sand at horizon edge
-                           float3(0.62, 0.50, 0.34),    // warmer/darker sand below
+    // Ground band below the horizon - DARKER at the horizon (atmospheric
+    // perspective makes far ground appear dimmer and bluer), brighter
+    // sand colour up close (looking down).  Reads as foreground sand
+    // fading into a hazy desert distance.
+    float3 ground   = lerp(float3(0.48, 0.40, 0.28),    // darker / hazier sand at the horizon (FAR)
+                           float3(0.92, 0.82, 0.62),    // bright sand under foot     (NEAR, looking down)
                            saturate(-y * 1.4));
 
     // Sun disc/halo.  Only fires when the ray direction is close to the
@@ -520,6 +521,19 @@ void Hit(inout Payload p, in Attribs a)
                                           cullFlags,
                                           myDepth + 1, childInGlass);
         finalColor = lerp(finalColor, reflectedRGB, mat.reflectivity);
+    }
+
+    p.color = float4(finalColor, 1);
+}
+
+
+apply the same stained-glass-style tint to the reflection -
+        // the mirror reads as a per-cluster COLOURED MIRROR (polished
+        // stained glass) and the cluster decomposition is still
+        // visible.  Half-strength so reflections still read clearly as
+        // reflections, just with a hue.
+        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * 0.5);
+        finalColor = lerp(finalColor, reflectedRGB * reflectTint, mat.reflectivity);
     }
 
     p.color = float4(finalColor, 1);

@@ -481,46 +481,44 @@ namespace ProceduralGeometry
         // unchanged.  Result: handle exits/re-enters the body about 75%
         // from the top (closer to the body's bottom) instead of at
         // mid-height.
-        const float kEntryDown = 0.0f;
+        // Drop the THIN-side body+handle join point (u=0/2π) DOWN to
+        // make the handle re-enter the bottle further from the top.
+        // The thick-side join (u=π) stays at z=0 (its natural value),
+        // creating an asymmetric bottle where the handle's two ends sit
+        // at different heights - the handle exits the body's thick side
+        // at mid-height and re-enters the thin side LOW on the bulb.
+        //
+        // Shift function: -kThinDrop * cos²(u/2)
+        //   - = -kThinDrop  at u=0 / u=2π   (thin join: dropped DOWN)
+        //   - = 0           at u=π          (thick join: unchanged)
+        //   - smooth (zero derivative) at all endpoints
+        const float kThinDrop = 7.0f;
         const float invSpan = bottleScale / kVscale;   // normalises height to ±bottleScale
 
         // Helper: returns the (un-axis-swapped, un-scaled) Klein-bottle
         // surface point at parameter (u, v).  Used both for vertex
         // positions and for the central-difference normal estimate below.
-        auto kleinPoint = [kPi, kVscale, kEntryDown](float u, float v) -> float3
+        auto kleinPoint = [kPi, kVscale, kThinDrop](float u, float v) -> float3
         {
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
             const float r  = 4.0f * (1.0f - cu * 0.5f);
-            // Symmetric cos²(u) bias, SUBTRACTED so it makes z more
-            // negative -> world Y lower.  Equal at both joins (u=0/2π
-            // and u=π) so the handle re-enters the body LOW on both
-            // ends.
-            const float entryShift = -kEntryDown * cu * cu;
+            // Thin-side drop: cos²(u/2) = (1+cos(u))/2 is 1 at u=0/2π
+            // (thin join) and 0 at u=π (thick join).  Subtracted so it
+            // pulls the thin join DOWN.  Slope is sin(u)/2 = 0 at all
+            // u=0,π,2π so the join is smooth on both ends.
+            const float halfCos = std::cos(u * 0.5f);
+            const float thinShift = -kThinDrop * halfCos * halfCos;
             float x, z;
             if (u < kPi)
             {
-                // Body half.  The standard parametric has a v-dependent
-                // z-slope (6·cos(v)) at u=π that the handle half DOESN'T
-                // have, producing a kink along the v=0 and v=π lines
-                // where the two pieces meet.  Multiply that v-cosine z
-                // term by cos²(u/2) so it (and its derivative) decay to
-                // ZERO as u -> π:
-                //   cos²(u/2) at u=0 = 1   (no change at body neck)
-                //   cos²(u/2) at u=π = 0   (term vanishes at body-handle join)
-                //   d/du[sin(u)·cos²(u/2)]|_{u=π} = 0  (slopes match!)
-                // Bottle becomes globally C¹-smooth across u=π; visually
-                // the body bulb is a touch less round near the join but
-                // the handle blends in seamlessly.
-                const float halfCos = std::cos(u * 0.5f);
-                const float kSmooth = halfCos * halfCos;
                 x = 6.0f * cu * (1.0f + su) + r * cu * cv;
-                z = -kVscale * su           - r * su * cv * kSmooth + entryShift;
+                z = -kVscale * su           - r * su * cv + thinShift;
             }
             else
             {
                 x = 6.0f * cu * (1.0f + su) + r * std::cos(v + kPi);
-                z = -kVscale * su                                     + entryShift;
+                z = -kVscale * su                          + thinShift;
             }
             const float y = r * std::sin(v);
             return { x, y, z };  // (x_wide, y_depth, z_tall) - original-axis convention

@@ -492,7 +492,11 @@ namespace ProceduralGeometry
             const float cu = std::cos(u), su = std::sin(u);
             const float cv = std::cos(v);
             const float r  = 4.0f * (1.0f - cu * 0.5f);
-            const float entryShift = kEntryDown * cu * cu;   // peaks at u=0,π,2π; zero at u=π/2,3π/2
+            // Asymmetric (1-cos(u))²/4 bias, SUBTRACTED so it makes z
+            // more negative -> world Y lower.  Maximum at u=π (thick
+            // join), zero at u=0/2π (thin join).
+            const float oneMinusCu = 1.0f - cu;
+            const float entryShift = -kEntryDown * oneMinusCu * oneMinusCu * 0.25f;
             float x, z;
             if (u < kPi)
             {
@@ -581,5 +585,6 @@ namespace ProceduralGeometry
         return m;
     }
 }
+
 
 

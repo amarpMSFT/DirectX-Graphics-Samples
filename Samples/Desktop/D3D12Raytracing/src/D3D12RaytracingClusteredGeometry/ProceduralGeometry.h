@@ -37,6 +37,13 @@ namespace ProceduralGeometry
 {
     struct float3 { float x, y, z; };
 
+    // CLUSTER_FLAG_INTERIOR_SURFACE: this cluster is a face of an enclosed
+    // glass volume (e.g. the slab's bottom face seen from inside, or one
+    // of the slab's side walls).  The shader uses this to apply a back-
+    // face refractivity boost so the interior surface reads as visible
+    // instead of washing out the camera ray with transmitted exterior.
+    static constexpr unsigned int CLUSTER_FLAG_INTERIOR_SURFACE = 0x1u;
+
     struct Cluster
     {
         unsigned int            clusterID;     // exposed via HLSL ClusterID() in hits
@@ -47,6 +54,26 @@ namespace ProceduralGeometry
                                                // DXR2 cluster geometry's CLAS only takes
                                                // positions in its vertex buffer.
         std::vector<uint8_t>    indices;       // local 8-bit indices into positions/normals
+
+        // ------------------------------------------------------------------
+        // Per-cluster GENERIC metadata, set by each generator at construction
+        // time.  Lets the scene-build code drive per-cluster material /
+        // colour overrides UNIFORMLY across all object types - no special-
+        // casing per-instance in the closesthit shader, no hand-mirrored
+        // cluster-id ranges in CPU code either.  Generic checker config
+        // can be applied as `isB = (gridU + gridV) & 1` regardless of
+        // whether this is a sphere lat/long tile, a slab top tile, or a
+        // slab wall sub-cluster.
+        // ------------------------------------------------------------------
+        unsigned int            gridU = 0;         // 1st grid coord (latIdx / tu)
+        unsigned int            gridV = 0;         // 2nd grid coord (longIdx / tv)
+        unsigned int            matchedColorCid;   // ClusterColor() hash key.  For most
+                                                   // clusters this == clusterID, but for
+                                                   // slab bottom + wall sub-clusters the
+                                                   // generator sets this to the matching
+                                                   // TOP tile's cid so the colour layer
+                                                   // is unified across the slab volume.
+        unsigned int            flags = 0;         // CLUSTER_FLAG_* bits.
     };
 
     struct Mesh
@@ -79,6 +106,9 @@ namespace ProceduralGeometry
         {
             Cluster c;
             c.clusterID = clusterCounter++;
+            c.gridU = (unsigned int)tLat;
+            c.gridV = (unsigned int)tLong;
+            c.matchedColorCid = c.clusterID;     // sphere clusters use their own cid for colour
 
             // Latitude/longitude index ranges this tile covers.
             const int latLo  = tLat  * tileLatSize;
@@ -234,6 +264,9 @@ namespace ProceduralGeometry
         {
             Cluster c;
             c.clusterID = clusterCounter++;
+            c.gridU = (unsigned int)tu;
+            c.gridV = (unsigned int)tv;
+            c.matchedColorCid = c.clusterID;
             const Face& face = faces[f];
             // Per-face flat normal = axisU x axisV (outward by construction
             // of the face table).  All vertices on this cluster share it -
@@ -306,11 +339,21 @@ namespace ProceduralGeometry
         unsigned int clusterCounter = firstClusterID;
 
         // ---- TOP FACES (normal +Y, CCW from above) ---------------------
+        // Top tiles are LEAD clusters of the slab volume - their cids
+        // are referenced by matching bottom + wall sub-clusters' matched-
+        // color-cid so the entire (tu, tv) column reads as one unit.
         for (int tu = 0; tu < tilesU; ++tu)
         for (int tv = 0; tv < tilesV; ++tv)
         {
             Cluster c;
             c.clusterID = clusterCounter++;
+            c.gridU = (unsigned int)tu;
+            c.gridV = (unsigned int)tv;
+            c.matchedColorCid = c.clusterID;             // top tile owns its own colour
+            // Slab interior surface flag: top face is hit from inside
+            // when refracted rays come back UP through the slab; that
+            // path uses the back-face refractivity boost.
+            if (slab) c.flags |= CLUSTER_FLAG_INTERIOR_SURFACE;
             const float baseU = -halfSizeU + (float)tu * tileWidthU;
             const float baseV = -halfSizeV + (float)tv * tileWidthV;
 
@@ -377,18 +420,32 @@ namespace ProceduralGeometry
                 m.clusters.push_back(std::move(c));
             }
 
-            // 4 SIDE WALLS - one cluster each, single quad (4 verts, 2 tris).
-            // Outward normals: -X, +X, -Z, +Z.  For each wall we list
-            //   p0 = top-near, p1 = bot-near, p2 = top-far, p3 = bot-far
-            // where "near" / "far" run along the wall's horizontal axis
-            // (chosen per-wall so the consistent index order { 0, 1, 3,
-            // 0, 3, 2 } gives a CCW-from-outside winding -> the geometric
-            // cross product (p1-p0) x (p3-p0) equals the outward normal).
-            // Verified by hand for all four walls.
-            auto pushSideWall = [&](float3 p0, float3 p1, float3 p2, float3 p3, float3 nrm)
+            // 4 SIDE WALLS - SPLIT into per-tile-slot sub-clusters so each
+            // visible slice has its OWN cluster and therefore its OWN
+            // ClusterMeta entry (matched colour + material to the adjacent
+            // top tile, set by the scene-build code).  Each wall has 6
+            // sub-clusters (one per tilesU or tilesV slot it abuts).
+            // Cluster ordering: -X wall slots 0..tilesV-1, +X wall slots
+            // 0..tilesV-1, -Z wall slots 0..tilesU-1, +Z wall slots
+            // 0..tilesU-1.  Total: 2*tilesV + 2*tilesU = 24 sub-clusters
+            // (for a 6x6 slab).
+            // pushSideWallSlot emits ONE quad (4 verts, 2 tris) that covers
+            // exactly one tile-slot's worth of the wall - matched 1:1 in
+            // position with the adjacent top tile.  matchedTopCid is the
+            // cid of the top tile this wall slice abuts so colour stays
+            // unified across the slab volume; (gridU,gridV) is the top
+            // tile's grid coord so the scene-build checker config picks
+            // the SAME parity for wall+top+bottom of one column.
+            const unsigned int kFirstTopCidLocal = firstClusterID;
+            auto pushSideWallSlot = [&](float3 p0, float3 p1, float3 p2, float3 p3, float3 nrm,
+                                        unsigned int gridU, unsigned int gridV)
             {
                 Cluster c;
-                c.clusterID = clusterCounter++;
+                c.clusterID       = clusterCounter++;
+                c.gridU           = gridU;
+                c.gridV           = gridV;
+                c.matchedColorCid = kFirstTopCidLocal + gridU * (unsigned int)tilesV + gridV;
+                c.flags          |= CLUSTER_FLAG_INTERIOR_SURFACE;
                 c.positions = { p0, p1, p2, p3 };
                 c.normals   = { nrm, nrm, nrm, nrm };
                 c.indices   = { 0, 1, 3, 0, 3, 2 };
@@ -399,18 +456,46 @@ namespace ProceduralGeometry
             const float xMin = -halfSizeU, xMax = halfSizeU;
             const float zMin = -halfSizeV, zMax = halfSizeV;
             const float yTop = 0.0f,       yBot = -thickness;
-            // -X wall (x=xMin, normal=-X). View from -X (looking in +X dir).
-            pushSideWall({xMin, yTop, zMin}, {xMin, yBot, zMin},
-                         {xMin, yTop, zMax}, {xMin, yBot, zMax}, {-1, 0, 0});
-            // +X wall (x=xMax, normal=+X). View from +X (looking in -X dir).
-            pushSideWall({xMax, yTop, zMax}, {xMax, yBot, zMax},
-                         {xMax, yTop, zMin}, {xMax, yBot, zMin}, {+1, 0, 0});
-            // -Z wall (z=zMin, normal=-Z). View from -Z (looking in +Z dir).
-            pushSideWall({xMax, yTop, zMin}, {xMax, yBot, zMin},
-                         {xMin, yTop, zMin}, {xMin, yBot, zMin}, {0, 0, -1});
-            // +Z wall (z=zMax, normal=+Z). View from +Z (looking in -Z dir).
-            pushSideWall({xMin, yTop, zMax}, {xMin, yBot, zMax},
-                         {xMax, yTop, zMax}, {xMax, yBot, zMax}, {0, 0, +1});
+            // -X wall (x=xMin, normal=-X).  Slots iterate tv=0..tilesV-1.
+            // Matching top column: tu=0.
+            for (int tv = 0; tv < tilesV; ++tv)
+            {
+                const float z0 = zMin + (float)tv       * tileWidthV;
+                const float z1 = zMin + (float)(tv + 1) * tileWidthV;
+                pushSideWallSlot({xMin, yTop, z0}, {xMin, yBot, z0},
+                                 {xMin, yTop, z1}, {xMin, yBot, z1}, {-1, 0, 0},
+                                 /*tu=*/0u, /*tv=*/(unsigned int)tv);
+            }
+            // +X wall (x=xMax, normal=+X).  Matching top column: tu=tilesU-1.
+            // Reversed near/far order so the consistent index winding
+            // { 0,1,3, 0,3,2 } still produces outward normal +X.
+            for (int tv = 0; tv < tilesV; ++tv)
+            {
+                const float z0 = zMin + (float)(tv + 1) * tileWidthV;
+                const float z1 = zMin + (float)tv       * tileWidthV;
+                pushSideWallSlot({xMax, yTop, z0}, {xMax, yBot, z0},
+                                 {xMax, yTop, z1}, {xMax, yBot, z1}, {+1, 0, 0},
+                                 /*tu=*/(unsigned int)(tilesU - 1), /*tv=*/(unsigned int)tv);
+            }
+            // -Z wall (z=zMin, normal=-Z).  Matching top row: tv=0.
+            // Reversed near/far order: x goes from xMax -> xMin per slot.
+            for (int tu = 0; tu < tilesU; ++tu)
+            {
+                const float x0 = xMin + (float)(tu + 1) * tileWidthU;
+                const float x1 = xMin + (float)tu       * tileWidthU;
+                pushSideWallSlot({x0, yTop, zMin}, {x0, yBot, zMin},
+                                 {x1, yTop, zMin}, {x1, yBot, zMin}, {0, 0, -1},
+                                 /*tu=*/(unsigned int)tu, /*tv=*/0u);
+            }
+            // +Z wall (z=zMax, normal=+Z).  Matching top row: tv=tilesV-1.
+            for (int tu = 0; tu < tilesU; ++tu)
+            {
+                const float x0 = xMin + (float)tu       * tileWidthU;
+                const float x1 = xMin + (float)(tu + 1) * tileWidthU;
+                pushSideWallSlot({x0, yTop, zMax}, {x0, yBot, zMax},
+                                 {x1, yTop, zMax}, {x1, yBot, zMax}, {0, 0, +1},
+                                 /*tu=*/(unsigned int)tu, /*tv=*/(unsigned int)(tilesV - 1));
+            }
         }
         return m;
     }
@@ -542,6 +627,9 @@ namespace ProceduralGeometry
         {
             Cluster c;
             c.clusterID = clusterCounter++;
+            c.gridU = (unsigned int)tu;
+            c.gridV = (unsigned int)tv;
+            c.matchedColorCid = c.clusterID;
             const int rowSize = tileVSize + 1;
 
             for (int li = 0; li <= tileUSize; ++li)

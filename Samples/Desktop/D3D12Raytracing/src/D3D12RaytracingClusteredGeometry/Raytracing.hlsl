@@ -41,6 +41,34 @@ StructuredBuffer<MaterialDesc>    g_materials : register(t1);
 ByteAddressBuffer                 g_clusterNormals : register(t2);   // float3 stored as 16 bytes (with .w padding)
 ByteAddressBuffer                 g_clusterIndices : register(t3);   // uint  stored as  4 bytes
 ByteAddressBuffer                 g_clusterOffsets : register(t4);   // uint2 stored as  8 bytes (vertOff, idxOff per cluster)
+// Per-cluster GENERIC metadata buffer (ClusterMeta, 48B per cluster).
+// Drives ALL per-cluster material / colour decisions in the closesthit -
+// no in-shader InstanceID() branches, no cid-range hardcoding, no parity
+// formulas, no wall-tile-slot oPos decoding.  Every per-cluster decision
+// lives in CPU-authored data; the shader just loads the meta and applies
+// the override fields uniformly.  See RaytracingHlslCompat.h ClusterMeta.
+ByteAddressBuffer                 g_clusterMeta    : register(t5);
+
+ClusterMeta LoadClusterMeta(uint cid)
+{
+    // Stride = 48 bytes (matches CPU-side sizeof(ClusterMeta)).  Plain
+    // 4-byte loads packed into the struct, asfloat() for the float fields.
+    const uint base = cid * 48u;
+    ClusterMeta m;
+    m.colorIndex     = g_clusterMeta.Load(base +  0);
+    m.flags          = g_clusterMeta.Load(base +  4);
+    m.overrideRefl   = asfloat(g_clusterMeta.Load(base +  8));
+    m.overrideRefr   = asfloat(g_clusterMeta.Load(base + 12));
+    m.overrideIor    = asfloat(g_clusterMeta.Load(base + 16));
+    m.baseColorScale = asfloat(g_clusterMeta.Load(base + 20));
+    m.surfTintMul    = asfloat(g_clusterMeta.Load(base + 24));
+    m.refrTintMul    = asfloat(g_clusterMeta.Load(base + 28));
+    m.reflTintMul    = asfloat(g_clusterMeta.Load(base + 32));
+    m._pad0          = 0;
+    m._pad1          = 0;
+    m._pad2          = 0;
+    return m;
+}
 
 struct [raypayload] Payload
 {
@@ -320,165 +348,60 @@ void AnyHit(inout Payload p, in Attribs a)
 [shader("closesthit")]
 void Hit(inout Payload p, in Attribs a)
 {
+    // -------------------------------------------------------------------
+    // DATA-DRIVEN material + colour resolution.
+    //
+    // EVERY per-cluster decision (material override, cluster colour hash
+    // key, surface/refraction/reflection tint strength, interior-surface
+    // back-face refractivity boost) is read from a SINGLE per-cluster
+    // metadata buffer that the CPU populates at scene-build time from
+    // each generator's emitted Cluster grid info + the object's scene-
+    // config knobs (CheckerConfig, tint multipliers).  The shader has
+    // ZERO InstanceID() branches, ZERO cluster-id-range tests, ZERO
+    // parity formulas, ZERO oPos-based wall-tile-slot decoding.  Adding
+    // a new variant (different checker pattern, new material kind,
+    // different tint) is a CPU-only edit.
+    // -------------------------------------------------------------------
+    const uint        cid  = ClusterID();
+    const ClusterMeta meta = LoadClusterMeta(cid);
+
     MaterialDesc mat = g_materials[InstanceID()];
 
-    uint cid = ClusterID();
+    // Apply per-cluster material overrides (sentinel <0 = use baseline).
+    if (meta.overrideRefl >= 0.0) mat.reflectivity = meta.overrideRefl;
+    if (meta.overrideRefr >= 0.0) mat.refractivity = meta.overrideRefr;
+    if (meta.overrideIor  >= 0.0) mat.ior          = meta.overrideIor;
+    mat.baseColor.xyz *= meta.baseColorScale;
 
-    // ---- Per-cluster material override demo --------------------------
-    // Sphere2 (instanceID=2, the matte aqua opaque sphere) gets a CHECKER
-    // pattern: alternate clusters are "matte aqua" (default material) vs
-    // "translucent aqua glass" (refractive override).  Demonstrates that
-    // material can vary PER CLUSTER inside a single BLAS - a useful
-    // pattern for things like decals, damage, or mosaic tiles, since
-    // each cluster has its own ClusterID() and the closesthit can use
-    // it to look up cluster-specific data.
-    //
-    // Sphere2 mesh: numLat=16 numLong=32 tileLat=4 tileLong=4 ->
-    // tilesLat=4, tilesLong=8 -> 32 clusters with IDs 200..231.
-    // Cluster (latIdx, longIdx) has localID = latIdx*8 + longIdx.
-    // Checker = (latIdx + longIdx) parity.
-    if (InstanceID() == 2)
+    // Interior surface = part of an enclosed glass volume (slab faces).
+    // Back-face hits from inside the glass should appear MORE opaque so
+    // the interior surface reads as visible instead of washing out with
+    // the transmitted exterior view.
+    if ((meta.flags & CLUSTER_META_FLAG_INTERIOR_SURFACE) != 0u &&
+        HitKind() == HIT_KIND_TRIANGLE_BACK_FACE &&
+        mat.refractivity > 0.0)
     {
-        const uint kSphere2FirstCid = 200;
-        const uint kSphere2TilesLong = 8;
-        uint local   = cid - kSphere2FirstCid;
-        uint latIdx  = local / kSphere2TilesLong;
-        uint longIdx = local % kSphere2TilesLong;
-        bool isB     = ((latIdx + longIdx) & 1u) != 0u;
-        if (isB)
-        {
-            // Translucent variant: glass refraction overrides the matte
-            // baseline.  Note the per-instance FORCE_OPAQUE flag is
-            // still set (the BLAS instance was built that way), so any-
-            // hit doesn't fire here, but refraction (which doesn't need
-            // any-hit, just back-face hits via RAY_FLAG_NONE on the
-            // child trace) works fine.
-            mat.refractivity = 0.85;
-            mat.ior          = 1.50;
-        }
-        else
-        {
-            // Matte variant: brighten the cluster-tint so the matte
-            // halves of the checker pattern read as VIBRANT colour
-            // tiles, distinct from the translucent ones.
-            mat.baseColor.xyz = saturate(mat.baseColor.xyz * 1.45);
-        }
+        mat.refractivity *= 0.4;
     }
-    // Sphere1 (instanceID=1, the clear-glass-densest sphere) gets its
-    // OWN checker pattern - alternate between SHINY MIRROR and the
-    // baseline TRANSLUCENT glass.  Same parity-on-(lat+long) idea as
-    // sphere2.  Sphere1 mesh: numLat=24 numLong=48 tileLat=4 tileLong=6
-    // -> tilesLat=6, tilesLong=8 -> 48 clusters with IDs 100..147.
-    if (InstanceID() == 1)
-    {
-        const uint kSphere1FirstCid = 100;
-        const uint kSphere1TilesLong = 8;
-        uint local   = cid - kSphere1FirstCid;
-        uint latIdx  = local / kSphere1TilesLong;
-        uint longIdx = local % kSphere1TilesLong;
-        bool isB     = ((latIdx + longIdx) & 1u) != 0u;
-        if (isB)
-        {
-            // Shiny mirror variant: mirror-opaque override.  Refraction
-            // is killed (refr=0) so this cluster shows just the cluster-
-            // tinted base color + a strong reflection.
-            mat.reflectivity = 0.90;
-            mat.refractivity = 0.0;
-            mat.ior          = 0.0;
-        }
-        // else: keep the baseline translucent glass material.
-    }
-    // Floor (instanceID=6, the glass slab) gets a CHECKER too: alternate
-    // top+bottom face TILES between SHINY MIRROR and TRANSLUCENT glass.
-    // Slab layout (see GeneratePlaneSpatialTiles slab branch):
-    //   600..635 : top    6x6 = 36 clusters
-    //   636..671 : bottom 6x6 = 36 clusters (mirror of top, normal -Y)
-    //   672..675 : 4 side walls - one big cluster spanning the whole edge
-    // Same parity formula on (tu, tv) as the spheres so the top + bottom
-    // checker stay aligned (a "tile" looks the same material from above
-    // and below).  Side walls: remap to the adjacent top tile's cid using
-    // the object-space hit position so the wall slice picks up the SAME
-    // colour AND material as the floor tile it abuts (no visible seam).
-    if (InstanceID() == 6)
-    {
-        const uint kFloorFirstCid = 600u;
-        const uint kFloorTilesV   = 6u;
-        const uint kTopBottomEnd  = kFloorFirstCid + 2u * 36u; // 672 = first wall
-
-        // SIDE WALLS: remap cid -> adjacent top tile cid.
-        if (cid >= 672u && cid <= 675u)
-        {
-            // Object-space hit position.  Slab is centered at origin in
-            // object space, halfSize 3.5 in both X and Z, scale=1.0.
-            float3 oPos = ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection();
-            const float kHalf  = 3.5;
-            const float kTileW = (2.0 * kHalf) / 6.0;          // ~1.167 units per tile
-            int tu, tv;
-            if (cid == 672u)        { tu = 0;                                                tv = clamp((int)floor((oPos.z + kHalf) / kTileW), 0, 5); }
-            else if (cid == 673u)   { tu = 5;                                                tv = clamp((int)floor((oPos.z + kHalf) / kTileW), 0, 5); }
-            else if (cid == 674u)   { tu = clamp((int)floor((oPos.x + kHalf) / kTileW), 0, 5); tv = 0;                                                }
-            else /* cid == 675 */   { tu = clamp((int)floor((oPos.x + kHalf) / kTileW), 0, 5); tv = 5;                                                }
-            cid = kFloorFirstCid + (uint)tu * kFloorTilesV + (uint)tv;
-        }
-
-        // BOTTOM TILES: remap cid -> matching top tile cid (subtract the
-        // 36-tile offset) so the bottom face picks up the SAME cluster
-        // colour as the top tile directly above it.  Without this remap
-        // ClusterColor() hashes each cid independently and the bottom
-        // tiles get a totally different palette - visually disorienting
-        // when looking through a translucent top tile down to its
-        // corresponding bottom (which the user would intuit as the
-        // "same tile, other side").
-        if (cid >= kFloorFirstCid + 36u && cid < kTopBottomEnd)
-        {
-            cid -= 36u;     // bottom (636..671) -> top (600..635)
-        }
-
-        if (cid < kTopBottomEnd)
-        {
-            // Local index within the top set (0..35) after the bottom-
-            // and wall-remaps above.
-            uint local   = (cid - kFloorFirstCid) % 36u;
-            uint tu      = local / kFloorTilesV;
-            uint tv      = local % kFloorTilesV;
-            bool isB     = ((tu + tv) & 1u) != 0u;
-            if (isB)
-            {
-                mat.reflectivity = 0.85;
-                mat.refractivity = 0.0;
-                mat.ior          = 0.0;
-            }
-            // else: keep the baseline translucent glass slab material.
-        }
-        // For BACK-FACE hits on the slab (ray is INSIDE the glass volume
-        // hitting an interior surface from within - e.g. the camera ray
-        // refracted through a translucent top tile and is now hitting
-        // the matching bottom tile from inside), boost the surface
-        // contribution by dropping refractivity.  Without this the
-        // bottom face's cluster colour shows up as only ~14%% of the
-        // exit pixel (mostly the sand beyond), so the user cannot SEE
-        // the bottom face's checker pattern through the slab.  Cutting
-        // refractivity to 40%% of baseline raises surface contribution
-        // to ~50%% which lets the matching bottom-tile colour read
-        // distinctly as an "inner glass layer" instead of just being
-        // a tiny tint over sand.
-        if (HitKind() == HIT_KIND_TRIANGLE_BACK_FACE && mat.refractivity > 0.0)
-        {
-            mat.refractivity *= 0.4;
-        }
-    }
-    // ------------------------------------------------------------------
-    // ------------------------------------------------------------------
 
     // Cluster-rainbow palette is gated on a single visualisation knob -
     // miscParams.w in the scene CB.  >0 lets the per-cluster cosine
     // palette tint the base colour (so the user can SEE the cluster
     // boundaries which is the whole point of this sample); 0 makes
-    // material colours fully take over.  Default is a subtle 0.3 blend.
-    float  clusterTint = saturate(g_scene.miscParams.w);
-    float3 clusterCol  = (cid != 0xFFFFFFFFu) ? ClusterColor(cid)
-                                              : float3(0.6, 0.6, 0.6);
-    float3 base = mat.baseColor.xyz * lerp(float3(1, 1, 1), clusterCol, clusterTint);
+    // material colours fully take over.
+    const float clusterTint = saturate(g_scene.miscParams.w);
+    // Cluster colour lookup uses meta.colorIndex - the CPU sets this to
+    // the matching top-tile cid for slab bottom + wall sub-clusters so
+    // the entire slab volume column reads as one unit; otherwise it's
+    // just the cluster's own cid.
+    const float3 clusterCol = (meta.colorIndex != 0xFFFFFFFFu)
+                                ? ClusterColor(meta.colorIndex)
+                                : float3(0.6, 0.6, 0.6);
+    // Surface base = baseColor * lerp(white, clusterCol, clusterTint * meta.surfTintMul).
+    // meta.surfTintMul is the per-object knob (default 1.0; floor uses 0.40
+    // so its translucent tiles read as pale glass not saturated bricks).
+    const float surfTint = clusterTint * meta.surfTintMul;
+    const float3 base    = mat.baseColor.xyz * lerp(float3(1, 1, 1), clusterCol, surfTint);
 
     // World-space surface normal.  Per-vertex normals live in the side-
     // channel keyed by (ClusterID, PrimitiveIndex):
@@ -573,15 +496,10 @@ void Hit(inout Payload p, in Attribs a)
         float eta  = (HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE) ? (1.0 / mat.ior) : mat.ior;
         float3 incident   = WorldRayDirection();
         float3 refractDir = refract(incident, nWorld, eta);
-        // Tint the refracted RGB by the cluster colour so per-cluster
-        // boundaries are VISIBLE through glass (acts like a stained-
-        // glass filter - the cluster decomposition shows up as colour
-        // variation in the refracted view, not just on the thin
-        // surface contribution).  Half-strength relative to the surface
-        // tint so the stained-glass effect is clearly visible without
-        // drowning out what's seen THROUGH the glass.  Shared between
-        // TIR and true-refraction branches below.
-        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * 0.50);
+        // Tint the refracted RGB by the cluster colour (stained-glass).
+        // Strength = clusterTint * meta.refrTintMul (default 0.50; floor
+        // dials to 0.25 so translucent tiles read cleanly through).
+        float3 refractTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * meta.refrTintMul);
 
         if (dot(refractDir, refractDir) < 0.001)
         {
@@ -636,21 +554,18 @@ void Hit(inout Payload p, in Attribs a)
                                           reflectDir,
                                           cullFlags,
                                           myDepth + 1, childInGlass);
-        // Cluster-tint strength on REFLECTIONS:
-        //   chrome (sphere0) and most surfaces: 0.70 - high tint so the
-        //     cluster grid reads on a near-perfect mirror (chrome would
-        //     otherwise show only the mirrored scene, with no per-cluster
-        //     visual differentiation).
-        //   floor (instanceID=6): LOW tint (0.20) so the directional
-        //     sky-gradient variation dominates - top tiles reflect
-        //     vertically -> zenith deep blue, side tiles reflect
-        //     horizontally -> horizon light blue + other objects.
-        //     This is what makes the floor's top vs side visually
-        //     distinct as MIRROR surfaces with the same cluster identity.
-        float tintStrength = (InstanceID() == 6u) ? 0.20 : 0.70;
-        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, tintStrength);
+        // Tint the reflected RGB by the cluster colour.  Strength =
+        // clusterTint * meta.reflTintMul.  Defaults:
+        //   chrome / glass spheres: meta.reflTintMul ~ 1.08 (effective
+        //     ~0.70 at default clusterTint=0.65) - high tint so the
+        //     cluster grid reads on near-perfect mirrors.
+        //   floor: meta.reflTintMul ~ 0.31 (effective ~0.20) - LOW tint
+        //     so the directional sky/horizon variation dominates over
+        //     cluster identity on the mirror tiles.
+        float3 reflectTint = lerp(float3(1, 1, 1), clusterCol, clusterTint * meta.reflTintMul);
         finalColor = lerp(finalColor, reflectedRGB * reflectTint, F);
     }
 
     p.color = float4(finalColor, 1);
 }
+

@@ -29,6 +29,8 @@ namespace GlobalRootSig {
         ClusterIndicesSRVSlot,      // Stage F: StructuredBuffer<uint>   g_clusterIndices  (uint32 per index)
         ClusterOffsetsSRVSlot,      // Stage F: StructuredBuffer<uint2>  g_clusterOffsets  (per-cluster
                                     //                                                      vertOff, idxOff)
+        ClusterMetaSRVSlot,         // Refactor: ByteAddressBuffer of ClusterMeta[] - data-driven
+                                    //           per-cluster material/colour override metadata.
         Count
     };
 }
@@ -62,6 +64,37 @@ struct ClusterObject
     // don't care about orientation.
     DirectX::XMFLOAT3                        worldRotEuler = { 0, 0, 0 };
     UINT                                     instanceID    = 0;
+
+    // ------------------------------------------------------------------
+    // Per-object SCENE/ART config (will move to SceneData.h in Phase E).
+    // Drives the GENERIC BuildClusterMetadata() pass which produces the
+    // per-cluster GPU buffer: shader has zero per-object branches.
+    // ------------------------------------------------------------------
+    struct CheckerOverride
+    {
+        // <0 sentinel = no override.  Otherwise the value replaces the
+        // baseline material's corresponding field for clusters matching
+        // this side of the parity.
+        float overrideRefl     = -1.0f;
+        float overrideRefr     = -1.0f;
+        float overrideIor      = -1.0f;
+        // 1.0 = no change.  Multiplies the baseline material's baseColor.xyz.
+        float baseColorScale   =  1.0f;
+    };
+    struct CheckerConfig
+    {
+        bool             enabled = false;
+        CheckerOverride  evenParity;     // (gridU + gridV) & 1 == 0
+        CheckerOverride  oddParity;      // (gridU + gridV) & 1 == 1
+    };
+    CheckerConfig checker;
+
+    // Per-object TINT MULTIPLIERS (applied to ALL clusters of this object,
+    // baked into per-cluster ClusterMeta).  Each multiplies the global
+    // clusterTint slider before its respective lerp blend.
+    float surfTintMul = 1.0f;   // surface base-colour cluster tint
+    float refrTintMul = 0.50f;  // refraction tint
+    float reflTintMul = 1.08f;  // reflection tint  (= 0.70 / 0.65 default)
 };
 
 class D3D12RaytracingClusteredGeometry : public DXSample
@@ -335,6 +368,13 @@ private:
     UINT                                 m_clusterOffsetsCount = 0;
     void BuildClusterShaderSideBuffers();
 
+    // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
+    // Drives ALL per-cluster material / colour decisions in the shader -
+    // see the big design comment on ClusterMeta in RaytracingHlslCompat.h.
+    ComPtr<ID3D12Resource>               m_clusterMetaBuffer;
+    UINT                                 m_clusterMetaCount = 0;
+    void BuildClusterMetadata();
+
     // ---------- Timestamp queries for AS build wall-clocks ----------
     // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).
     // Per-frame uses a separate heap + readback with 3 ring-buffer slots so
@@ -416,4 +456,5 @@ private:
     static const wchar_t* c_hitGroupName;
     static const wchar_t* c_shadowHitGroupName;
 };
+
 

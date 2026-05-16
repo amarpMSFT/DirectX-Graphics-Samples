@@ -73,3 +73,47 @@ struct MaterialDesc
     float    ior;            // refractive index (1.5=glass, 1.33=water, ignored if refractivity==0)
     float    translucency;   // [0..1] stochastic any-hit reject probability
 };
+
+// ----------------------------------------------------------------------------
+// Per-CLUSTER metadata.  Indexed by ClusterID() on the GPU; built once
+// per-cluster on the CPU at scene-build time.
+//
+// CRITICAL DESIGN POINT: every per-cluster decision the closesthit shader
+// needs lives HERE - in CPU-authored data.  The shader does ONE load:
+//     ClusterMeta m = g_clusterMeta[cid];
+// and applies the overrides unconditionally.  No InstanceID() branches,
+// no hand-mirrored cluster-id ranges, no parity formulas, no oPos-based
+// wall-tile-slot decoding.  Adding a new material variant is "tweak a
+// few fields in BuildClusterMetadata" - touch the CPU code, leave the
+// shader alone.
+//
+// Stride is 48 bytes (multiple of 16) for clean ByteAddressBuffer indexing
+// at cid * sizeof(ClusterMeta).
+// ----------------------------------------------------------------------------
+#define CLUSTER_META_FLAG_INTERIOR_SURFACE 0x1u   // back-face refr *= 0.4
+
+struct ClusterMeta
+{
+    uint  colorIndex;          // ClusterColor() hash key.  For matched
+                               // bottom + wall sub-clusters this is the
+                               // matching top-tile cid; otherwise the
+                               // cluster's own cid.
+    uint  flags;               // CLUSTER_META_FLAG_* bits.
+    float overrideRefl;        // <0 = no override; >=0 = replace mat.reflectivity
+    float overrideRefr;        // <0 = no override; >=0 = replace mat.refractivity
+    float overrideIor;         // <0 = no override; >=0 = replace mat.ior
+    float baseColorScale;      // 1.0 = no scale; multiplies mat.baseColor.xyz
+    // Per-cluster tint multipliers - the shader's clusterTint slider
+    // gets multiplied by these before the final lerp blend.  Lets each
+    // object dial its surface / refraction / reflection cluster-colour
+    // bias independently (e.g. chrome wants strong reflection-tint to
+    // expose the cluster grid on a near-perfect mirror; floor wants
+    // weak reflection-tint so sky-direction variation dominates over
+    // cluster identity on its mirror tiles).
+    float surfTintMul;         // surface base-colour blend.  1.0 = use clusterTint as-is.
+    float refrTintMul;         // refraction tint blend.  Default 0.50.
+    float reflTintMul;         // reflection tint blend.  Default ~1.08 (= 0.70 / 0.65).
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+};

@@ -255,6 +255,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildAccelerationStructures();
     SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
     BuildClusterShaderSideBuffers();
+    SampleLog::Write(L">>> BuildClusterMetadata\n");
+    BuildClusterMetadata();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
     CreateRaytracingPipelineAndShaderTables();
     SampleLog::Write(L">>> CreateDescriptorHeapAndRaytracingOutput\n");
@@ -303,7 +305,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     constexpr int kCompressedBitsPerComponent = 12;
 
     auto add = [&](ProceduralGeometry::Mesh&& mesh, const XMFLOAT3& pos, float scale, UINT instanceID,
-                   const XMFLOAT3& euler = XMFLOAT3(0,0,0))
+                   const XMFLOAT3& euler = XMFLOAT3(0,0,0)) -> ClusterObject&
     {
         ClusterObject obj;
         obj.mesh          = std::move(mesh);
@@ -312,6 +314,7 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
         obj.worldRotEuler = euler;
         obj.instanceID    = instanceID;
         m_objects.push_back(std::move(obj));
+        return m_objects.back();
     };
 
     // Arrange the six objects in a roughly-hexagonal cluster around the origin
@@ -327,13 +330,41 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
 
     auto with_y = [](XMFLOAT3 p, float y) { p.y = y; return p; };
 
-    // Spheres around the hex.
+    // ------------------------------------------------------------------
+    // SPHERES.  Per-object SCENE CONFIG is attached right after add() to
+    // drive the GENERIC BuildClusterMetadata() pass - no per-instance
+    // branches anywhere in the shader.  (In Phase E these become static
+    // table entries in SceneData.h, removed from this engine code.)
+    // ------------------------------------------------------------------
+    // Sphere0 - CHROME, no checker.  reflTintMul stays at default 1.08
+    // so the chrome ball shows its cluster grid clearly in the mirror.
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.85f, 32, 64, /*tileLat*/4, /*tileLong*/8, 0),
-        with_y(hex(0),  0.40f), 1.0f, 0);                                  // 8x8=64 clusters - lifted (sphere r=0.85, floor top at y=-0.56) so bottom is at y=-0.45, clear of floor
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
-        with_y(hex(1),  0.4f), 1.0f, 1);                                  // 6x8=48 clusters
-    add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),
-        with_y(hex(2), -0.1f), 1.0f, 2);                                  // 4x8=32 clusters
+        with_y(hex(0),  0.40f), 1.0f, 0);                                  // 8x8=64 clusters - lifted clear of floor
+
+    // Sphere1 - SHINY-MIRROR / TRANSLUCENT-GLASS checker.  Odd-parity
+    // clusters override to mirror (refl=0.90, refr=0); even-parity
+    // clusters keep the baseline translucent glass material.
+    {
+        auto& obj = add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.60f, 24, 48, /*tileLat*/4, /*tileLong*/6, 100),
+            with_y(hex(1),  0.4f), 1.0f, 1);                               // 6x8=48 clusters
+        obj.checker.enabled = true;
+        obj.checker.oddParity.overrideRefl = 0.90f;
+        obj.checker.oddParity.overrideRefr = 0.0f;
+        obj.checker.oddParity.overrideIor  = 0.0f;
+    }
+
+    // Sphere2 - MATTE-VIBRANT / TRANSLUCENT-GLASS checker.  Odd-parity:
+    // translucent glass override.  Even-parity: brighten baseColor 1.45x
+    // so the matte tiles read as vibrant colour patches.
+    {
+        auto& obj = add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.55f, 16, 32, /*tileLat*/4, /*tileLong*/4, 200),
+            with_y(hex(2), -0.1f), 1.0f, 2);                               // 4x8=32 clusters
+        obj.checker.enabled = true;
+        obj.checker.oddParity.overrideRefr = 0.85f;
+        obj.checker.oddParity.overrideIor  = 1.50f;
+        obj.checker.evenParity.baseColorScale = 1.45f;
+    }
+
     add(ProceduralGeometry::GenerateUVSphereSpatialTiles(0.45f, 12, 24, /*tileLat*/3, /*tileLong*/4, 300),
         with_y(hex(3),  0.3f), 1.0f, 3);                                  // 4x6=24 clusters
 
@@ -351,37 +382,44 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     add(ProceduralGeometry::GenerateCubeSpatialTiles(0.45f, 8, 8, 500),
         with_y(hex(5),  0.0f), 1.0f, 5);                                  // 6 faces * 1 tile = 6 clusters
 
-    // Floor — a 0.55-thick GLASS BLOCK.  Top face at y=-0.7, bottom at
-    // y=-1.25, plus 4 side walls so the slab is a fully-closed glass
-    // volume.  The thicker cross-section is visually obvious from the
-    // default camera angle (you can see the slab's edge depth from
-    // outside), and refraction enters the top, bounces around inside,
-    // and exits through whichever face the refracted ray finds.
-    // Cluster count: 36 top + 36 bottom + 4 side walls = 76 clusters.
-    add(ProceduralGeometry::GeneratePlaneSpatialTiles(
-            /*halfSizeU*/3.5f, /*halfSizeV*/3.5f,
-            /*tilesU*/6,       /*tilesV*/6,
-            /*tileQuadsU*/4,   /*tileQuadsV*/4,
-            /*firstClusterID*/600,
-            /*thickness*/0.28f),
-        XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);                            // 76 clusters total
+    // Floor - GLASS SLAB with chess-board CHECKER (top + bottom + 4 walls
+    // share cluster colour + material per column).  Odd-parity tiles are
+    // MIRROR override; even-parity keep the baseline translucent glass.
+    // Tint mults dial the floor's stained-glass intensity down so the
+    // translucent tiles read as pale glass (not saturated coloured bricks).
+    {
+        auto& obj = add(ProceduralGeometry::GeneratePlaneSpatialTiles(
+                /*halfSizeU*/3.5f, /*halfSizeV*/3.5f,
+                /*tilesU*/6,       /*tilesV*/6,
+                /*tileQuadsU*/4,   /*tileQuadsV*/4,
+                /*firstClusterID*/600,
+                /*thickness*/0.28f),
+            XMFLOAT3(0.0f, -0.7f, 0.0f), 1.0f, 6);
+        obj.checker.enabled = true;
+        obj.checker.oddParity.overrideRefl = 0.85f;
+        obj.checker.oddParity.overrideRefr = 0.0f;
+        obj.checker.oddParity.overrideIor  = 0.0f;
+        // Reduce surface + refraction + reflection tinting on the floor.
+        // Default clusterTint = 0.65; the resulting effective blends are:
+        //   surf = 0.65 * 0.40 = 0.26   (pale glass colour bias)
+        //   refr = 0.65 * 0.25 = 0.16   (refraction reads cleanly)
+        //   refl = 0.65 * 0.31 = 0.20   (mirror tiles show sky-direction
+        //                                variation, not cluster identity)
+        obj.surfTintMul = 0.40f;
+        obj.refrTintMul = 0.25f;
+        obj.reflTintMul = 0.31f;
+    }
 
     // Klein bottle - the iconic "neck-through-body" parametric Klein
-    // bottle, GLASS-LIKE: real Snell refraction (refr=0.55, ior=1.5) +
-    // a faint mirror sheen (refl=0.10) + a tiny stochastic dusting
-    // (trans=0.10) for a slight "frosted glass" texture.  Positioned
-    // BESIDE the animated glass sphere up high so the two refractive
-    // objects are visually adjacent (compare a topologically-trivial
-    // glass ball with a topologically-bonkers glass Klein bottle), and
-    // rotated so the handle's loop-into-body geometry shows in the
-    // default camera view.
+    // bottle, GLASS-LIKE: real Snell refraction + a faint mirror sheen.
+    // No checker; uses default tint mults.
     add(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
-            /*bottleScale*/0.65f,                                          // a touch bigger so refraction reads
-            /*numU*/32, /*numV*/16,                                        // matches torus / sphere2 res
+            /*bottleScale*/0.65f,
+            /*numU*/32, /*numV*/16,
             /*tileUSize*/4, /*tileVSize*/4,
             /*firstClusterID*/700),
-        XMFLOAT3(-1.55f, 1.55f, -0.30f), 1.0f, 8,                          // beside the animated sphere; lifted clear of the smallest sphere underneath (which is at (-2.2, 0.4, 0) with r=0.45)
-        XMFLOAT3(0.20f, /*~30°*/0.55f, 0.0f));                             // tilt + yaw so the loop reads
+        XMFLOAT3(-1.55f, 1.55f, -0.30f), 1.0f, 8,
+        XMFLOAT3(0.20f, 0.55f, 0.0f));
 
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
@@ -793,6 +831,116 @@ void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
                             indices.size() * sizeof(UINT) +
                             offsets.size() * sizeof(XMUINT2)) / 1024));
 }
+
+
+// =====================================================================================
+// BuildClusterMetadata - generic per-cluster metadata pass.
+//
+// Walks every cluster of every object (including the animated sphere) and
+// emits one ClusterMeta entry per cluster ID.  All per-object material /
+// colour decisions live in the ClusterObject::checker config and the per-
+// object tint multipliers - the GPU shader is fully data-driven and has
+// ZERO per-instance / per-cid-range branches.
+//
+// The fields populated come straight from CPU-side scene data:
+//   - colorIndex       = cluster.matchedColorCid  (set by generator;
+//                                                  matched top tile for
+//                                                  slab bottom/wall)
+//   - flags            = cluster.flags            (INTERIOR_SURFACE etc.)
+//   - overrideRefl/Refr/Ior = picked by parity (cluster.gridU+gridV)&1
+//                             from obj.checker.{even,odd}Parity
+//   - baseColorScale   = same (from CheckerOverride.baseColorScale)
+//   - surfTintMul / refrTintMul / reflTintMul = per-object knobs
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    const UINT kAnimatedClusterIdOffset = 800;
+
+    // Pass 1: same size discovery as BuildClusterShaderSideBuffers.
+    UINT maxClusterID = 0;
+    for (const auto& obj : m_objects)
+        for (const auto& c : obj.mesh.clusters)
+            maxClusterID = std::max(maxClusterID, c.clusterID);
+    if (m_animatedObjectEnabled)
+        for (const auto& c : m_animatedObject.mesh.clusters)
+            maxClusterID = std::max(maxClusterID, c.clusterID + kAnimatedClusterIdOffset);
+
+    const UINT metaCount = maxClusterID + 1;
+    std::vector<ClusterMeta> meta(metaCount, ClusterMeta{});
+
+    // Initialize all slots with neutral defaults: no override, colorIndex=cid,
+    // baseColorScale=1, tint mul defaults that reproduce the legacy look.
+    for (UINT i = 0; i < metaCount; ++i)
+    {
+        meta[i].colorIndex     = i;
+        meta[i].flags          = 0u;
+        meta[i].overrideRefl   = -1.0f;
+        meta[i].overrideRefr   = -1.0f;
+        meta[i].overrideIor    = -1.0f;
+        meta[i].baseColorScale = 1.0f;
+        meta[i].surfTintMul    = 1.0f;
+        meta[i].refrTintMul    = 0.50f;
+        meta[i].reflTintMul    = 1.08f;   // = 0.70 / 0.65 (default clusterTint)
+    }
+
+    // Generic per-cluster fill - works on any object type that has a
+    // mesh + optional checker config + tint multipliers (since the
+    // animated sphere uses a different storage class than ClusterObject
+    // but otherwise carries the same per-cluster info on its mesh).
+    auto fillFromMesh = [&](const ProceduralGeometry::Mesh& mesh,
+                            UINT cidOffset,
+                            const ClusterObject::CheckerConfig& checker,
+                            float surfTintMul, float refrTintMul, float reflTintMul)
+    {
+        for (const auto& c : mesh.clusters)
+        {
+            const UINT id = c.clusterID + cidOffset;
+            ClusterMeta& m = meta[id];
+
+            m.colorIndex     = c.matchedColorCid + cidOffset;
+            m.flags          = c.flags;
+            m.surfTintMul    = surfTintMul;
+            m.refrTintMul    = refrTintMul;
+            m.reflTintMul    = reflTintMul;
+
+            if (checker.enabled)
+            {
+                const bool isOdd = ((c.gridU + c.gridV) & 1u) != 0u;
+                const auto& side = isOdd ? checker.oddParity
+                                         : checker.evenParity;
+                m.overrideRefl   = side.overrideRefl;
+                m.overrideRefr   = side.overrideRefr;
+                m.overrideIor    = side.overrideIor;
+                m.baseColorScale = side.baseColorScale;
+            }
+        }
+    };
+
+    for (const auto& obj : m_objects)
+        fillFromMesh(obj.mesh, 0u, obj.checker,
+                     obj.surfTintMul, obj.refrTintMul, obj.reflTintMul);
+    if (m_animatedObjectEnabled)
+    {
+        // The animated object uses default scene config for now (no
+        // checker, baseline tint multipliers).  When scene data moves to
+        // SceneData.h in Phase E the animated object can be a regular
+        // ClusterObject entry like the rest.
+        ClusterObject::CheckerConfig noChecker;
+        fillFromMesh(m_animatedObject.mesh, kAnimatedClusterIdOffset,
+                     noChecker, /*surf*/1.0f, /*refr*/0.50f, /*refl*/1.08f);
+    }
+
+    AllocateUploadBuffer(device, meta.data(), meta.size() * sizeof(ClusterMeta),
+                         &m_clusterMetaBuffer, L"Per-cluster GENERIC metadata (ClusterMeta[])");
+    m_clusterMetaCount = (UINT)meta.size();
+
+    SampleLog::LogF(L"[clustermeta] %u entries (~%u KB)\n",
+                    m_clusterMetaCount,
+                    (UINT)((meta.size() * sizeof(ClusterMeta)) / 1024));
+}
+
 
 
 //
@@ -2565,6 +2713,10 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         params[GlobalRootSig::ClusterNormalsSRVSlot].InitAsShaderResourceView(2);
         params[GlobalRootSig::ClusterIndicesSRVSlot].InitAsShaderResourceView(3);
         params[GlobalRootSig::ClusterOffsetsSRVSlot].InitAsShaderResourceView(4);
+        // Per-cluster GENERIC metadata buffer.  Replaces ALL hardcoded
+        // per-instance / per-cid-range branches in the closesthit.  See
+        // RaytracingHlslCompat.h ClusterMeta.
+        params[GlobalRootSig::ClusterMetaSRVSlot].InitAsShaderResourceView(5);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -2889,6 +3041,8 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         m_clusterIndicesBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterOffsetsSRVSlot,
         m_clusterOffsetsBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterMetaSRVSlot,
+        m_clusterMetaBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();

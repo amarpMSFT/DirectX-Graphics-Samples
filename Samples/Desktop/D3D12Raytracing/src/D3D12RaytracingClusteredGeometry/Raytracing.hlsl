@@ -421,10 +421,23 @@ void Hit(inout Payload p, in Attribs a)
             cid = kFloorFirstCid + (uint)tu * kFloorTilesV + (uint)tv;
         }
 
+        // BOTTOM TILES: remap cid -> matching top tile cid (subtract the
+        // 36-tile offset) so the bottom face picks up the SAME cluster
+        // colour as the top tile directly above it.  Without this remap
+        // ClusterColor() hashes each cid independently and the bottom
+        // tiles get a totally different palette - visually disorienting
+        // when looking through a translucent top tile down to its
+        // corresponding bottom (which the user would intuit as the
+        // "same tile, other side").
+        if (cid >= kFloorFirstCid + 36u && cid < kTopBottomEnd)
+        {
+            cid -= 36u;     // bottom (636..671) -> top (600..635)
+        }
+
         if (cid < kTopBottomEnd)
         {
-            // Local index within either the top set (0..35) or the bottom
-            // set (0..35) - same formula because both follow the same tu/tv loop.
+            // Local index within the top set (0..35) after the bottom-
+            // and wall-remaps above.
             uint local   = (cid - kFloorFirstCid) % 36u;
             uint tu      = local / kFloorTilesV;
             uint tv      = local % kFloorTilesV;
@@ -438,7 +451,6 @@ void Hit(inout Payload p, in Attribs a)
             // else: keep the baseline translucent glass slab material.
         }
     }
-    // ------------------------------------------------------------------
     // ------------------------------------------------------------------
 
     // Cluster-rainbow palette is gated on a single visualisation knob -

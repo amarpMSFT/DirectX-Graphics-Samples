@@ -82,11 +82,49 @@ private:
     bool m_clustersAndPtlasSupported = false;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
-    // Default is FLOAT32_3 — currently looks cleanest. The COMPRESSED1 path
-    // exists for the demo but has a bug in my encoder (visible as shifted
-    // geometry / cracks at cluster boundaries); see TODO in Compressed1.h.
+    // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
+    // renders them cleanly) but hits a current NVIDIA driver bug; see the
+    // banner in BuildScene() in the .cpp.
     enum class VertexMode { Compressed1, Float32_3 };
     VertexMode                           m_vertexMode = VertexMode::Float32_3;
+
+    // ---------- CLAS memory-allocation strategy (selectable via --clas-alloc) ----------
+    // Implicit  - one IMPLICIT_DESTINATIONS build into a worst-case-sized buffer.
+    //             Simplest, lowest CPU overhead, highest steady memory.
+    // GetSizes  - 2-pass: first runs MODE_GET_SIZES to learn per-cluster bytes,
+    //             then EXPLICIT_DESTINATIONS build into an exact-sized buffer.
+    //             No over-allocation; CPU stalls on size-array readback.
+    // Compact   - 1-pass IMPLICIT build (worst-case alloc) PLUS a per-cluster
+    //             size readback (free side effect of the build); then
+    //             MOVE_CLUSTER_OBJECTS in IMPLICIT mode compacts the live CLAS
+    //             into a tightly-sized buffer. Peak GPU memory = worst-case +
+    //             compacted; final GPU memory = compacted.
+    enum class ClasAllocMode { Implicit, GetSizes, Compact };
+    ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Implicit;
+    const wchar_t*                       ClasAllocModeName() const
+    {
+        switch (m_clasAllocMode)
+        {
+        case ClasAllocMode::Implicit: return L"implicit";
+        case ClasAllocMode::GetSizes: return L"get-sizes";
+        case ClasAllocMode::Compact:  return L"compact";
+        }
+        return L"?";
+    }
+    // Stats captured by BuildClasIndirect, reported via UpdateTitleBar + log.
+    struct ClasMemStats
+    {
+        UINT64 resultPrebuildMax  = 0;  // prebuild.ResultDataMaxSizeInBytes (worst case)
+        UINT64 resultInitialBytes = 0;  // what we actually allocated initially
+        UINT64 resultFinalBytes   = 0;  // final live result-buffer size after this function returns
+        UINT64 peakResidentBytes  = 0;  // max concurrent live result-buffer memory
+        UINT64 scratchBytesPhase1 = 0;
+        UINT64 scratchBytesPhase2 = 0;
+        UINT64 sumActualBytes     = 0;  // sum of per-cluster sizes (= the irreducible CLAS storage)
+        double cpuWallMsPhase1    = 0.0;
+        double cpuWallMsPhase2    = 0.0;
+    };
+    ClasMemStats                         m_clasMemStats;
 
     // ---------- Scene = N procedurally-generated objects ----------
     std::vector<ClusterObject>           m_objects;
@@ -104,6 +142,7 @@ private:
     ComPtr<ID3D12Resource>               m_clasScratchBuffer;
     ComPtr<ID3D12Resource>               m_clasAddressArray;       // N_total_clusters x GVA
     ComPtr<ID3D12Resource>               m_clasSizeArray;          // N_total_clusters x UINT64
+    ComPtr<ID3D12Resource>               m_clasMoveArgsBuffer;     // ClasAllocMode::Compact only - kept alive across function returns
 
     // Single BLAS-from-CLAS build covers all BLASes (one per object).
     ComPtr<ID3D12Resource>               m_blasScratchBuffer;
@@ -233,7 +272,10 @@ private:
     void BuildScene();                              // populates m_objects (CPU-side meshes + encoding)
     void BuildAccelerationStructures();
     void UploadClusterInputs();
-    void BuildClasIndirect();
+    void BuildClasIndirect();              // dispatches to one of the three below
+    void BuildClasImplicit();              // ClasAllocMode::Implicit
+    void BuildClasGetSizes();              // ClasAllocMode::GetSizes
+    void BuildClasCompact();               // ClasAllocMode::Compact
     void BuildBlasFromClasIndirect();
     void BuildTlasClassic();
     void RebuildTlasPerFrame();

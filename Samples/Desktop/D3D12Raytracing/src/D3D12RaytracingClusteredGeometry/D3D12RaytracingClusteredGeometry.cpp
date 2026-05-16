@@ -16,6 +16,7 @@
 
 #include <DirectXMath.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 using namespace std;
@@ -63,6 +64,16 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
         {
             if      (_wcsicmp(argv[i+1], L"float")      == 0) m_vertexMode = VertexMode::Float32_3;
             else if (_wcsicmp(argv[i+1], L"compressed") == 0) m_vertexMode = VertexMode::Compressed1;
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--clas-alloc") == 0 && i + 1 < argc)
+        {
+            // CLAS memory-allocation strategy. See ClasAllocMode in the header for
+            // the contract of each mode; the [CLAS mem] log line at init time
+            // reports the stats that change between them.
+            if      (_wcsicmp(argv[i+1], L"implicit")  == 0) m_clasAllocMode = ClasAllocMode::Implicit;
+            else if (_wcsicmp(argv[i+1], L"get-sizes") == 0) m_clasAllocMode = ClasAllocMode::GetSizes;
+            else if (_wcsicmp(argv[i+1], L"compact")   == 0) m_clasAllocMode = ClasAllocMode::Compact;
             i += 1;
         }
     }
@@ -678,19 +689,106 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
     m_clasArgsStride     = (UINT)argStride;
 }
 
-// ---------------------------------------------------------------------------------
-// Single CLAS build covering ALL clusters from ALL objects in one
-// ExecuteIndirectRTASOperations call. Implementation-defined layout in
-// IMPLICIT_DESTINATIONS mode; per-cluster addresses written to m_clasAddressArray.
-// ---------------------------------------------------------------------------------
+// =====================================================================================
+// CLAS allocation strategies.
+//
+// All three modes share the same per-cluster inputs (vertex/index buffers,
+// triangle counts, args array, etc.). They differ only in HOW the per-cluster
+// output CLAS bytes get placed in GPU memory:
+//
+//   Implicit  - one IMPLICIT_DESTINATIONS build; allocate worst-case storage
+//               from prebuild.ResultDataMaxSizeInBytes. Simplest path. Wastes
+//               memory when actual per-cluster size << worst case (typical
+//               5x over-alloc for this scene on NVIDIA).
+//
+//   GetSizes  - two passes:
+//                 1. MODE_GET_SIZES: no result-buffer alloc, driver writes
+//                    per-cluster bytes-needed into a UAV size array.
+//                 2. CPU readback of sizes, sum to get the exact total,
+//                    compute per-cluster destination offsets, allocate an
+//                    exact-sized result buffer.
+//                 3. MODE_EXPLICIT_DESTINATIONS build into that buffer.
+//               No over-allocation at any point. Cost: one extra GPU pass +
+//               a CPU stall on the size readback.
+//
+//   Compact   - two passes, opposite tradeoff:
+//                 1. MODE_IMPLICIT_DESTINATIONS build (worst-case alloc),
+//                    with ResultSizeArray attached so per-cluster actual
+//                    sizes are written as a side effect of the build.
+//                 2. CPU readback of sizes -> compacted total.
+//                 3. MOVE_CLUSTER_OBJECTS in MODE_IMPLICIT_DESTINATIONS into
+//                    a tightly-sized compacted result buffer.
+//                 4. Old (worst-case) result buffer is released.
+//               Peak GPU memory = worst-case + compacted (briefly, during
+//               step 3). Final = compacted. No CPU-blocking required if the
+//               size info is consumed by a GPU shader -> only useful if you
+//               want EXACT post-build alloc on a single GPU timeline.
+//
+// All three end with m_clasResultBuffer, m_clasAddressArray, m_clasSizeArray
+// in their canonical post-CLAS state so the subsequent BLAS-from-CLAS build
+// can proceed identically. The captured stats (m_clasMemStats) let the
+// user see the tradeoff in numbers via the [CLAS mem] log line.
+// =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
+{
+    SampleLog::LogF(L"[CLAS alloc-mode] %s\n", ClasAllocModeName());
+    m_clasMemStats = ClasMemStats{};        // reset stats for this run
+    switch (m_clasAllocMode)
+    {
+    case ClasAllocMode::Implicit: BuildClasImplicit(); break;
+    case ClasAllocMode::GetSizes: BuildClasGetSizes(); break;
+    case ClasAllocMode::Compact:  BuildClasCompact();  break;
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Build the shared D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC + ClusterLimits.
+// All three modes need the same input description; only their Mode field and
+// the surrounding batched-op-data setup differ. Keeping this in one helper
+// avoids drift between the three paths.
+// ---------------------------------------------------------------------------------
+static void BuildSharedClusterTrianglesInputs(
+    const D3D12RaytracingClusteredGeometry& self,
+    UINT N, bool useFloat, UINT maxTris, UINT maxVerts, UINT totalTris, UINT totalVerts,
+    UINT maxCompressedSize,
+    D3D12_RTAS_CLUSTER_LIMITS& outLimits,
+    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC& outClasDesc)
+{
+    (void)self;
+    outLimits = {};
+    outLimits.MaxArgCount                                   = N;
+    outLimits.MaxGeometryIndexValue                         = 0;
+    outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
+    outLimits.MaxTriangleCountPerCluster                    = maxTris;
+    outLimits.MaxVertexCountPerCluster                      = maxVerts;
+    outLimits.MaxTotalTriangleCount                         = totalTris;
+    outLimits.MaxTotalVertexCount                           = totalVerts;
+    outLimits.MaxOpacityMicromapIndicesPerCluster           = 0;
+
+    outClasDesc = {};
+    outClasDesc.ClusterLimits                       = outLimits;
+    outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
+                                                               : D3D12_VERTEX_FORMAT_COMPRESSED1;
+    outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
+    outClasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
+    outClasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
+    outClasDesc.MaxCompressedClusterPositionsSize   = useFloat ? 0u : maxCompressedSize;
+    // .Mode set by each caller.
+}
+
+// ---------------------------------------------------------------------------------
+// Implicit mode (default). Single IMPLICIT_DESTINATIONS build covering all
+// clusters. Allocates the worst-case result-buffer size from prebuild info;
+// per-cluster GVAs land in m_clasAddressArray; per-cluster sizes land in
+// m_clasSizeArray (as a side effect of the build, useful for stats).
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
 {
     auto device = m_deviceResources->GetD3DDevice();
     const UINT N = m_totalClusterCount;
     const bool useFloat = (m_vertexMode == VertexMode::Float32_3);
 
-    // Compute per-cluster maxima for ClusterLimits + (compressed1 path only)
-    // the worst-case packed vertex blob size.
     UINT maxTris = 0, maxVerts = 0, totalTris = 0, totalVerts = 0;
     UINT maxCompressedSize = 0;
     for (const auto& obj : m_objects)
@@ -704,28 +802,12 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
             maxCompressedSize = std::max(maxCompressedSize, (UINT)obj.encoded[i].TotalBytes());
     }
 
-    D3D12_RTAS_CLUSTER_LIMITS limits = {};
-    limits.MaxArgCount                                   = N;
-    limits.MaxGeometryIndexValue                         = 0;
-    limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
-    limits.MaxTriangleCountPerCluster                    = maxTris;
-    limits.MaxVertexCountPerCluster                      = maxVerts;
-    limits.MaxTotalTriangleCount                         = totalTris;
-    limits.MaxTotalVertexCount                           = totalVerts;
-    limits.MaxOpacityMicromapIndicesPerCluster           = 0;
-
-    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc = {};
-    clasDesc.ClusterLimits                       = limits;
-    clasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
-    clasDesc.Mode                                = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
-    clasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
-                                                            : D3D12_VERTEX_FORMAT_COMPRESSED1;
-    clasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
-    clasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
-    clasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
-    // MaxCompressedClusterPositionsSize is only meaningful for COMPRESSED1.
-    // TEMP: way oversized to test if undersizing is the bug
-    clasDesc.MaxCompressedClusterPositionsSize   = useFloat ? 0u : (maxCompressedSize * 4 + 1024);
+    D3D12_RTAS_CLUSTER_LIMITS limits;
+    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc;
+    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+                                      totalTris, totalVerts, maxCompressedSize,
+                                      limits, clasDesc);
+    clasDesc.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
     D3D12_RTAS_OPERATION_INPUTS opInputs = {};
     opInputs.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
@@ -738,9 +820,15 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
                     (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
                     (unsigned long long)prebuild.ScratchDataSizeInBytes);
 
+    m_clasMemStats.resultPrebuildMax  = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.resultInitialBytes = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.resultFinalBytes   = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.peakResidentBytes  = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.scratchBytesPhase1 = prebuild.ScratchDataSizeInBytes;
+
     AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
                       &m_clasResultBuffer, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                      L"All-cluster CLAS result buffer");
+                      L"All-cluster CLAS result buffer (implicit)");
     AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
                       &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                       L"CLAS scratch");
@@ -765,14 +853,465 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
     opDesc.Inputs                = opInputs;
     opDesc.pBatchedOperationData = &batched;
 
+    const auto t0 = std::chrono::steady_clock::now();
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDesc, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
-
     D3D12_RESOURCE_BARRIER barriers[] = {
         CD3DX12_RESOURCE_BARRIER::UAV(m_clasResultBuffer.Get()),
         CD3DX12_RESOURCE_BARRIER::UAV(m_clasAddressArray.Get()),
         CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get()),
     };
     m_dxrCommandList->ResourceBarrier(_countof(barriers), barriers);
+    const auto t1 = std::chrono::steady_clock::now();
+    m_clasMemStats.cpuWallMsPhase1 = std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// ---------------------------------------------------------------------------------
+// GetSizes mode. Two-pass: first a GET_SIZES pass to learn per-cluster bytes,
+// then an EXPLICIT_DESTINATIONS build into an exact-sized result buffer.
+// CPU stalls between passes on the size-array readback.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+    auto cmdList = m_deviceResources->GetCommandList();
+    const UINT N = m_totalClusterCount;
+    const bool useFloat = (m_vertexMode == VertexMode::Float32_3);
+
+    UINT maxTris = 0, maxVerts = 0, totalTris = 0, totalVerts = 0;
+    UINT maxCompressedSize = 0;
+    for (const auto& obj : m_objects)
+    for (size_t i = 0; i < obj.mesh.clusters.size(); ++i)
+    {
+        UINT t = (UINT)(obj.mesh.clusters[i].indices.size() / 3);
+        UINT v = (UINT)obj.mesh.clusters[i].positions.size();
+        maxTris  = std::max(maxTris,  t);  totalTris  += t;
+        maxVerts = std::max(maxVerts, v);  totalVerts += v;
+        if (!useFloat)
+            maxCompressedSize = std::max(maxCompressedSize, (UINT)obj.encoded[i].TotalBytes());
+    }
+
+    D3D12_RTAS_CLUSTER_LIMITS limits;
+    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDescBase;
+    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+                                      totalTris, totalVerts, maxCompressedSize,
+                                      limits, clasDescBase);
+
+    // ---- Phase 1: GET_SIZES pass ----
+    // No result buffer needed; driver writes per-cluster bytes-needed into a
+    // UAV size buffer. m_clasSizeArray is reused as the destination.
+    auto clasDescSizes = clasDescBase;
+    clasDescSizes.Mode = D3D12_RTAS_OPERATION_MODE_GET_SIZES;
+
+    D3D12_RTAS_OPERATION_INPUTS opInputsSizes = {};
+    opInputsSizes.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+    opInputsSizes.pClusterTrianglesDesc = &clasDescSizes;
+
+    D3D12_RTAS_OPERATION_PREBUILD_INFO prebuildSizes = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&opInputsSizes, &prebuildSizes);
+    SampleLog::LogF(L"[CLAS prebuild get-sizes] result max=%llu bytes, scratch=%llu bytes\n",
+                    (unsigned long long)prebuildSizes.ResultDataMaxSizeInBytes,
+                    (unsigned long long)prebuildSizes.ScratchDataSizeInBytes);
+
+    // Worst-case result alloc for stats reference - we DON'T allocate it.
+    D3D12_RTAS_OPERATION_INPUTS opInputsImplicitProbe = opInputsSizes;
+    auto clasDescProbe = clasDescBase;
+    clasDescProbe.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+    opInputsImplicitProbe.pClusterTrianglesDesc = &clasDescProbe;
+    D3D12_RTAS_OPERATION_PREBUILD_INFO prebuildImplicitProbe = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&opInputsImplicitProbe, &prebuildImplicitProbe);
+    m_clasMemStats.resultPrebuildMax  = prebuildImplicitProbe.ResultDataMaxSizeInBytes;
+    m_clasMemStats.scratchBytesPhase1 = prebuildSizes.ScratchDataSizeInBytes;
+
+    AllocateUAVBuffer(device, std::max<UINT64>(prebuildSizes.ScratchDataSizeInBytes, 256ull),
+                      &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS scratch (get-sizes phase)");
+    AllocateUAVBuffer(device, (UINT64)N * sizeof(UINT64),
+                      &m_clasSizeArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS size array");
+
+    D3D12_RTAS_BATCHED_OPERATION_DATA batchedSizes = {};
+    batchedSizes.BatchScratchData      = m_clasScratchBuffer->GetGPUVirtualAddress();
+    batchedSizes.ResultSizeArray       = { m_clasSizeArray->GetGPUVirtualAddress(), sizeof(UINT64) };
+    batchedSizes.IndirectArgumentArray = { m_clasArgsArrayGPUVA, m_clasArgsStride };
+
+    D3D12_RTAS_OPERATION_DESC opDescSizes = {};
+    opDescSizes.Inputs                = opInputsSizes;
+    opDescSizes.pBatchedOperationData = &batchedSizes;
+
+    const auto p1_t0 = std::chrono::steady_clock::now();
+    m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDescSizes,
+        D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+    auto sizesUav = CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get());
+    m_dxrCommandList->ResourceBarrier(1, &sizesUav);
+
+    // Copy size array to a readback heap so the CPU can sum them.
+    ComPtr<ID3D12Resource> sizesReadback;
+    {
+        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer((UINT64)N * sizeof(UINT64));
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sizesReadback)));
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmdList->ResourceBarrier(1, &toCopy);
+        cmdList->CopyBufferRegion(sizesReadback.Get(), 0, m_clasSizeArray.Get(), 0,
+            (UINT64)N * sizeof(UINT64));
+        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList->ResourceBarrier(1, &fromCopy);
+    }
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    const auto p1_t1 = std::chrono::steady_clock::now();
+    m_clasMemStats.cpuWallMsPhase1 = std::chrono::duration<double, std::milli>(p1_t1 - p1_t0).count();
+
+    // Sum sizes + compute per-cluster destination offsets in the about-to-be-
+    // allocated exact-sized result buffer. ACCELERATION_STRUCTURE alignment
+    // (256B) must be respected for every cluster's start address.
+    constexpr UINT64 kAsAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    auto alignUp = [](UINT64 x, UINT64 a) { return (x + (a - 1)) & ~(a - 1); };
+
+    void* mapped = nullptr;
+    D3D12_RANGE rr = { 0, (SIZE_T)N * sizeof(UINT64) };
+    ThrowIfFailed(sizesReadback->Map(0, &rr, &mapped));
+    auto* sizes = reinterpret_cast<const UINT64*>(mapped);
+
+    std::vector<UINT64> destOffsets(N);
+    UINT64 sumActual = 0, packedTotal = 0;
+    for (UINT i = 0; i < N; ++i)
+    {
+        destOffsets[i] = packedTotal;
+        packedTotal   += alignUp(sizes[i], kAsAlign);
+        sumActual     += sizes[i];
+    }
+    D3D12_RANGE noWrite = { 0, 0 };
+    sizesReadback->Unmap(0, &noWrite);
+    SampleLog::LogF(L"[CLAS get-sizes] sum actual=%llu bytes, packed (256B-aligned)=%llu bytes\n",
+                    (unsigned long long)sumActual, (unsigned long long)packedTotal);
+    m_clasMemStats.sumActualBytes  = sumActual;
+    m_clasMemStats.resultInitialBytes = packedTotal;
+    m_clasMemStats.resultFinalBytes   = packedTotal;
+    m_clasMemStats.peakResidentBytes  = packedTotal;
+
+    // ---- Phase 2: EXPLICIT_DESTINATIONS build into exact-sized buffer ----
+    auto commandAllocator = m_deviceResources->GetCommandAllocator();
+    ThrowIfFailed(commandAllocator->Reset());
+    ThrowIfFailed(cmdList->Reset(commandAllocator, nullptr));
+
+    AllocateUAVBuffer(device, packedTotal,
+                      &m_clasResultBuffer, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"All-cluster CLAS result buffer (get-sizes exact)");
+
+    // Per-cluster destination GVAs go into m_clasAddressArray. EXPLICIT mode
+    // reads from this buffer; the driver places each result at the address we
+    // specify here. After the build, m_clasAddressArray's contents (which we
+    // just wrote on CPU) are the canonical post-build per-cluster GVAs that
+    // the BLAS-from-CLAS step needs.
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> destAddrs(N);
+    const D3D12_GPU_VIRTUAL_ADDRESS baseGVA = m_clasResultBuffer->GetGPUVirtualAddress();
+    for (UINT i = 0; i < N; ++i) destAddrs[i] = baseGVA + destOffsets[i];
+
+    AllocateUploadBuffer(device, destAddrs.data(),
+                         destAddrs.size() * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
+                         &m_clasAddressArray, L"CLAS address array (explicit destinations)");
+
+    auto clasDescBuild = clasDescBase;
+    clasDescBuild.Mode = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+
+    D3D12_RTAS_OPERATION_INPUTS opInputsBuild = {};
+    opInputsBuild.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+    opInputsBuild.pClusterTrianglesDesc = &clasDescBuild;
+
+    D3D12_RTAS_OPERATION_PREBUILD_INFO prebuildBuild = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&opInputsBuild, &prebuildBuild);
+    SampleLog::LogF(L"[CLAS prebuild explicit-build] scratch=%llu bytes\n",
+                    (unsigned long long)prebuildBuild.ScratchDataSizeInBytes);
+    m_clasMemStats.scratchBytesPhase2 = prebuildBuild.ScratchDataSizeInBytes;
+
+    AllocateUAVBuffer(device, std::max<UINT64>(prebuildBuild.ScratchDataSizeInBytes, 256ull),
+                      &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS scratch (explicit-build phase)");
+
+    D3D12_RTAS_BATCHED_OPERATION_DATA batchedBuild = {};
+    batchedBuild.BatchScratchData      = m_clasScratchBuffer->GetGPUVirtualAddress();
+    batchedBuild.ResultAddressArray    = { m_clasAddressArray->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+    batchedBuild.ResultSizeArray       = { m_clasSizeArray->GetGPUVirtualAddress(),    sizeof(UINT64) };
+    batchedBuild.IndirectArgumentArray = { m_clasArgsArrayGPUVA, m_clasArgsStride };
+
+    D3D12_RTAS_OPERATION_DESC opDescBuild = {};
+    opDescBuild.Inputs                = opInputsBuild;
+    opDescBuild.pBatchedOperationData = &batchedBuild;
+
+    const auto p2_t0 = std::chrono::steady_clock::now();
+    m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDescBuild,
+        D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+    // NB: m_clasAddressArray was allocated as an UPLOAD-heap buffer in this
+    // mode (read-only INPUT to the EXPLICIT_DESTINATIONS build), so it has no
+    // UAV bind flags and must NOT be UAV-barriered. Only the result/size
+    // buffers get the barrier.
+    D3D12_RESOURCE_BARRIER barriers[] = {
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasResultBuffer.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get()),
+    };
+    m_dxrCommandList->ResourceBarrier(_countof(barriers), barriers);
+    const auto p2_t1 = std::chrono::steady_clock::now();
+    m_clasMemStats.cpuWallMsPhase2 = std::chrono::duration<double, std::milli>(p2_t1 - p2_t0).count();
+}
+
+// ---------------------------------------------------------------------------------
+// Compact mode. Single IMPLICIT build (worst-case alloc) -- with the size
+// array attached so we get per-cluster actual sizes for free -- then a CPU
+// readback + MOVE_CLUSTER_OBJECTS in IMPLICIT mode that compacts the live
+// CLAS into a tightly-sized buffer. After the move the old (worst-case)
+// result buffer is released; what remains is the compacted buffer.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::BuildClasCompact()
+{
+    auto device  = m_deviceResources->GetD3DDevice();
+    auto cmdList = m_deviceResources->GetCommandList();
+    const UINT N = m_totalClusterCount;
+    const bool useFloat = (m_vertexMode == VertexMode::Float32_3);
+
+    UINT maxTris = 0, maxVerts = 0, totalTris = 0, totalVerts = 0;
+    UINT maxCompressedSize = 0;
+    for (const auto& obj : m_objects)
+    for (size_t i = 0; i < obj.mesh.clusters.size(); ++i)
+    {
+        UINT t = (UINT)(obj.mesh.clusters[i].indices.size() / 3);
+        UINT v = (UINT)obj.mesh.clusters[i].positions.size();
+        maxTris  = std::max(maxTris,  t);  totalTris  += t;
+        maxVerts = std::max(maxVerts, v);  totalVerts += v;
+        if (!useFloat)
+            maxCompressedSize = std::max(maxCompressedSize, (UINT)obj.encoded[i].TotalBytes());
+    }
+
+    D3D12_RTAS_CLUSTER_LIMITS limits;
+    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDescBase;
+    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+                                      totalTris, totalVerts, maxCompressedSize,
+                                      limits, clasDescBase);
+    clasDescBase.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+
+    D3D12_RTAS_OPERATION_INPUTS opInputs = {};
+    opInputs.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+    opInputs.pClusterTrianglesDesc = &clasDescBase;
+
+    D3D12_RTAS_OPERATION_PREBUILD_INFO prebuild = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&opInputs, &prebuild);
+    SampleLog::LogF(L"[CLAS prebuild compact phase1] result max=%llu, scratch=%llu bytes\n",
+                    (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
+                    (unsigned long long)prebuild.ScratchDataSizeInBytes);
+    m_clasMemStats.resultPrebuildMax  = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.resultInitialBytes = prebuild.ResultDataMaxSizeInBytes;
+    m_clasMemStats.scratchBytesPhase1 = prebuild.ScratchDataSizeInBytes;
+
+    // Phase 1 buffers - this is the implicit/worst-case build.
+    ComPtr<ID3D12Resource> phase1ResultBuffer;
+    AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
+                      &phase1ResultBuffer, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"CLAS phase1 (worst-case) result buffer");
+    AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
+                      &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS scratch (compact phase1)");
+    ComPtr<ID3D12Resource> phase1AddressArray;
+    AllocateUAVBuffer(device, (UINT64)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
+                      &phase1AddressArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS phase1 address array");
+    AllocateUAVBuffer(device, (UINT64)N * sizeof(UINT64),
+                      &m_clasSizeArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS size array");
+
+    D3D12_RTAS_BATCHED_OPERATION_DATA batched = {};
+    batched.BatchResultData           = phase1ResultBuffer->GetGPUVirtualAddress();
+    batched.BatchScratchData          = m_clasScratchBuffer->GetGPUVirtualAddress();
+    batched.ResultAddressArray        = { phase1AddressArray->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+    batched.ResultSizeArray           = { m_clasSizeArray->GetGPUVirtualAddress(),    sizeof(UINT64) };
+    batched.IndirectArgumentArray     = { m_clasArgsArrayGPUVA, m_clasArgsStride };
+
+    D3D12_RTAS_OPERATION_DESC opDesc = {};
+    opDesc.Inputs                = opInputs;
+    opDesc.pBatchedOperationData = &batched;
+
+    const auto p1_t0 = std::chrono::steady_clock::now();
+    m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDesc,
+        D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+
+    D3D12_RESOURCE_BARRIER barriers[] = {
+        CD3DX12_RESOURCE_BARRIER::UAV(phase1ResultBuffer.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(phase1AddressArray.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get()),
+    };
+    m_dxrCommandList->ResourceBarrier(_countof(barriers), barriers);
+
+    // Read sizes back so we know how big the compacted buffer needs to be.
+    ComPtr<ID3D12Resource> sizesReadback;
+    {
+        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer((UINT64)N * sizeof(UINT64));
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sizesReadback)));
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmdList->ResourceBarrier(1, &toCopy);
+        cmdList->CopyBufferRegion(sizesReadback.Get(), 0, m_clasSizeArray.Get(), 0,
+            (UINT64)N * sizeof(UINT64));
+        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList->ResourceBarrier(1, &fromCopy);
+    }
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    const auto p1_t1 = std::chrono::steady_clock::now();
+    m_clasMemStats.cpuWallMsPhase1 = std::chrono::duration<double, std::milli>(p1_t1 - p1_t0).count();
+
+    // Sum sizes -> compacted total. The move op packs sequentially with 256B
+    // alignment per element.
+    constexpr UINT64 kAsAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    auto alignUp = [](UINT64 x, UINT64 a) { return (x + (a - 1)) & ~(a - 1); };
+
+    void* mapped = nullptr;
+    D3D12_RANGE rr = { 0, (SIZE_T)N * sizeof(UINT64) };
+    ThrowIfFailed(sizesReadback->Map(0, &rr, &mapped));
+    auto* sizes = reinterpret_cast<const UINT64*>(mapped);
+    UINT64 sumActual = 0, packedTotal = 0;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srcAddrsCPU(N);
+    {
+        // Also read phase1's per-cluster GVAs (needed for the move-args
+        // SourceAccelerationStructure field). Could do this with one
+        // big readback, but we already have sizesReadback in flight - do a
+        // small extra readback for addresses.
+        ComPtr<ID3D12Resource> addrsReadback;
+        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer((UINT64)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&addrsReadback)));
+        auto commandAllocator = m_deviceResources->GetCommandAllocator();
+        ThrowIfFailed(commandAllocator->Reset());
+        ThrowIfFailed(cmdList->Reset(commandAllocator, nullptr));
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(phase1AddressArray.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        cmdList->ResourceBarrier(1, &toCopy);
+        cmdList->CopyBufferRegion(addrsReadback.Get(), 0, phase1AddressArray.Get(), 0,
+            (UINT64)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        m_deviceResources->ExecuteCommandList();
+        m_deviceResources->WaitForGpu();
+        void* m2 = nullptr;
+        D3D12_RANGE r2 = { 0, (SIZE_T)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+        ThrowIfFailed(addrsReadback->Map(0, &r2, &m2));
+        memcpy(srcAddrsCPU.data(), m2, (size_t)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        D3D12_RANGE noWrite0 = {0, 0};
+        addrsReadback->Unmap(0, &noWrite0);
+    }
+    for (UINT i = 0; i < N; ++i)
+    {
+        sumActual   += sizes[i];
+        packedTotal += alignUp(sizes[i], kAsAlign);
+    }
+    D3D12_RANGE noWrite = { 0, 0 };
+    sizesReadback->Unmap(0, &noWrite);
+    SampleLog::LogF(L"[CLAS compact] sum actual=%llu bytes, packed (256B-aligned)=%llu bytes (vs worst-case %llu)\n",
+                    (unsigned long long)sumActual, (unsigned long long)packedTotal,
+                    (unsigned long long)prebuild.ResultDataMaxSizeInBytes);
+    m_clasMemStats.sumActualBytes  = sumActual;
+    m_clasMemStats.resultFinalBytes = packedTotal;
+    // Peak = worst-case + compacted (both live during MOVE).
+    m_clasMemStats.peakResidentBytes =
+        prebuild.ResultDataMaxSizeInBytes + packedTotal;
+
+    // ---- Phase 2: MOVE_CLUSTER_OBJECTS in IMPLICIT_DESTINATIONS ----
+    // Pack into a fresh tightly-sized buffer; driver writes new per-cluster
+    // addresses into a new m_clasAddressArray. After the move, phase1 buffers
+    // are released - only the compacted result remains live.
+    auto commandAllocator = m_deviceResources->GetCommandAllocator();
+    ThrowIfFailed(commandAllocator->Reset());
+    ThrowIfFailed(cmdList->Reset(commandAllocator, nullptr));
+
+    // Compacted result buffer + new address array (output of MOVE).
+    AllocateUAVBuffer(device, packedTotal,
+                      &m_clasResultBuffer, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"All-cluster CLAS result buffer (compacted)");
+    AllocateUAVBuffer(device, (UINT64)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
+                      &m_clasAddressArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS address array (post-compact)");
+
+    // MOVE_CLUSTER_OBJECTS args: SourceAccelerationStructure per cluster.
+    // m_clasMoveArgsBuffer is a member so it outlives this function call
+    // (the queued cmd list reads from it until BuildAccelerationStructures
+    // flushes at the bottom).
+    std::vector<D3D12_RTAS_OPERATION_MOVE_CLUSTER_OBJECTS_ARGS> moveArgs(N);
+    for (UINT i = 0; i < N; ++i)
+        moveArgs[i].SourceAccelerationStructure = srcAddrsCPU[i];
+    AllocateUploadBuffer(device, moveArgs.data(),
+                         moveArgs.size() * sizeof(D3D12_RTAS_OPERATION_MOVE_CLUSTER_OBJECTS_ARGS),
+                         &m_clasMoveArgsBuffer, L"CLAS move args");
+
+    D3D12_RTAS_CLUSTER_MOVES_DESC movesDesc = {};
+    movesDesc.MaxArgCount    = N;
+    movesDesc.Mode           = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+    movesDesc.Type           = D3D12_RTAS_MOVE_OPERATION_TYPE_CLUSTER_LEVEL_ACCELERATION_STRUCTURE;
+    movesDesc.MaxBytesMoved  = packedTotal;
+    movesDesc.Flags          = D3D12_RTAS_CLUSTER_MOVE_OPERATION_FLAG_NONE;
+
+    D3D12_RTAS_OPERATION_INPUTS moveInputs = {};
+    moveInputs.Type              = D3D12_RTAS_OPERATION_TYPE_MOVE_CLUSTER_OBJECTS;
+    moveInputs.pClusterMovesDesc = &movesDesc;
+
+    D3D12_RTAS_OPERATION_PREBUILD_INFO movePrebuild = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&moveInputs, &movePrebuild);
+    SampleLog::LogF(L"[CLAS prebuild compact phase2 (move)] result max=%llu, scratch=%llu bytes\n",
+                    (unsigned long long)movePrebuild.ResultDataMaxSizeInBytes,
+                    (unsigned long long)movePrebuild.ScratchDataSizeInBytes);
+    m_clasMemStats.scratchBytesPhase2 = movePrebuild.ScratchDataSizeInBytes;
+
+    AllocateUAVBuffer(device, std::max<UINT64>(movePrebuild.ScratchDataSizeInBytes, 256ull),
+                      &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"CLAS scratch (compact move)");
+
+    D3D12_RTAS_BATCHED_OPERATION_DATA batchedMove = {};
+    batchedMove.BatchResultData       = m_clasResultBuffer->GetGPUVirtualAddress();
+    batchedMove.BatchScratchData      = m_clasScratchBuffer->GetGPUVirtualAddress();
+    batchedMove.ResultAddressArray    = { m_clasAddressArray->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+    batchedMove.ResultSizeArray       = { m_clasSizeArray->GetGPUVirtualAddress(),    sizeof(UINT64) };
+    batchedMove.IndirectArgumentArray = { m_clasMoveArgsBuffer->GetGPUVirtualAddress(),
+                                          sizeof(D3D12_RTAS_OPERATION_MOVE_CLUSTER_OBJECTS_ARGS) };
+
+    D3D12_RTAS_OPERATION_DESC moveOpDesc = {};
+    moveOpDesc.Inputs                = moveInputs;
+    moveOpDesc.pBatchedOperationData = &batchedMove;
+
+    const auto p2_t0 = std::chrono::steady_clock::now();
+    m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &moveOpDesc,
+        D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+    D3D12_RESOURCE_BARRIER moveBarriers[] = {
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasResultBuffer.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasAddressArray.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get()),
+    };
+    m_dxrCommandList->ResourceBarrier(_countof(moveBarriers), moveBarriers);
+
+    // Flush + wait the move op before this function returns. Without this,
+    // the queued move work + the still-OPEN cmd list interact badly with the
+    // next mid-flush in BuildAnimatedObjectSetup (we get an
+    // ID3D12CommandAllocator::Reset error - "previous executions associated
+    // with the allocator have not completed"), even with a UAV barrier
+    // between the move and the BLAS-from-CLAS that consumes its output.
+    // Treating the compact-pass as a self-contained init step (build+move+
+    // wait) is the natural shape and matches how a streaming asset pipeline
+    // would issue compactions anyway. Cost: roughly 1ms wall-clock on this
+    // hardware - this is the price of doing exact-fit allocation under a
+    // post-build compaction model.
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    auto cmdAlloc = m_deviceResources->GetCommandAllocator();
+    ThrowIfFailed(cmdAlloc->Reset());
+    ThrowIfFailed(cmdList->Reset(cmdAlloc, nullptr));
+
+    const auto p2_t1 = std::chrono::steady_clock::now();
+    m_clasMemStats.cpuWallMsPhase2 = std::chrono::duration<double, std::milli>(p2_t1 - p2_t0).count();
+
+    // phase1ResultBuffer + phase1AddressArray go out of scope here; their
+    // ComPtrs drop their last ref; the GPU is done with them (we just waited).
+    // Final memory cost is m_clasResultBuffer (compacted) + scratch + addr/size.
 }
 
 // ---------------------------------------------------------------------------------
@@ -1570,6 +2109,37 @@ void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
     SampleLog::LogF(L"[storage] CLAS: %llu bytes  BLAS: %llu bytes\n",
                     (unsigned long long)m_totalClasBytes,
                     (unsigned long long)m_totalBlasBytes);
+
+    // Per-mode CLAS memory stats. Use [CLAS mem] tag so the table is grep-able.
+    // Notes:
+    //  - sumActualBytes is the irreducible CLAS storage (= sum of per-cluster
+    //    sizes the driver picked). It's the same for all three modes; the
+    //    modes differ only in how much we *reserved* on top of that.
+    //  - resultPrebuildMax is the worst-case alloc the driver would ask for
+    //    in IMPLICIT mode (used as the reference for "wasted" bytes).
+    //  - peakResidentBytes is the maximum live result-buffer memory at any
+    //    instant during the build flow.
+    const auto& s = m_clasMemStats;
+    const double overheadVsActual = s.sumActualBytes
+        ? 100.0 * (double)((double)s.resultFinalBytes - (double)s.sumActualBytes) / (double)s.sumActualBytes
+        : 0.0;
+    const double savingsVsImplicit = s.resultPrebuildMax
+        ? 100.0 * (double)((double)s.resultPrebuildMax - (double)s.resultFinalBytes) / (double)s.resultPrebuildMax
+        : 0.0;
+    SampleLog::LogF(
+        L"[CLAS mem mode=%s] prebuild_max=%llu  initial=%llu  final=%llu  peak=%llu  "
+        L"sum_actual=%llu  scratch=(%llu, %llu)  cpu_phase_ms=(%.3f, %.3f)  "
+        L"final_overhead_vs_actual=%+.1f%%  savings_vs_implicit=%+.1f%%\n",
+        ClasAllocModeName(),
+        (unsigned long long)s.resultPrebuildMax,
+        (unsigned long long)s.resultInitialBytes,
+        (unsigned long long)s.resultFinalBytes,
+        (unsigned long long)s.peakResidentBytes,
+        (unsigned long long)s.sumActualBytes,
+        (unsigned long long)s.scratchBytesPhase1,
+        (unsigned long long)s.scratchBytesPhase2,
+        s.cpuWallMsPhase1, s.cpuWallMsPhase2,
+        overheadVsActual, savingsVsImplicit);
 }
 
 // ---------------------------------------------------------------------------------
@@ -2002,6 +2572,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_clasScratchBuffer.Reset();
     m_clasAddressArray.Reset();
     m_clasSizeArray.Reset();
+    m_clasMoveArgsBuffer.Reset();
     m_blasScratchBuffer.Reset();
     m_blasArgsBuffer.Reset();
     m_blasResultAddrBuffer.Reset();

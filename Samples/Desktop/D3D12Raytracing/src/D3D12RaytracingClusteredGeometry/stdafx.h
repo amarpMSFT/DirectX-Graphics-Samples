@@ -48,6 +48,15 @@
 #include <dxgidebug.h>
 #endif
 
+// DirectXTK12 (SpriteBatch + SpriteFont) for on-screen overlay text -- see
+// CreateUIFont() / RenderUI() in D3D12RaytracingClusteredGeometry.cpp.
+// Pulled in via the directxtk12_desktop_2019 nuget package referenced from
+// packages.config; the .vcxproj imports the package's .targets file.
+#include "SpriteBatch.h"
+#include "SpriteFont.h"
+#include "GraphicsMemory.h"
+#include "ResourceUploadBatch.h"
+
 #include "SampleLog.h"
 #include "DXSampleHelper.h"
 #include "DeviceResources.h"

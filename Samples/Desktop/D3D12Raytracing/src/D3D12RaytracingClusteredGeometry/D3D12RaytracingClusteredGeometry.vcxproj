@@ -138,6 +138,19 @@
       <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
       <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
     </CustomBuild>
+    <!-- Compute shader for animating the showpiece ball.  Compiled to cs_6_6
+         (SM 6.6 has all the intrinsics we use; no need for the 6.10 set the
+         raytracing module requires).  Same dxc binary, different target. -->
+    <CustomBuild Include="AnimateBall.hlsl">
+      <FileType>Document</FileType>
+      <Message>Compiling AnimateBall.hlsl -> $(IntDir)CompiledShaders\%(Filename).hlsl.h (cs_6_6)</Message>
+      <Command Condition="'$(Configuration)'=='Debug'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
+"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Zi -Qembed_debug -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
+      <Command Condition="'$(Configuration)'=='Release'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
+"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
+      <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
+      <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
+    </CustomBuild>
   </ItemGroup>
 
   <!-- Loose files visible in IDE. -->
@@ -145,7 +158,26 @@
     <None Include="packages.config" />
     <None Include="readme.md" />
     <None Include="ExperimentalD3D12.props" />
+    <!-- DirectXTK sprite-font asset for the on-screen overlay (see RenderUI()).
+         CopyToOutputDirectory ensures it lands next to the exe; SpriteFont
+         opens it at runtime by relative filename. -->
+    <None Include="SegoeUI_24.spritefont">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- DirectXTK12 (SpriteBatch + SpriteFont) for on-screen overlay text.
+       packages.config drives nuget restore; this Import is the build-time
+       hook that actually wires the lib + headers into the project. -->
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets" Condition="Exists('..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets')" />
+  </ImportGroup>
+  <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
+    <PropertyGroup>
+      <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
+    </PropertyGroup>
+    <Error Condition="!Exists('..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets'))" />
+  </Target>
 </Project>

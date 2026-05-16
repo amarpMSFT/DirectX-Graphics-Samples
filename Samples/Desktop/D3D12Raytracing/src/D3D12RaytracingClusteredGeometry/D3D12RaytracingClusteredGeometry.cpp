@@ -13,6 +13,7 @@
 #include "D3D12RaytracingClusteredGeometry.h"
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\\Raytracing.hlsl.h"
+#include "CompiledShaders\\AnimateBall.hlsl.h"
 #include "SceneData.h"
 #include "MaterialData.h"
 
@@ -101,6 +102,18 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             m_positionTruncateBits = (UINT)n;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--compressed-bits") == 0 && i + 1 < argc)
+        {
+            // COMPRESSED1 mode only - bits per component for the shared-exponent
+            // quantizer. Range 1 (extreme - 1 bit each axis) to 16 (max).
+            // Same value the [/] runtime slider drives.  Ignored under
+            // --vertex-format float.
+            int n = _wtoi(argv[i+1]);
+            if (n < 1)  n = 1;
+            if (n > 16) n = 16;
+            m_compressedBitsPerComponent = (UINT)n;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--aa-samples") == 0 && i + 1 < argc)
         {
             // Anti-aliasing samples per pixel.  The raygen shader traces N
@@ -147,12 +160,18 @@ void D3D12RaytracingClusteredGeometry::OnInit()
     }
 
     SampleLog::Write(L"OnInit: creating DeviceResources\n");
+    // 5th arg = device-resources options.  0 here means VSYNC ON
+    // (Present(1, 0) inside DeviceResources::Present).  Tearing is visible at
+    // low framerates without vsync -- this scene's clusters can dip to <60
+    // fps under heavy reflection/refraction bounces, so we lock to refresh.
+    // If you want VRR / unlocked framerate to measure perf, swap this to
+    // DeviceResources::c_RequireTearingSupport (Present(0, ALLOW_TEARING)).
     m_deviceResources = std::make_unique<DeviceResources>(
         DXGI_FORMAT_B8G8R8A8_UNORM,
         DXGI_FORMAT_UNKNOWN,
         FrameCount,
         D3D_FEATURE_LEVEL_11_0,
-        DeviceResources::c_RequireTearingSupport,
+        /*options*/0,
         m_adapterIDoverride);
     m_deviceResources->RegisterDeviceNotify(this);
     m_deviceResources->SetWindow(Win32Application::GetHwnd(), m_width, m_height);
@@ -262,6 +281,11 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildScene();
     SampleLog::Write(L">>> BuildMaterials\n");
     BuildMaterials();
+    // CreateAnimationComputePipeline must run BEFORE BuildAccelerationStructures
+    // because the latter invokes UpdateAnimatedObjectPerFrame on the init path,
+    // which dispatches the AnimateBall compute shader -- needs the PSO + RS.
+    SampleLog::Write(L">>> CreateAnimationComputePipeline\n");
+    CreateAnimationComputePipeline();
     SampleLog::Write(L">>> BuildAccelerationStructures\n");
     BuildAccelerationStructures();
     SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
@@ -272,6 +296,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     CreateRaytracingPipelineAndShaderTables();
     SampleLog::Write(L">>> CreateDescriptorHeapAndRaytracingOutput\n");
     CreateDescriptorHeapAndRaytracingOutput();
+    SampleLog::Write(L">>> CreateUIFont\n");
+    CreateUIFont();
     SampleLog::Write(L">>> CreateDeviceDependentResources DONE\n");
 }
 
@@ -325,12 +351,10 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildScene()
 {
-    // 12 bits/axis = 36 bits/vertex for Compressed1 vertex format.  Per-
-    // axis bit counts in the actual bitstream (driven by maxDelta per
-    // axis) are typically much less for clusters with constant or near-
-    // constant components (e.g. cube faces have 1 bit on the constant axis).
-    constexpr int kCompressedBitsPerComponent = 12;
-
+    // (COMPRESSED1 precision used to be a constexpr 12 here; promoted to the
+    // m_compressedBitsPerComponent member so the '[' / ']' keys can cycle it
+    // live in COMPRESSED1 mode.  EncodeCompressedClusters() reads the live
+    // member, so re-calling it after a slider change re-encodes everything.)
     // GENERIC scene-build pass.  Iterates over the pure-data scene
     // definition (SceneData::BuildSceneDefinition()) and dispatches to
     // the right ProceduralGeometry generator per ObjectSpec.  All art /
@@ -398,6 +422,11 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
         runningOffset         += obj.clusterCount;
     }
     m_totalClusterCount = runningOffset;
+    m_totalTriangleCount = 0;
+    for (const auto& obj : m_objects)
+        m_totalTriangleCount += obj.mesh.totalTriangles;
+    // m_animatedObject.mesh.totalTriangles is added later (after animated
+    // mesh is generated in BuildAnimatedObjectSetup).
 
     SampleLog::LogF(L"\n[scene] %zu objects, %u total clusters\n",
                     m_objects.size(), m_totalClusterCount);
@@ -446,123 +475,91 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // pass --vertex-format compressed to exercise the broken path against a
     // future NVIDIA driver update.
     // ============================================================================
-    if (m_vertexMode == VertexMode::Compressed1)
+    EncodeCompressedClusters();
+    // FLOAT32_3 path uses obj.mesh.clusters[i].positions directly at upload
+    // time; obj.rawPositions is unused and intentionally left empty.  Log
+    // the equivalent byte count so the user can compare paths at a glance.
     {
-        // Pick a single shared compressed1 exponent across the WHOLE scene (all
-        // clusters in all objects). Same-grid quantization keeps adjacent
-        // clusters' shared-edge vertices bit-identical -> watertight at the
-        // quantization level (BVH-leaf precision is a separate matter).
-        int sharedExponent;
-        {
-            float maxExtent = 0.f;
-            for (const auto& obj : m_objects)
-            for (const auto& c   : obj.mesh.clusters)
-            {
-                float mn[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX };
-                float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX };
-                for (const auto& p : c.positions)
-                {
-                    const float ps[3] = { p.x, p.y, p.z };
-                    for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], ps[k]); mx[k] = std::max(mx[k], ps[k]); }
-                }
-                for (int k = 0; k < 3; ++k) maxExtent = std::max(maxExtent, mx[k] - mn[k]);
-            }
-            const float minUnit = maxExtent / float((1ull << kCompressedBitsPerComponent) - 1);
-            sharedExponent = (int)std::ceil(std::log2(minUnit)) + 127;
-            if (sharedExponent < 1)   sharedExponent = 1;
-            if (sharedExponent > 232) sharedExponent = 232;
-            SampleLog::LogF(L"[compressed1] shared exponent (biased): %d  (unit=%.6f)\n",
-                            sharedExponent, std::ldexp(1.0f, sharedExponent - 127));
-        }
-
-        size_t totalCompressedBytes = 0, totalUncompressedBytes = 0;
-        float  maxRoundtripError = 0.f;
-        size_t globalClusterIdx  = 0;
-        for (auto& obj : m_objects)
-        {
-            obj.encoded.reserve(obj.mesh.clusters.size());
-            for (const auto& c : obj.mesh.clusters)
-            {
-                auto enc = Compressed1::Encode(c.positions, kCompressedBitsPerComponent, sharedExponent);
-                auto decoded = Compressed1::Decode(enc);
-                for (size_t i = 0; i < c.positions.size(); ++i)
-                {
-                    float dx = decoded[i].x - c.positions[i].x;
-                    float dy = decoded[i].y - c.positions[i].y;
-                    float dz = decoded[i].z - c.positions[i].z;
-                    maxRoundtripError = std::max(maxRoundtripError, std::sqrt(dx*dx + dy*dy + dz*dz));
-                }
-                // Dump cluster 0 (sphere) and cluster 500 (cube) byte-for-byte
-                // for forensic comparison. Cluster 0 is sphere obj #0's first
-                // cluster; cluster 500 is the first cube cluster (cube starts
-                // at firstClusterID=500).
-                // KNOWN-ISSUE FORENSICS (disable for production builds).
-                // Set DUMP_COMPRESSED1_DIAG to 1 to print per-cluster header,
-                // anchors, bit-counts and a sample of original-vs-decoded
-                // positions for the listed cluster IDs. Useful when chasing
-                // why the BVH-build's interpretation of a compressed1 cluster
-                // diverges from the CPU roundtrip decode.
-                #define DUMP_COMPRESSED1_DIAG 0
-                #if DUMP_COMPRESSED1_DIAG
-                if (c.clusterID == 0 || c.clusterID == 1 || c.clusterID == 10
-                    || c.clusterID == 56 || c.clusterID == 500)
-                {
-                    SampleLog::LogF(L"[compressed1 dump] clusterID=%u "
-                                    L"verts=%u  x_bits=%u y_bits=%u z_bits=%u  "
-                                    L"anchor=(%d, %d, %d)  exp=%u\n",
-                                    c.clusterID, enc.vertexCount,
-                                    enc.xBits, enc.yBits, enc.zBits,
-                                    (int)DECODE_D3D12_COMPRESSED1_X_ANCHOR(enc.header),
-                                    (int)DECODE_D3D12_COMPRESSED1_Y_ANCHOR(enc.header),
-                                    (int)DECODE_D3D12_COMPRESSED1_Z_ANCHOR(enc.header),
-                                    (unsigned)DECODE_D3D12_COMPRESSED1_EXPONENT(enc.header));
-                    SampleLog::LogF(L"  header words: %08X %08X %08X  bitstream-bytes=%zu\n",
-                                    enc.header.field0, enc.header.field1, enc.header.field2,
-                                    enc.bitstream.size());
-                    // First 4 AND last 4 vertices: print original + decoded
-                    auto printV = [&](size_t i) {
-                        SampleLog::LogF(L"  v[%2zu] orig=(%+.5f,%+.5f,%+.5f) dec=(%+.5f,%+.5f,%+.5f)\n",
-                                        i,
-                                        c.positions[i].x, c.positions[i].y, c.positions[i].z,
-                                        decoded[i].x,     decoded[i].y,     decoded[i].z);
-                    };
-                    for (size_t i = 0; i < std::min<size_t>(4, c.positions.size()); ++i) printV(i);
-                    if (c.positions.size() > 8)
-                    {
-                        SampleLog::Write(L"  ...\n");
-                        for (size_t i = c.positions.size() - 4; i < c.positions.size(); ++i) printV(i);
-                    }
-                }
-                #endif // DUMP_COMPRESSED1_DIAG
-                totalCompressedBytes   += enc.TotalBytes();
-                totalUncompressedBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
-                obj.encoded.push_back(std::move(enc));
-                ++globalClusterIdx;
-            }
-        }
-        SampleLog::LogF(L"[compressed1] %u clusters @ %d bits/comp -> %zu bytes (vs %zu uncompressed = %.2fx)\n",
-                        m_totalClusterCount, kCompressedBitsPerComponent,
-                        totalCompressedBytes, totalUncompressedBytes,
-                        (double)totalUncompressedBytes / (double)totalCompressedBytes);
-        SampleLog::LogF(L"[compressed1] worst-case roundtrip position error: %.6f units\n", maxRoundtripError);
-    }
-    else
-    {
-        // FLOAT32_3 path: just hold the original positions, no encoding.
-        for (auto& obj : m_objects)
-        {
-            obj.rawPositions.reserve(obj.mesh.clusters.size());
-            for (const auto& c : obj.mesh.clusters)
-                obj.rawPositions.push_back(c.positions);
-        }
         size_t totalBytes = 0;
         for (const auto& obj : m_objects)
-            for (const auto& v : obj.rawPositions)
-                totalBytes += v.size() * sizeof(ProceduralGeometry::float3);
+            for (const auto& c : obj.mesh.clusters)
+                totalBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
         SampleLog::LogF(L"[float32_3] %u clusters: %zu bytes total\n",
                         m_totalClusterCount, totalBytes);
     }
 }
+
+// ---------------------------------------------------------------------------------
+// Re-encode every cluster's positions into Compressed1 blobs using the live
+// m_compressedBitsPerComponent.  Called once from BuildScene at startup and
+// again from RebuildStaticAccelerationStructures when the user cycles the
+// precision slider ('[' / ']' in COMPRESSED1 mode).
+//
+// We always populate obj.encoded even in FLOAT32_3 mode so the 'v' toggle
+// can flip vertex format without re-running scene build.  Cost is pure CPU
+// and ~50 ms one-time at scene scale; re-encode is comparable.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::EncodeCompressedClusters()
+{
+    const UINT bitsPerComp = m_compressedBitsPerComponent;
+
+    // Pick a single shared compressed1 exponent across the WHOLE scene (all
+    // clusters in all objects).  Same-grid quantization keeps adjacent
+    // clusters' shared-edge vertices bit-identical -> watertight at the
+    // quantization level (BVH-leaf precision is a separate matter).
+    int sharedExponent;
+    {
+        float maxExtent = 0.f;
+        for (const auto& obj : m_objects)
+        for (const auto& c   : obj.mesh.clusters)
+        {
+            float mn[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX };
+            float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX };
+            for (const auto& p : c.positions)
+            {
+                const float ps[3] = { p.x, p.y, p.z };
+                for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], ps[k]); mx[k] = std::max(mx[k], ps[k]); }
+            }
+            for (int k = 0; k < 3; ++k) maxExtent = std::max(maxExtent, mx[k] - mn[k]);
+        }
+        const float minUnit = maxExtent / float((1ull << bitsPerComp) - 1);
+        sharedExponent = (int)std::ceil(std::log2(minUnit)) + 127;
+        if (sharedExponent < 1)   sharedExponent = 1;
+        if (sharedExponent > 232) sharedExponent = 232;
+        SampleLog::LogF(L"[compressed1] %u bits/comp; shared exponent (biased): %d  (unit=%.6f)\n",
+                        bitsPerComp, sharedExponent, std::ldexp(1.0f, sharedExponent - 127));
+    }
+
+    size_t totalCompressedBytes = 0, totalUncompressedBytes = 0;
+    float  maxRoundtripError = 0.f;
+    for (auto& obj : m_objects)
+    {
+        obj.encoded.clear();                                 // re-encode wipes any prior blobs
+        obj.encoded.reserve(obj.mesh.clusters.size());
+        for (const auto& c : obj.mesh.clusters)
+        {
+            auto enc = Compressed1::Encode(c.positions, (int)bitsPerComp, sharedExponent);
+            auto decoded = Compressed1::Decode(enc);
+            for (size_t i = 0; i < c.positions.size(); ++i)
+            {
+                float dx = decoded[i].x - c.positions[i].x;
+                float dy = decoded[i].y - c.positions[i].y;
+                float dz = decoded[i].z - c.positions[i].z;
+                maxRoundtripError = std::max(maxRoundtripError, std::sqrt(dx*dx + dy*dy + dz*dz));
+            }
+            totalCompressedBytes   += enc.TotalBytes();
+            totalUncompressedBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
+            obj.encoded.push_back(std::move(enc));
+        }
+    }
+    SampleLog::LogF(L"[compressed1] %u clusters @ %u bits/comp -> %zu bytes (vs %zu uncompressed = %.2fx); "
+                    L"worst-case roundtrip error %.6f units\n",
+                    m_totalClusterCount, bitsPerComp,
+                    totalCompressedBytes, totalUncompressedBytes,
+                    (double)totalUncompressedBytes / (double)totalCompressedBytes,
+                    maxRoundtripError);
+}
+
 
 
 // =====================================================================================
@@ -660,6 +657,116 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 
     ReadBuildTimestamps();
     DumpClusterStatsAsync();
+
+    // Initial snapshot of overlay stats so the first frame of rendering shows
+    // the correct numbers (subsequent config changes refresh via the
+    // CaptureOverlayStatsSnapshot call at the bottom of
+    // RebuildStaticAccelerationStructures).
+    CaptureOverlayStatsSnapshot();
+}
+
+// ---------------------------------------------------------------------------------
+// Runtime tear-down + rebuild of the STATIC half of the AS pipeline (CLAS,
+// BLAS-from-CLAS, TLAS).  Animated object's per-frame INSTANTIATE + BLAS
+// rebuild uses its own buffers + scratch and is intentionally untouched -
+// it continues to render correctly across the rebuild because:
+//   1. m_animatedObject.blasGPUVA is stable (EXPLICIT_DESTINATIONS).
+//   2. The TLAS instance desc array we rebuild references that same GVA.
+//
+// Drives the 'a' (cycle CLAS alloc mode) and 'v' (cycle vertex format)
+// keyboard shortcuts in OnKeyDown.  Per-frame cost is one full GPU flush
+// per press; perfectly fine for a tech-demo toggle but not something you
+// would hook into a hot path in production code.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const wchar_t* reason)
+{
+    SampleLog::LogF(L"\n>>> RebuildStaticAccelerationStructures (%s)\n", reason ? reason : L"?");
+
+    auto commandList      = m_deviceResources->GetCommandList();
+    auto commandAllocator = m_deviceResources->GetCommandAllocator();
+
+    // 1) Flush the GPU so the in-flight frame finishes reading from CLAS/BLAS/TLAS
+    //    before we tear them down.  ComPtr<>::Reset() releases the underlying
+    //    ID3D12Resource - if the GPU is still touching it the runtime errors out.
+    m_deviceResources->WaitForGpu();
+
+    // 2) Drop all CLAS-related GPU resources.  Each mode's BuildClas* will
+    //    reallocate these via ComPtr assignment (which releases stale slots).
+    //    Explicitly clearing here makes the tear-down explicit and is the
+    //    correct hygiene for the Compact mode (which keeps m_clasMoveArgsBuffer
+    //    alive across function returns).
+    m_clasResultBuffer.Reset();
+    m_clasScratchBuffer.Reset();
+    m_clasAddressArray.Reset();
+    m_clasSizeArray.Reset();
+    m_clasMoveArgsBuffer.Reset();
+    m_clasArgsArrayGPUVA = 0;
+    m_clasArgsStride     = 0;
+    m_totalClasBytes     = 0;
+    m_clasMemStats       = ClasMemStats{};
+
+    // 3) Drop static-object BLAS storage.  Each ClusterObject's blasStorage
+    //    will be reallocated by BuildBlasFromClasIndirect.  The animated
+    //    object's BLAS is owned by m_animatedObject and intentionally
+    //    untouched (its GVA must remain valid for the TLAS instance desc).
+    for (auto& obj : m_objects)
+    {
+        obj.blasStorage.Reset();
+        obj.blasGPUVA = 0;
+    }
+    m_blasScratchBuffer.Reset();
+    m_blasArgsBuffer.Reset();
+    m_blasResultAddrBuffer.Reset();
+
+    // 4) Drop TLAS storage.  Per-frame rebuild path keys off these, so they
+    //    MUST exist before the next OnRender; BuildTlasClassic recreates them.
+    m_tlasBuffer.Reset();
+    m_tlasScratchBuffer.Reset();
+    m_tlasInstanceDescs.Reset();
+
+    // 5) Reset the command list/allocator and re-run the static build chain.
+    //    UploadClusterInputs reads the live m_vertexMode; BuildClasIndirect
+    //    reads the live m_clasAllocMode - so cycling either field via the
+    //    keyboard before this call is sufficient.  EncodeCompressedClusters
+    //    is unconditional so the 'v' toggle to COMPRESSED1 and the '[' / ']'
+    //    precision slider both pick up the latest m_compressedBitsPerComponent.
+    ThrowIfFailed(commandAllocator->Reset());
+    ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
+
+    EncodeCompressedClusters();
+    UploadClusterInputs();
+    BuildClasIndirect();
+    BuildBlasFromClasIndirect();
+    // Animated path also picks up the new precision: BuildAnimatedObjectSetup's
+    // per-cluster TrianglesArgs.PositionTruncateBitCount comes straight from
+    // m_positionTruncateBits, so rebuilding the templates is what makes the
+    // slider visibly affect the showpiece ball.  Setup does its own internal
+    // flush+wait for the template-GVA readback; cmd list is reset afterwards
+    // and we continue recording into the fresh list for the TLAS rebuild.
+    if (m_animatedObjectEnabled)
+    {
+        BuildAnimatedObjectSetup();
+        UpdateAnimatedObjectPerFrame();
+    }
+    BuildTlasClassic();
+
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+
+    // 6) Refresh the stats that feed the title bar.  m_totalClasBytes is the
+    //    live result buffer size; the per-build CPU-wall stats already landed
+    //    in m_clasMemStats via the relevant BuildClas* function.
+    if (m_clasResultBuffer) m_totalClasBytes = m_clasResultBuffer->GetDesc().Width;
+
+    SampleLog::LogF(L"<<< RebuildStaticAccelerationStructures done.  CLAS=%.1f MB, scratch=%.1f MB\n",
+                    m_totalClasBytes / (1024.0 * 1024.0),
+                    m_clasMemStats.scratchBytesPhase1 / (1024.0 * 1024.0));
+
+    // Snapshot all the displayed numbers (except per-frame ms) into
+    // m_overlayStats so the overlay reads from a cached struct instead of
+    // poking GetDesc().Width every frame.  Per-frame timing gets snapped
+    // a few frames later, once the ring buffer refills - see Tick().
+    CaptureOverlayStatsSnapshot();
 }
 
 // ---------------------------------------------------------------------------------
@@ -1879,9 +1986,25 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     // 1) Mesh + hints. Sphere with spatial cluster tiles. Hints = rest * envelopeScale
     //    so animation can squash/stretch within [1/envelope, envelope] without
     //    leaving the cluster's pre-built BVH bounds.
+    //
+    //    INVARIANT: kEnvelopeScale MUST stay above (1 + kAnimWobbleAmp) -- the
+    //    template's per-cluster AABB and (for a future COMPRESSED1
+    //    instantiation path) the Compressed1TemplateHeader quantization range
+    //    are both seeded from these hint positions.  If the animation worst-
+    //    case scale (1 + amp) overflows kEnvelopeScale, FLOAT32_3 per-frame
+    //    INSTANTIATE will clip against InstantiationBoundingBoxLimit and
+    //    COMPRESSED1 INSTANTIATE will saturate at the header's max
+    //    representable value -- both silently corrupt geometry.  The
+    //    HLSL-side wobble amplitude lives in AnimateBall.hlsl::kWobbleAmp and
+    //    is mirrored here ONLY for this assert.  Keep the two in sync.
     // ------------------------------------------------------------------
-    constexpr float kRestRadius   = 1.00f;        // central showpiece ball, bigger
+    constexpr float kRestRadius    = 1.00f;       // central showpiece ball, bigger
     constexpr float kEnvelopeScale = 1.18f;       // hint sphere radius = rest * 1.18
+    constexpr float kAnimWobbleAmp = 0.08f;       // MUST match AnimateBall.hlsl::kWobbleAmp
+    static_assert(1.0f + kAnimWobbleAmp < kEnvelopeScale,
+        "kEnvelopeScale must leave headroom over the animation's max radial "
+        "displacement (1 + kAnimWobbleAmp).  See AnimateBall.hlsl::kWobbleAmp -- "
+        "if you raise the wobble amplitude there, bump kEnvelopeScale here.");
     // 2x cluster count per dim (192 -> 768 clusters: 24 lat x 32 long)
     // while KEEPING per-cluster tris count at 48 - resolution doubled
     // in each dim (48x96 -> 96x192), tile size kept (tileLat 4, tileLong 6).
@@ -1915,6 +2038,15 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     SampleLog::LogF(L"\n[animated] sphere mesh: %u clusters, %u verts, %u tris (envelope x%.2f)\n",
                     obj.clusterCount, obj.totalVertexCount,
                     obj.mesh.totalTriangles, kEnvelopeScale);
+
+    // Roll the animated mesh's triangles into the scene-wide total now
+    // that the mesh has been generated; the title bar reads from this.
+    // Recompute from scratch each time because BuildAnimatedObjectSetup is
+    // now re-invoked by RebuildStaticAccelerationStructures on A/V/[/]
+    // toggles -- a naive '+=' would keep stacking the animated tri count.
+    m_totalTriangleCount = obj.mesh.totalTriangles;
+    for (const auto& o : m_objects)
+        m_totalTriangleCount += o.mesh.totalTriangles;
 
     // ------------------------------------------------------------------
     // 2) Upload buffer: hint vertex data + index data + template build args.
@@ -1981,6 +2113,14 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         a.TrianglesArgs.IndexBufferStride   = 1;
         a.TrianglesArgs.VertexBuffer        = templateInputBaseGPUVA + slots[c].vbOffset;
         a.TrianglesArgs.IndexBuffer         = templateInputBaseGPUVA + slots[c].ibOffset;
+        // Apply the live FLOAT32_3 mantissa-truncation precision (same field
+        // that drives the static CLAS path).  At INSTANTIATE time the driver
+        // converts the per-frame FLOAT32_3 source to the template's
+        // VertexInstantiationFormat -- so to extend this animated path to
+        // COMPRESSED1 we only have to switch tplDesc.VertexInstantiationFormat
+        // and fill the Compressed1TemplateHeader union member below (the
+        // compute shader keeps writing FLOAT32_3 positions either way).
+        a.TrianglesArgs.PositionTruncateBitCount = (UINT16)m_positionTruncateBits;
         // No instantiation-bounds hint - the driver uses the hint vertex AABB.
         a.InstantiationBoundingBoxLimit     = 0;
         tArgs[c] = a;
@@ -2055,20 +2195,80 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 
     // ------------------------------------------------------------------
     // 4) Per-frame resources (allocated once, contents rewritten every frame).
-    //    perFrameVertexBuffer  - the new positions for all clusters this frame
+    //    perFrameVertexBuffer  - GPU-only DEFAULT-heap UAV.  Written by
+    //                            AnimateBall.cs each frame, read by
+    //                            INSTANTIATE_CLUSTER_TEMPLATES.  Cycles
+    //                            UAV <-> NON_PIXEL_SHADER_RESOURCE inside
+    //                            UpdateAnimatedObjectPerFrame.
+    //    restPositionsBuffer   - DEFAULT-heap SRV containing the rest-pose
+    //                            positions, uploaded once below.
     //    perFrameInstArgsBuffer- one INSTANTIATE_CLUSTER_TEMPLATES_ARGS per cluster
     //    perFrameClasResultBuffer + scratch + addresses (IMPLICIT_DESTINATIONS)
     //    blasStorage + scratch + args  (EXPLICIT_DESTINATIONS for fixed GPU VA)
     // ------------------------------------------------------------------
     const size_t vbBytes = (size_t)obj.totalVertexCount * sizeof(XMFLOAT3);
     {
-        auto vbDesc = CD3DX12_RESOURCE_DESC::Buffer(alignTo(vbBytes, 256));
+        // GPU-only animated vertex buffer (UAV; the compute shader writes;
+        // INSTANTIATE reads).  Starts in UNORDERED_ACCESS so the first frame's
+        // compute pass works without an initial state transition.
+        auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        auto vbDesc = CD3DX12_RESOURCE_DESC::Buffer(alignTo(vbBytes, 256),
+                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         ThrowIfFailed(device->CreateCommittedResource(
-            &uploadHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&obj.perFrameVertexBuffer)));
-        obj.perFrameVertexBuffer->SetName(L"Animated: per-frame vertex buffer");
-        ThrowIfFailed(obj.perFrameVertexBuffer->Map(0, &noRead,
-            reinterpret_cast<void**>(&obj.perFrameVertexBufferMapped)));
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&obj.perFrameVertexBuffer)));
+        obj.perFrameVertexBuffer->SetName(L"Animated: per-frame vertex buffer (UAV, compute-written)");
+    }
+    {
+        // Rest-pose positions: upload once from CPU into a DEFAULT-heap buffer.
+        // Read by AnimateBall.cs via a raw SRV bound as a root descriptor.
+        // Done as a self-contained ExecuteCommandList+WaitForGpu pair so the
+        // upload staging buffer can die at the end of this block (the existing
+        // template-GVA readback flush further down would also do, but a
+        // self-contained upload reads more straightforwardly).
+        auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        auto restDesc = CD3DX12_RESOURCE_DESC::Buffer(alignTo(vbBytes, 256));
+        ThrowIfFailed(device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &restDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&obj.restPositionsBuffer)));
+        obj.restPositionsBuffer->SetName(L"Animated: rest-pose positions (SRV, compute-read)");
+
+        Microsoft::WRL::ComPtr<ID3D12Resource> staging;
+        auto stageDesc = CD3DX12_RESOURCE_DESC::Buffer(alignTo(vbBytes, 256));
+        ThrowIfFailed(device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &stageDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)));
+        staging->SetName(L"Animated: rest-pose staging upload");
+
+        XMFLOAT3* mapped = nullptr;
+        ThrowIfFailed(staging->Map(0, &noRead, reinterpret_cast<void**>(&mapped)));
+        for (UINT c = 0; c < obj.clusterCount; ++c)
+        {
+            const auto& src = obj.mesh.clusters[c];
+            for (size_t v = 0; v < src.positions.size(); ++v)
+            {
+                mapped->x = src.positions[v].x;
+                mapped->y = src.positions[v].y;
+                mapped->z = src.positions[v].z;
+                ++mapped;
+            }
+        }
+        staging->Unmap(0, nullptr);
+
+        auto cl = m_deviceResources->GetCommandList();
+        cl->CopyBufferRegion(obj.restPositionsBuffer.Get(), 0, staging.Get(), 0, vbBytes);
+        auto toSrv = CD3DX12_RESOURCE_BARRIER::Transition(obj.restPositionsBuffer.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        cl->ResourceBarrier(1, &toSrv);
+        m_deviceResources->ExecuteCommandList();
+        m_deviceResources->WaitForGpu();
+        // Re-open the command list for the template-GVA readback that follows.
+        auto allocator = m_deviceResources->GetCommandAllocator();
+        ThrowIfFailed(allocator->Reset());
+        ThrowIfFailed(cl->Reset(allocator, nullptr));
+        // staging goes out of scope here -- safe, GPU has consumed it.
     }
     {
         const size_t instArgsBytes = obj.clusterCount * sizeof(D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS);
@@ -2192,6 +2392,23 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     AllocateUAVBuffer(device, (UINT64)obj.clusterCount * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
                       &obj.perFrameClasAddressArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                       L"Animated: per-frame CLAS address array");
+    // Per-cluster output-size buffer for the one-shot measurement INSTANTIATE
+    // (only written by MeasureAnimatedClasBytesOneShot at the end of this
+    // setup function -- the regular per-frame INSTANTIATE skips ResultSizeArray
+    // so there's zero per-frame readback cost).
+    AllocateUAVBuffer(device, (UINT64)obj.clusterCount * sizeof(UINT64),
+                      &obj.perFrameClasSizesBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"Animated: per-frame CLAS sizes (measurement)");
+    {
+        const UINT64 rbBytes = (UINT64)obj.clusterCount * sizeof(UINT64);
+        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer(rbBytes);
+        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        ThrowIfFailed(device->CreateCommittedResource(
+            &rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&obj.perFrameClasSizesReadback)));
+        obj.perFrameClasSizesReadback->SetName(L"Animated: per-frame CLAS sizes readback");
+    }
 
     // BLAS-from-CLAS prebuild & alloc (single BLAS, EXPLICIT_DESTINATIONS).
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
@@ -2241,6 +2458,213 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     m_animatedObjectEnabled = true;
     SampleLog::LogF(L"[animated] setup complete: BLAS at GVA 0x%llx, %u clusters per frame\n",
                     (unsigned long long)obj.blasGPUVA, obj.clusterCount);
+
+    // One-shot per-cluster CLAS size readback - runs synchronously, populates
+    // m_overlayStats.animatedPerFrameClasActualBytes.  Costs ~1ms of extra
+    // setup work per config change; zero per-frame cost.
+    MeasureAnimatedClasBytesOneShot();
+}
+
+// =====================================================================================
+// One-shot INSTANTIATE_CLUSTER_TEMPLATES with ResultSizeArray hooked up so we
+// can read the per-cluster CLAS leaf sizes the driver actually emitted.  This
+// is invoked ONCE at the end of BuildAnimatedObjectSetup (which itself runs
+// at init + on every config change), so the steady-state per-frame INSTANTIATE
+// in UpdateAnimatedObjectPerFrame stays free of readback overhead.
+// Stalls the GPU briefly while it copies the size UAV into a readback buffer.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
+{
+    if (!m_animatedObjectEnabled) return;
+    auto& obj = m_animatedObject;
+    auto device = m_deviceResources->GetD3DDevice();
+    auto cmdList = m_deviceResources->GetCommandList();
+
+    // BuildAnimatedObjectSetup left the cmd list OPEN and the perFrameVertexBuffer
+    // in UNORDERED_ACCESS state (compute UAV).  The animated compute pass that
+    // populates positions hasn't run yet (it runs every frame in
+    // UpdateAnimatedObjectPerFrame) -- so the source VB still holds zeros from
+    // its initial allocation.  That's fine for *sizing* purposes: INSTANTIATE
+    // produces fixed-shape CLAS leaves regardless of vertex values, so the size
+    // it reports for an all-zeros input matches the size for any other input.
+
+    // Need to transition perFrameVertexBuffer UAV -> NON_PIXEL_SHADER_RESOURCE
+    // before INSTANTIATE, then back to UAV after (matching the per-frame state
+    // cycle in UpdateAnimatedObjectPerFrame).
+    D3D12_RESOURCE_BARRIER toRead =
+        CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    cmdList->ResourceBarrier(1, &toRead);
+
+    D3D12_RTAS_CLUSTER_LIMITS limits = {};
+    limits.MaxArgCount                                   = obj.clusterCount;
+    limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
+    limits.MaxTriangleCountPerCluster                    = obj.maxTrisPerCluster;
+    limits.MaxVertexCountPerCluster                      = obj.maxVertsPerCluster;
+    limits.MaxTotalTriangleCount                         = obj.mesh.totalTriangles;
+    limits.MaxTotalVertexCount                           = obj.totalVertexCount;
+
+    D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
+    instDesc.ClusterLimits      = limits;
+    instDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    instDesc.Mode               = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+    instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
+
+    D3D12_RTAS_OPERATION_INPUTS opInputsInst = {};
+    opInputsInst.Type                            = D3D12_RTAS_OPERATION_TYPE_INSTANTIATE_CLUSTER_TEMPLATES;
+    opInputsInst.pInstantiateClusterTemplateDesc = &instDesc;
+
+    // Same as per-frame INSTANTIATE but with ResultSizeArray populated.
+    D3D12_RTAS_BATCHED_OPERATION_DATA batchedInst = {};
+    batchedInst.BatchResultData       = obj.perFrameClasResultBuffer->GetGPUVirtualAddress();
+    batchedInst.BatchScratchData      = obj.perFrameClasScratchBuffer->GetGPUVirtualAddress();
+    batchedInst.ResultAddressArray    = { obj.perFrameClasAddressArray->GetGPUVirtualAddress(),
+                                          sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+    batchedInst.ResultSizeArray       = { obj.perFrameClasSizesBuffer->GetGPUVirtualAddress(),
+                                          sizeof(UINT64) };
+    batchedInst.IndirectArgumentArray = { obj.perFrameInstArgsBuffer->GetGPUVirtualAddress(),
+                                          sizeof(D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS) };
+
+    D3D12_RTAS_OPERATION_DESC opDescInst = {};
+    opDescInst.Inputs                = opInputsInst;
+    opDescInst.pBatchedOperationData = &batchedInst;
+    m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDescInst,
+        D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+
+    D3D12_RESOURCE_BARRIER instUav[] = {
+        CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameClasResultBuffer.Get()),
+        CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameClasSizesBuffer.Get()),
+    };
+    cmdList->ResourceBarrier(_countof(instUav), instUav);
+
+    // Copy size UAV -> readback.
+    D3D12_RESOURCE_BARRIER sizesToCopy =
+        CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameClasSizesBuffer.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->ResourceBarrier(1, &sizesToCopy);
+    cmdList->CopyBufferRegion(obj.perFrameClasSizesReadback.Get(), 0,
+                              obj.perFrameClasSizesBuffer.Get(), 0,
+                              (UINT64)obj.clusterCount * sizeof(UINT64));
+    D3D12_RESOURCE_BARRIER sizesBackToUav =
+        CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameClasSizesBuffer.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmdList->ResourceBarrier(1, &sizesBackToUav);
+
+    // Restore perFrameVertexBuffer state so the next per-frame compute pass
+    // finds it as UAV (matches what UpdateAnimatedObjectPerFrame expects).
+    D3D12_RESOURCE_BARRIER backToUav =
+        CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    cmdList->ResourceBarrier(1, &backToUav);
+
+    // Synchronous flush + wait so we can map the readback below.
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    auto allocator = m_deviceResources->GetCommandAllocator();
+    ThrowIfFailed(allocator->Reset());
+    ThrowIfFailed(cmdList->Reset(allocator, nullptr));
+
+    // Map + sum + store.
+    UINT64 sumActual = 0;
+    void* mapped = nullptr;
+    D3D12_RANGE rdRange = { 0, (size_t)obj.clusterCount * sizeof(UINT64) };
+    ThrowIfFailed(obj.perFrameClasSizesReadback->Map(0, &rdRange, &mapped));
+    const UINT64* sizes = reinterpret_cast<const UINT64*>(mapped);
+    UINT64 minSz = UINT64_MAX, maxSz = 0;
+    for (UINT c = 0; c < obj.clusterCount; ++c)
+    {
+        sumActual += sizes[c];
+        minSz = std::min(minSz, sizes[c]);
+        maxSz = std::max(maxSz, sizes[c]);
+    }
+    D3D12_RANGE noWrite = { 0, 0 };
+    obj.perFrameClasSizesReadback->Unmap(0, &noWrite);
+
+    m_overlayStats.animatedPerFrameClasActualBytes = sumActual;
+    SampleLog::LogF(L"[animated CLAS measure] %u clusters: bytes min=%llu max=%llu mean=%llu total=%llu\n",
+                    obj.clusterCount,
+                    (unsigned long long)minSz, (unsigned long long)maxSz,
+                    obj.clusterCount > 0 ? (unsigned long long)(sumActual / obj.clusterCount) : 0ull,
+                    (unsigned long long)sumActual);
+}
+
+// =====================================================================================
+// Walk all the live buffers + m_clasMemStats and copy the displayed numbers
+// into m_overlayStats so the per-frame overlay can read from a snapshot rather
+// than poking GetDesc().Width on every frame.  Called from
+// RebuildStaticAccelerationStructures (after both static and animated paths
+// have finished).  Per-frame timing values are *not* captured here - they're
+// snapped by Tick() a few frames later once the ring buffer has refilled.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
+{
+    auto sizeOf = [](const Microsoft::WRL::ComPtr<ID3D12Resource>& r) -> UINT64 {
+        return r ? r->GetDesc().Width : 0ull;
+    };
+    auto& s = m_overlayStats;
+
+    // Stash the previous snapshot so the overlay can colour numbers red/green
+    // when this toggle changes them.  Every capture EXCEPT the very first
+    // (init) saves current as prev -- so colours always reflect "what
+    // changed vs the immediately previous toggle".  The 5 s timer below
+    // applies to the fade-out only, not to which values we compare against.
+    const auto now    = std::chrono::steady_clock::now();
+    const bool isInit = (s.staticClasAllocBytes == 0);   // m_overlayStats default-initialised
+    if (!isInit)
+    {
+        m_overlayStatsPrev    = s;
+        m_overlayStatsHasPrev = true;
+    }
+
+    // Static
+    s.staticClasAllocBytes   = m_totalClasBytes;
+    s.staticClasActualBytes  = m_clasMemStats.sumActualBytes;
+    s.staticClasScratchBytes = m_clasMemStats.scratchBytesPhase1;
+    UINT64 blasSum = 0;
+    for (const auto& obj : m_objects)
+        if (obj.blasStorage) blasSum += obj.blasStorage->GetDesc().Width;
+    s.staticBlasTotalBytes   = blasSum;
+
+    // Animated  (animatedPerFrameClasActualBytes is set by
+    // MeasureAnimatedClasBytesOneShot and we leave it alone here).
+    if (m_animatedObjectEnabled)
+    {
+        const auto& a = m_animatedObject;
+        s.animatedTemplateBytes            = sizeOf(a.templateResultBuffer);
+        s.animatedPerFrameClasAllocBytes   = sizeOf(a.perFrameClasResultBuffer);
+        s.animatedPerFrameClasScratchBytes = sizeOf(a.perFrameClasScratchBuffer);
+        s.animatedBlasBytes                = sizeOf(a.blasStorage);
+    }
+    else
+    {
+        s.animatedTemplateBytes = s.animatedPerFrameClasAllocBytes =
+        s.animatedPerFrameClasScratchBytes = s.animatedBlasBytes =
+        s.animatedPerFrameClasActualBytes = 0;
+    }
+
+    s.tlasBytes            = sizeOf(m_tlasBuffer);
+    s.totalClusterCount    = m_totalClusterCount;
+    s.totalTriangleCount   = m_totalTriangleCount;
+
+    // Arm timing capture for a few frames out so the ring buffer can refill
+    // with post-rebuild samples before we snap pfAnimRebuildMs / pfTlasRebuildMs.
+    // kPerFrameRingSlots + 2 gives a small margin.
+    s.pfTimingValid            = false;
+    m_overlayStatsArmCountdown = (INT)kPerFrameRingSlots + 2;
+
+    // Refresh the delta-colour fade window: 5 seconds from NOW.  Each toggle
+    // installs a fresh window (and a fresh prev above), so the user sees
+    // immediate red/green vs the immediately previous toggle, fading back to
+    // subtle 5 s after the LAST toggle.  Skipped on init -- there's nothing
+    // meaningful to compare against yet, so we leave deltaUntil at min() so
+    // the first real toggle's colours show without waiting for the fake-init
+    // window to drain.
+    if (!isInit)
+        m_overlayStatsDeltaUntil = now + std::chrono::seconds(5);
 }
 
 // =====================================================================================
@@ -2248,50 +2672,49 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 // rebuild + DispatchRays. Total work: 1 memcpy (positions) + 2 batched
 // ExecuteIndirectRTASOperations calls + 2 UAV barriers.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
+void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimestampBase)
 {
     if (!m_animatedObjectEnabled) return;
     auto& obj = m_animatedObject;
 
-    // ------------------------------------------------------------------
-    // 1) Compute new positions. Pulsate the sphere (uniform radial scale)
-    //    plus a small per-vertex high-frequency wobble so you can see the
-    //    individual clusters shimmering.
-    // ------------------------------------------------------------------
-    const float t          = (float)m_animSeconds;
-    // Per-vertex radial RIPPLE - sum of three sin waves on independent
-    // axes so the undulation reads as 3-D lumps instead of plane-wave
-    // stripes wrapping around a single (1,1,1) axis.  Each axis's wave
-    // contributes amp/3 so the total radial deflection stays bounded
-    // by wobbleAmp.  Time phases offset per axis so they don't pulse
-    // in lock-step.  amp 0.12 -> 0.08 (a little less aggressive).
-    const float wobbleAmp  = 0.08f;
-    const float wobbleFreq = 20.0f;
+    auto cl = m_deviceResources->GetCommandList();
 
-    XMFLOAT3* dst = obj.perFrameVertexBufferMapped;
-    for (UINT c = 0; c < obj.clusterCount; ++c)
+    // ------------------------------------------------------------------
+    // 1) GPU compute pass: AnimateBall.cs reads obj.restPositionsBuffer
+    //    (SRV) and writes the deformed positions into
+    //    obj.perFrameVertexBuffer (UAV).  The compute root signature is
+    //    intentionally tiny (root constants + raw SRV + raw UAV) so we
+    //    don't need to touch the descriptor heap here -- the raytracing
+    //    pipeline's heap binding from the previous DispatchRays still
+    //    holds (and Dispatch() doesn't read from it).
+    //
+    //    Per-frame CPU work is now ~5 D3D12 method calls: set RS+PSO,
+    //    push 2 dwords, 2 SetComputeRoot*View, 1 Dispatch, 1 barrier.
+    // ------------------------------------------------------------------
+    cl->SetComputeRootSignature(m_animComputeRS.Get());
+    cl->SetPipelineState(m_animComputePSO.Get());
+    struct { float t; UINT vertexCount; } params = {
+        (float)m_animSeconds, obj.totalVertexCount,
+    };
+    cl->SetComputeRoot32BitConstants(0, 2, &params, 0);
+    cl->SetComputeRootShaderResourceView (1, obj.restPositionsBuffer ->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(2, obj.perFrameVertexBuffer->GetGPUVirtualAddress());
+    const UINT kThreadsPerGroup = 64;
+    const UINT groups = (obj.totalVertexCount + kThreadsPerGroup - 1) / kThreadsPerGroup;
+    cl->Dispatch(groups, 1, 1);
+
+    // UAV barrier + transition to NON_PIXEL_SHADER_RESOURCE so INSTANTIATE
+    // sees the just-written positions.  After INSTANTIATE we transition back
+    // to UAV for the next frame's compute pass.
     {
-        const auto& src = obj.mesh.clusters[c];
-        for (size_t v = 0; v < src.positions.size(); ++v)
-        {
-            const auto& p = src.positions[v];
-            // Per-vertex wobble phase from position, so adjacent vertices wobble
-            // together (no per-vertex shear that would crack cluster edges).
-            // 3-axis ripple: independent sin waves on x, y, z with offset
-            // time-phases so they don't lock-step.  Sum divided by 3 so
-            // the worst-case radial deflection stays bounded by wobbleAmp.
-            float sx = std::sin(wobbleFreq * p.x + t * 3.0f + 0.0f);
-            float sy = std::sin(wobbleFreq * p.y + t * 3.0f + 1.7f);
-            float sz = std::sin(wobbleFreq * p.z + t * 3.0f + 3.4f);
-            float scale = 1.0f + wobbleAmp * (sx + sy + sz) * (1.0f / 3.0f);
-            // Sphere centred at origin -> radial scaling is just multiplicative.
-            dst->x = p.x * scale;
-            dst->y = p.y * scale;
-            dst->z = p.z * scale;
-            ++dst;
-        }
+        D3D12_RESOURCE_BARRIER toRead[2] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameVertexBuffer.Get()),
+            CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(_countof(toRead), toRead);
     }
-
     // ------------------------------------------------------------------
     // 2) INSTANTIATE_CLUSTER_TEMPLATES - one batched op, N args. The args
     //    were pre-filled at setup time (ClusterTemplate + VertexBuffer slice
@@ -2326,12 +2749,29 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
     D3D12_RTAS_OPERATION_DESC opDescInst = {};
     opDescInst.Inputs                = opInputsInst;
     opDescInst.pBatchedOperationData = &batchedInst;
+    // Bracket JUST the INSTANTIATE op with a timestamp pair so the overlay
+    // can attribute time changes to vertex format / precision (which only
+    // affect INSTANTIATE, not BLAS-from-CLAS).  The barriers immediately
+    // after are intentionally OUTSIDE the bracket -- those are zero-cost
+    // pipeline ordering edges, not work.
+    auto cl4_ts = m_dxrCommandList.Get();
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 0);
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDescInst,
         D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 1);
 
     D3D12_RESOURCE_BARRIER instBarriers[] = {
         CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameClasResultBuffer.Get()),
         CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameClasAddressArray.Get()),
+        // INSTANTIATE consumed perFrameVertexBuffer (NON_PIXEL_SHADER_RESOURCE);
+        // flip back to UAV for next frame's compute pass.  Doing this RIGHT
+        // after the INSTANTIATE op keeps the buffer ready for the next
+        // dispatch without an extra mid-frame transition.
+        CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     };
     m_dxrCommandList->ResourceBarrier(_countof(instBarriers), instBarriers);
 
@@ -2362,8 +2802,15 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame()
     D3D12_RTAS_OPERATION_DESC opDescBlas = {};
     opDescBlas.Inputs                = opInputsBlas;
     opDescBlas.pBatchedOperationData = &batchedBlas;
+    // Bracket the BLAS-from-CLAS op separately so the overlay reports it
+    // alongside (but distinct from) INSTANTIATE.  This is the "baseline" cost
+    // that shouldn't move much when the precision slider changes.
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 2);
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDescBlas,
         D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 3);
 
     auto blasBarrier = CD3DX12_RESOURCE_BARRIER::UAV(obj.blasStorage.Get());
     m_dxrCommandList->ResourceBarrier(1, &blasBarrier);
@@ -2655,44 +3102,9 @@ void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
     }
 }
 
-// ---------------------------------------------------------------------------------
-// Update the window title with live stats. Throttled to roughly once per second.
-// ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::UpdateTitleBar()
-{
-    if (++m_titleUpdateCounter < 30) return;
-    m_titleUpdateCounter = 0;
-
-    wchar_t buf[512];
-    if (m_animatedObjectEnabled && m_pfFramesCaptured >= kPerFrameRingSlots)
-    {
-        // Per-frame totals broken out: animated AS rebuild (INSTANTIATE_CLUSTER_TEMPLATES
-        // + BUILD_BLAS_FROM_CLAS) + TLAS rebuild.
-        swprintf_s(buf,
-            L"DXR2 Clusters | %u obj (%u+1) %u CLAS | init build %.2f ms "
-            L"(CLAS %.3f, BLAS %.3f, TLAS %.3f) | per-frame AS %.3f ms "
-            L"(anim %.3f + TLAS %.3f) | %u FPS",
-            (UINT)m_objects.size() + 1, (UINT)m_objects.size(),
-            m_totalClusterCount,
-            m_totalBuildMs, m_clasBuildMs, m_blasBuildMs, m_tlasBuildMs,
-            m_pfAnimRebuildMs + m_pfTlasRebuildMs,
-            m_pfAnimRebuildMs, m_pfTlasRebuildMs,
-            (unsigned)m_timer.GetFramesPerSecond());
-    }
-    else
-    {
-        swprintf_s(buf,
-            L"DXR2 Clusters | %u obj | %u CLAS / %.1f KB | BLAS / %.1f KB "
-            L"| build %.2f ms (CLAS %.2f, BLAS %.2f, TLAS %.2f) | %u FPS",
-            (UINT)m_objects.size(),
-            m_totalClusterCount, m_totalClasBytes / 1024.0,
-            m_totalBlasBytes / 1024.0,
-            m_totalBuildMs, m_clasBuildMs, m_blasBuildMs, m_tlasBuildMs,
-            (unsigned)m_timer.GetFramesPerSecond());
-    }
-    SetCustomWindowText(buf);
-}
-
+// Title bar intentionally left as the default static "<app name>" set at
+// window-creation time.  All per-frame stats live in the on-screen overlay
+// (RenderUI()) which has no width limit and supports colour-coded keybinds.
 // =====================================================================================
 // Raytracing pipeline + shader tables (unchanged from milestone 2).
 // =====================================================================================
@@ -2818,7 +3230,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     //   safety               -> recursion 8 (unused headroom)
     // The closesthit gates refraction at myDepth <= 4 to stay well under
     // this budget while still letting 4+ glass volumes compose visually.
-    pipelineConfig->Config(8, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    pipelineConfig->Config(16, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -2885,13 +3297,548 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
                m_hitGroupShaderTable,
                L"hit-group shader table (opaque-primary, shadow, glass-primary, shadow)");
 }
+// ---------------------------------------------------------------------------------
+// DirectXTK SpriteBatch + SpriteFont setup.  Creates the GraphicsMemory ring
+// allocator that DirectXTK uses for per-frame upload data, builds a sprite
+// batch PSO that matches the back-buffer + depth-buffer format pair, and
+// loads SegoeUI_24.spritefont (deployed by the .vcxproj alongside the exe).
+// The 24 pt atlas is exactly 2x the visual target -- combined with kScale=0.5
+// below, that gives a clean 2:1 bilinear downsample (every destination pixel
+// = perfect average of its 2x2 source texels).  Any other ratio (e.g. 48 pt /
+// kScale=0.265 we briefly tried) drops source texels under bilinear filtering
+// and aliases on thin glyph strokes.
+//
+// The font texture SRV is placed into slot 1 of our shader-visible descriptor
+// heap (slot 0 = the raytracing-output UAV).  AllocateDescriptor() hands
+// these out monotonically; the heap was bumped to 8 slots so we have plenty
+// of room for the font + future overlays.
+//
+// MUST be called AFTER CreateDescriptorHeapAndRaytracingOutput so that the
+// shared descriptor heap exists when we ask it for slot 1.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::CreateUIFont()
+{
+    using namespace DirectX;
+    auto device = m_deviceResources->GetD3DDevice();
+
+    m_graphicsMemory = std::make_unique<GraphicsMemory>(device);
+
+    // SpriteBatch PSO needs to match the back-buffer format pair (RTV format
+    // + DSV format).  Depth buffer is present on this sample's DeviceResources
+    // but the overlay itself disables depth read/write via SpriteBatch's
+    // default state -- the format just has to match the bound DSV slot at
+    // draw time, even if we render with no depth.
+    ResourceUploadBatch resourceUpload(device);
+    resourceUpload.Begin();
+    {
+        RenderTargetState rtState(m_deviceResources->GetBackBufferFormat(),
+                                  m_deviceResources->GetDepthBufferFormat());
+        SpriteBatchPipelineStateDescription pd(rtState);
+        m_spriteBatch = std::make_unique<SpriteBatch>(device, resourceUpload, pd);
+    }
+    auto uploadFinished = resourceUpload.End(m_deviceResources->GetCommandQueue());
+    uploadFinished.wait();
+
+    // Reserve slot 1 of our shared descriptor heap for the font texture SRV.
+    // SpriteFont's constructor takes the CPU + GPU descriptor handles where
+    // it should write the SRV.
+    D3D12_CPU_DESCRIPTOR_HANDLE fontCpu;
+    UINT fontSlot = AllocateDescriptor(&fontCpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE fontGpu = CD3DX12_GPU_DESCRIPTOR_HANDLE(
+        m_descriptorHeap->GetGPUDescriptorHandleForHeapStart(), fontSlot, m_descriptorSize);
+
+    {
+        ResourceUploadBatch fontUpload(device);
+        fontUpload.Begin();
+        m_uiFont = std::make_unique<SpriteFont>(device, fontUpload,
+            L"SegoeUI_24.spritefont",
+            fontCpu, fontGpu);
+        // Defensive: if we ever try to render a character that isn't in the
+        // sprite font (e.g. a non-ASCII codepoint baked into a log message
+        // by mistake), SpriteFont::DrawString throws std::runtime_error which
+        // propagates out of WndProc -> STATUS_FATAL_USER_CALLBACK_EXCEPTION.
+        // Setting a default glyph turns that crash into a visible '?' instead.
+        m_uiFont->SetDefaultCharacter(L'?');
+        auto finished = fontUpload.End(m_deviceResources->GetCommandQueue());
+        finished.wait();
+    }
+    SampleLog::LogF(L"[ui] SpriteFont loaded (descriptor heap slot %u); "
+                    L"line spacing = %.1f px\n",
+                    fontSlot, m_uiFont->GetLineSpacing());
+}
+
+// ---------------------------------------------------------------------------------
+// Compute pipeline for the per-frame GPU ball animation pass.
+//
+// Root signature is intentionally tiny: 2 dwords of inline constants
+// (time + vertex count), one raw SRV (rest positions), one raw UAV
+// (animated positions).  All bindings are root-direct -- no descriptor
+// heap involvement -- so this pass is self-contained and doesn't need
+// to share descriptor slots with the raytracing path.
+//
+// PSO is built from the dxc-compiled cs_6_6 bytecode embedded via
+// AnimateBall.hlsl.h.  Called once at init from CreateDeviceDependentResources.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::CreateAnimationComputePipeline()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    CD3DX12_ROOT_PARAMETER rootParams[3] = {};
+    rootParams[0].InitAsConstants(2, /*shaderReg*/0);                  // b0 = { float t, uint vertexCount }
+    rootParams[1].InitAsShaderResourceView(0);                         // t0 = ByteAddressBuffer rest positions
+    rootParams[2].InitAsUnorderedAccessView(0);                        // u0 = RWByteAddressBuffer anim positions
+
+    CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
+    rsDesc.Init(_countof(rootParams), rootParams, 0, nullptr,
+                D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+    Microsoft::WRL::ComPtr<ID3DBlob> serialized, error;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                             &serialized, &error);
+    if (FAILED(hr))
+    {
+        if (error) SampleLog::LogF(L"[anim-cs] root sig serialize failed: %hs\n",
+                                   (const char*)error->GetBufferPointer());
+        ThrowIfFailed(hr);
+    }
+    ThrowIfFailed(device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                              serialized->GetBufferSize(),
+                                              IID_PPV_ARGS(&m_animComputeRS)));
+    m_animComputeRS->SetName(L"Animate ball compute root sig");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_animComputeRS.Get();
+    psoDesc.CS             = CD3DX12_SHADER_BYTECODE((void*)g_pAnimateBall, ARRAYSIZE(g_pAnimateBall));
+    ThrowIfFailed(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_animComputePSO)));
+    m_animComputePSO->SetName(L"Animate ball compute PSO");
+
+    SampleLog::LogF(L"[anim-cs] compute PSO built (%zu bytes of CS bytecode)\n",
+                    (size_t)ARRAYSIZE(g_pAnimateBall));
+}
+
+
+// ---------------------------------------------------------------------------------
+// Per-frame overlay text.  Called from DoRender() AFTER the raytraced output
+// has been copied into the back buffer and the back buffer is transitioned
+// back to RENDER_TARGET state.  The sprite batch rebinds the back-buffer RTV
+// (no depth attachment -- text is depth-disabled by default) and draws our
+// stats block + key bindings on top of the ray-traced image.
+//
+// Layout:
+//   line 0   adapter name (white, larger weight via DrawString w/ 1.1x scale)
+//   line 1   BLAS / CLAS / triangle counts
+//   line 2   CLAS memory: total + avg/cluster + scratch
+//   line 3   active vertex format
+//   line 4   active CLAS alloc mode
+//   line 5   per-frame rebuild timing (anim + TLAS)
+//   line 6   FPS
+//   line 7+  key-binding hints, with the hotkey character coloured yellow
+//
+// Pixel coordinates are top-left origin; we leave a 24-px inset from the
+// window's top-left corner.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::RenderUI()
+{
+    using namespace DirectX;
+    if (!m_spriteBatch || !m_uiFont) return;
+
+    auto commandList = m_deviceResources->GetCommandList();
+    auto viewport    = m_deviceResources->GetScreenViewport();
+    auto scissor     = m_deviceResources->GetScissorRect();
+
+    // Bind the back buffer as render target (no depth -- text doesn't write Z).
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_deviceResources->GetRenderTargetView();
+    commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    commandList->RSSetViewports(1, &viewport);
+    commandList->RSSetScissorRects(1, &scissor);
+
+    // Re-bind the shader-visible descriptor heap so the SpriteBatch shader
+    // can sample the font texture SRV from slot 1.  (Compute path bound it
+    // earlier; OMSetRenderTargets doesn't disturb it but the SetDescriptorHeaps
+    // call is documented to be safe to repeat per-pass and PIX captures look
+    // cleaner with the explicit bind.)
+    ID3D12DescriptorHeap* heaps[] = { m_descriptorHeap.Get() };
+    commandList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+    m_spriteBatch->SetViewport(viewport);
+    m_spriteBatch->Begin(commandList);
+
+    // Render at exactly 0.5x of the 24 pt atlas -- the only fractional kScale
+    // bilinear filtering downsamples cleanly (each destination pixel = perfect
+    // 2x2 average of source texels).  Any other ratio drops source data and
+    // aliases on thin glyph strokes; we tried 48 pt + 0.265x and the moire on
+    // small digits was visible.  If you change the visual size, regen the
+    // spritefont at exactly 2x the new target pt and KEEP kScale = 0.5.
+    const float    kScale  = 0.5f;
+    const float    kLineH  = m_uiFont->GetLineSpacing() * kScale;
+    XMFLOAT2       pos{ 24.0f, 18.0f };
+    const XMFLOAT2 kOrigin { 0.0f, 0.0f };
+    // Body text colours.  White on this scene's sky/hex/floor palette --
+    // kSubtle is the "no change" colour for stat rows (delta-coloured numbers
+    // tint away from this to green/red when they move).
+    const XMVECTOR kWhite  = XMVectorSet(1.00f, 1.00f, 1.00f, 1);
+    const XMVECTOR kSubtle = XMVectorSet(0.92f, 0.94f, 0.97f, 1);
+    const XMVECTOR kAccent = XMVectorSet(0.40f, 0.15f, 0.65f, 1);   // dark purple for section headers
+    const XMVECTOR kHotkey = XMVectorSet(1.00f, 0.90f, 0.15f, 1);   // bright yellow for the hotkey char
+    // Delta-colouring: every per-config-change number compares to its
+    // previous-snapshot value and tints itself.
+    //   green = went down (smaller = "better" for memory/time)
+    //   red   = went up   ("worse")
+    //   subtle (unchanged) = no prev or no change
+    const XMVECTOR kGreen  = XMVectorSet(0.40f, 1.00f, 0.40f, 1);   // bright green delta
+    const XMVECTOR kRed    = XMVectorSet(1.00f, 0.45f, 0.45f, 1);   // bright red delta
+
+    // Local helper -- DrawString with the global scale factor baked in.
+    auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
+        m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
+                             /*rotation*/0.0f, kOrigin, kScale * relScale);
+    };
+    // MeasureString returns the size at scale 1; cursor advances need scaling
+    // by kScale to land glyphs flush with each other.
+    // ignoreWhitespace=false is CRITICAL for drawSeg below: trailing spaces in
+    // a label segment must contribute to the advance, else "CLAS " + "0.66"
+    // composes as "CLAS0.66" with the label and value glued together.
+    auto measureX = [&](const wchar_t* s) {
+        return XMVectorGetX(m_uiFont->MeasureString(s, /*ignoreWhitespace*/false)) * kScale;
+    };
+    // Segment draw: writes `text` at the cursor and advances the cursor's X.
+    // Used to compose a stat line out of subtle-prefix / coloured-number /
+    // subtle-suffix pieces without needing a fully tagged-text renderer.
+    // `cursor` is mutated in place (x advances, y untouched).
+    auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
+        m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
+                             /*rotation*/0.0f, kOrigin, kScale);
+        cursor.x += measureX(text);
+    };
+    // Delta-colour pickers.  Return green/red/subtle based on cur vs prev.
+    // Two gates:
+    //   1. m_overlayStatsHasPrev -- no baseline yet (first capture).
+    //   2. m_overlayStatsDeltaUntil -- the 5s post-toggle window during which
+    //      colours are shown.  After it expires we fall back to subtle so the
+    //      screen doesn't permanently glow red/green long after the user
+    //      finished iterating.
+    // Plus a NOISE THRESHOLD: tiny changes (rounding drift, EMA wobble) get
+    // suppressed -- only a |cur - prev| / |prev| >= 2 % relative change
+    // triggers a colour, so the screen doesn't flash for sub-MB / sub-us
+    // differences that don't matter.  2 % was chosen so that going 11.00 KB/cl
+    // -> 11.21 KB/cl still reads as "same"; 11.00 -> 11.23 lights up.
+    constexpr double kDeltaPctThreshold = 0.02;
+    const bool deltaActive = m_overlayStatsHasPrev
+        && (std::chrono::steady_clock::now() < m_overlayStatsDeltaUntil);
+    auto deltaColour = [&](double cur, double prev) -> XMVECTOR {
+        if (!deltaActive) return kSubtle;
+        const double base = std::max(std::abs(prev), 1e-9);
+        const double rel  = std::abs(cur - prev) / base;
+        if (rel < kDeltaPctThreshold) return kSubtle;
+        return (cur < prev) ? kGreen : kRed;
+    };
+    auto deltaColourU = [&](UINT64 cur, UINT64 prev) -> XMVECTOR {
+        if (!deltaActive) return kSubtle;
+        const double base = std::max((double)prev, 1.0);
+        const double diff = (cur > prev) ? (double)(cur - prev) : (double)(prev - cur);
+        if (diff / base < kDeltaPctThreshold) return kSubtle;
+        return (cur < prev) ? kGreen : kRed;
+    };
+    // Convenience: print a value into a small buffer + return a wchar_t* so
+    // drawSeg can consume it inline.  Each fmt* call is the SAME format string
+    // so cur and prev are formatted identically (avoids "0.49 vs 0.495"
+    // false-equal artifacts when the difference is below the displayed precision).
+    auto fmt2 = [](wchar_t* dst, size_t cch, const wchar_t* f, double v) {
+        swprintf_s(dst, cch, f, v); return dst;
+    };
+    wchar_t fnum[64];   // scratch for formatted numbers
+
+    wchar_t buf[256];
+
+    // Line 0: adapter name (slightly bigger than the body lines).
+    swprintf_s(buf, L"Adapter: %s", m_deviceResources->GetAdapterDescription());
+    draw(buf, pos, kWhite, /*relScale*/1.10f);
+    pos.y += kLineH * 1.6f;
+
+    // Triangle-count short form.
+    auto formatTris = [](UINT n, wchar_t* out, size_t cch) {
+        if      (n >= 1000000u) swprintf_s(out, cch, L"%.1fM", n / 1.0e6);
+        else if (n >= 1000u)    swprintf_s(out, cch, L"%.1fK", n / 1.0e3);
+        else                    swprintf_s(out, cch, L"%u",    n);
+    };
+    // ----- All numeric stats below read from m_overlayStats (snapshotted on
+    //       config change) so the per-frame overhead of this overlay is just
+    //       a few swprintf_s calls + the SpriteBatch draws.  Only FPS is
+    //       computed live.  See OverlayStats / CaptureOverlayStatsSnapshot
+    //       in D3D12RaytracingClusteredGeometry.h/.cpp for the snap logic.
+    //
+    // Layout convention:
+    //   - Blue (kAccent)  = section headers + top-level counts.
+    //   - White (kSubtle) = stat rows underneath, indented two spaces.
+    // That's the only colour-meaning rule.  Don't sprinkle blue on data rows.
+    const auto& s = m_overlayStats;
+    const float kSectionGap = kLineH * 0.4f;
+
+    // ----- SCENE-WIDE counts (blue header + indented detail, matching the
+    //       rest of the layout).  Includes BOTH static and animated paths so
+    //       the numbers add up consistently -- m_totalClusterCount is
+    //       static-only (used by the build code) but the user-facing scene
+    // ----- SCENE: scene-wide counts.  No delta colouring -- cluster/tri
+    //       counts are scene properties, not "better/worse" knobs.
+    wchar_t trisBuf[16];
+    formatTris(s.totalTriangleCount, trisBuf, _countof(trisBuf));
+    const UINT animClusters = m_animatedObjectEnabled ? m_animatedObject.clusterCount : 0u;
+    const UINT sceneBlasCount    = (UINT)m_objects.size() + (m_animatedObjectEnabled ? 1u : 0u);
+    const UINT sceneClusterCount = s.totalClusterCount + animClusters;
+    draw(L"SCENE:", pos, kAccent);
+    pos.y += kLineH;
+    swprintf_s(buf, L"  %u BLAS  /  %u CLAS  /  %s tris",
+               sceneBlasCount, sceneClusterCount, trisBuf);
+    draw(buf, pos, kSubtle);
+    pos.y += kLineH + kSectionGap;
+
+    // ----- STATIC section -----
+    // NOTE on precision-vs-memory: staticClasAllocBytes is the RESULT BUFFER
+    // ALLOCATION, not the bytes the driver actually emitted into it.  In
+    // Implicit-dest mode the buffer is sized for worst-case (max possible
+    // per-cluster BVH leaf) and is *insensitive* to PositionTruncateBitCount
+    // / compressed1 bits-per-component.  In GetSizes / Compact modes the
+    // buffer is sized after a GetSizes probe returns per-cluster actual
+    // sizes, so the slider visibly shrinks/grows it.  Either way we show
+    // staticClasActualBytes alongside so the precision effect is visible.
+    draw(L"STATIC:", pos, kAccent);
+    pos.y += kLineH;
+    {
+        const auto& p = m_overlayStatsPrev;
+        const double allocMb     = s.staticClasAllocBytes   / (1024.0 * 1024.0);
+        const double prevAllocMb = p.staticClasAllocBytes   / (1024.0 * 1024.0);
+        const double actualMb    = s.staticClasActualBytes  / (1024.0 * 1024.0);
+        const double prevActMb   = p.staticClasActualBytes  / (1024.0 * 1024.0);
+        const double scratchMb   = s.staticClasScratchBytes / (1024.0 * 1024.0);
+        const double prevScrMb   = p.staticClasScratchBytes / (1024.0 * 1024.0);
+        const double avgKb       = (s.totalClusterCount > 0)
+            ? (double)s.staticClasAllocBytes / (double)s.totalClusterCount / 1024.0 : 0.0;
+        const double prevAvgKb   = (p.totalClusterCount > 0)
+            ? (double)p.staticClasAllocBytes / (double)p.totalClusterCount / 1024.0 : 0.0;
+
+        XMFLOAT2 c = pos;
+        drawSeg(L"  CLAS ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
+        drawSeg(L" MB alloc  (", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
+        drawSeg(L" MB actual, avg ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", avgKb), c, deltaColour(avgKb, prevAvgKb));
+        drawSeg(L" KB/cl)", c, kSubtle);
+        pos.y += kLineH;
+
+        c = pos;
+        drawSeg(L"  scratch ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+    }
+    pos.y += kSectionGap;
+
+    // ----- ANIMATED section -----
+    if (m_animatedObjectEnabled)
+    {
+        const auto& a = m_animatedObject;
+        const auto& p = m_overlayStatsPrev;
+        draw(L"ANIMATED:", pos, kAccent);
+        pos.y += kLineH;
+        swprintf_s(buf, L"  %u clusters / %u verts / %u tris   (template + per-frame template instantiate path)",
+                   a.clusterCount, a.totalVertexCount, a.mesh.totalTriangles);
+        draw(buf, pos, kSubtle); pos.y += kLineH;
+
+        const double tplMb     = s.animatedTemplateBytes            / (1024.0 * 1024.0);
+        const double prevTplMb = p.animatedTemplateBytes            / (1024.0 * 1024.0);
+        const double pfMb      = s.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
+        const double prevPfMb  = p.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
+        const double pfActMb   = s.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
+        const double prevPfAct = p.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
+        const double pfScrMb   = s.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
+        const double prevPfScr = p.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
+        const double aBlasMb   = s.animatedBlasBytes                / (1024.0 * 1024.0);
+        const double prevABlas = p.animatedBlasBytes                / (1024.0 * 1024.0);
+
+        XMFLOAT2 c = pos;
+        drawSeg(L"  templates ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tplMb), c, deltaColour(tplMb, prevTplMb));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+
+        c = pos;
+        drawSeg(L"  per-frame CLAS ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
+        drawSeg(L" MB alloc  (", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
+        drawSeg(L" MB actual)  + scratch ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfScrMb), c, deltaColour(pfScrMb, prevPfScr));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+
+        c = pos;
+        drawSeg(L"  BLAS ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+        pos.y += kSectionGap;
+    }
+
+    // ----- TOTAL section -----
+    {
+        const auto& p = m_overlayStatsPrev;
+        const UINT64 animatedTotal     = s.animatedTemplateBytes
+                                       + s.animatedPerFrameClasAllocBytes
+                                       + s.animatedBlasBytes;
+        const UINT64 prevAnimatedTotal = p.animatedTemplateBytes
+                                       + p.animatedPerFrameClasAllocBytes
+                                       + p.animatedBlasBytes;
+        const UINT64 grandTotal        = s.staticClasAllocBytes + s.staticBlasTotalBytes
+                                       + animatedTotal + s.tlasBytes;
+        const UINT64 prevGrandTotal    = p.staticClasAllocBytes + p.staticBlasTotalBytes
+                                       + prevAnimatedTotal + p.tlasBytes;
+        const UINT64 staticTotal       = s.staticClasAllocBytes + s.staticBlasTotalBytes;
+        const UINT64 prevStaticTotal   = p.staticClasAllocBytes + p.staticBlasTotalBytes;
+
+        draw(L"TOTAL:", pos, kAccent);
+        pos.y += kLineH;
+
+        const double grandMb = grandTotal / (1024.0 * 1024.0);
+        const double statMb  = staticTotal / (1024.0 * 1024.0);
+        const double animMb  = animatedTotal / (1024.0 * 1024.0);
+        const double tlasMb  = s.tlasBytes / (1024.0 * 1024.0);
+        XMFLOAT2 c = pos;
+        drawSeg(L"  AS memory ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", grandMb), c, deltaColourU(grandTotal, prevGrandTotal));
+        drawSeg(L" MB   (static ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", statMb), c, deltaColourU(staticTotal, prevStaticTotal));
+        drawSeg(L" + animated ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", animMb), c, deltaColourU(animatedTotal, prevAnimatedTotal));
+        drawSeg(L" + TLAS ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tlasMb), c, deltaColourU(s.tlasBytes, p.tlasBytes));
+        drawSeg(L")", c, kSubtle);
+        pos.y += kLineH;
+        pos.y += kSectionGap;
+    }
+
+    // ----- PER-FRAME section -----
+    // Times are snapped from the EMA a few frames after each config change so
+    // the displayed value belongs to the current config (not a smear of pre +
+    // post-rebuild samples).  Splitting INSTANTIATE vs BLAS vs TLAS is what
+    // makes the precision / vertex-format sweep meaningful: changing
+    // precision should move ONLY the INSTANTIATE column.
+    if (m_animatedObjectEnabled)
+    {
+        const auto& p = m_overlayStatsPrev;
+        draw(L"PER-FRAME:", pos, kAccent);
+        pos.y += kLineH;
+        if (s.pfTimingValid)
+        {
+            const double totalMs     = s.pfInstantiateMs + s.pfBlasRebuildMs + s.pfTlasRebuildMs;
+            const double prevTotalMs = p.pfInstantiateMs + p.pfBlasRebuildMs + p.pfTlasRebuildMs;
+            // Only colour-compare the per-frame timings if prev had valid
+            // timing too (else we'd compare against a stale 0.0 every time).
+            const bool   prevValid   = p.pfTimingValid;
+            auto pfPick = [&](double cur, double prev) -> XMVECTOR {
+                if (!deltaActive || !prevValid) return kSubtle;
+                const double base = std::max(std::abs(prev), 1e-9);
+                const double rel  = std::abs(cur - prev) / base;
+                if (rel < kDeltaPctThreshold) return kSubtle;
+                return (cur < prev) ? kGreen : kRed;
+            };
+            // Auto-picked unit so the user always knows what scale they're
+            // looking at -- "0.073" is ambiguous (ms? us? s?), "73 us" /
+            // "0.073 ms" / "1.5 s" are not.  Switch us<->ms at the 1 ms mark
+            // and ms<->s at the 1000 ms mark, both round numbers.
+            //
+            // NOTE: we deliberately use the ASCII "us" rather than the U+00B5
+            // micro-sign because MakeSpriteFont's default character range only
+            // covers ASCII 32-126 -- the spritefont file we ship has NO glyph
+            // for the micro-sign and SpriteFont::DrawString throws std::runtime_error
+            // ("character not in the font") when it sees one, which propagates
+            // out of WndProc as STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xC000041D).
+            // Regenerating the spritefont with /CharacterRegion would also work
+            // but ASCII "us" is universally readable and avoids the asset rebuild.
+            auto fmtTime = [](wchar_t* dst, size_t cch, double ms) -> wchar_t* {
+                if (ms >= 1000.0)      swprintf_s(dst, cch, L"%.3f s",  ms / 1000.0);
+                else if (ms >= 1.0)    swprintf_s(dst, cch, L"%.3f ms", ms);
+                else                   swprintf_s(dst, cch, L"%.1f us", ms * 1000.0);
+                return dst;
+            };
+
+            XMFLOAT2 c = pos;
+            drawSeg(L"  rebuild ", c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), totalMs), c, pfPick(totalMs, prevTotalMs));
+            drawSeg(L"   (template instantiate ", c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), s.pfInstantiateMs), c, pfPick(s.pfInstantiateMs, p.pfInstantiateMs));
+            drawSeg(L"  +  BLAS ", c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), s.pfBlasRebuildMs), c, pfPick(s.pfBlasRebuildMs, p.pfBlasRebuildMs));
+            drawSeg(L"  +  TLAS ", c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), s.pfTlasRebuildMs), c, pfPick(s.pfTlasRebuildMs, p.pfTlasRebuildMs));
+            drawSeg(L")", c, kSubtle);
+        }
+        else
+        {
+            draw(L"  measuring...", pos, kSubtle);
+        }
+        pos.y += kLineH;
+        pos.y += kSectionGap;
+    }
+
+    // ----- FPS section.  The ONLY number that's truly live - we don't
+    //       snapshot it because the whole point of FPS is the instantaneous
+    //       value the user can watch fluctuate.  Section header in blue +
+    //       indented value in white, matching the convention above.
+    draw(L"FPS:", pos, kAccent);
+    pos.y += kLineH;
+    swprintf_s(buf, L"  %u", (unsigned)m_timer.GetFramesPerSecond());
+    draw(buf, pos, kSubtle);
+    pos.y += kLineH * 1.4f;
+
+    // ----- Interactive controls.  Key prefix coloured amber, label + current
+    // value in white -- each line owns its own value so there's no need to
+    // hunt up the screen for "what is it set to right now?".  The "(-/+)"
+    // hint is omitted because ',' and '.' / '[' and ']' are visually paired
+    // keys -- you can tell from the prefix which way each one moves.
+    auto drawKeyLine = [&](const wchar_t* keyPrefix, const wchar_t* tail) {
+        XMFLOAT2 p = pos;
+        draw(keyPrefix, p, kHotkey);
+        p.x += measureX(keyPrefix);
+        draw(tail, p, kWhite);
+        pos.y += kLineH;
+    };
+
+    wchar_t kbuf[256];
+
+    swprintf_s(kbuf, L"   CLAS alloc mode:  %s", ClasAllocModeName());
+    drawKeyLine(L"[A]", kbuf);
+
+    swprintf_s(kbuf, L"   vertex format:    %s",
+               m_vertexMode == VertexMode::Float32_3 ? L"FLOAT32_3" : L"COMPRESSED1");
+    drawKeyLine(L"[V]", kbuf);
+
+    if (m_vertexMode == VertexMode::Float32_3)
+        swprintf_s(kbuf, L"   cluster precision: %u bits/component   (32-bit float, PositionTruncateBitCount=%u)",
+                   32u - m_positionTruncateBits, m_positionTruncateBits);
+    else
+        swprintf_s(kbuf, L"   cluster precision: %u bits/component   (shared exponent)",
+                   m_compressedBitsPerComponent);
+    drawKeyLine(L"[ ]", kbuf);
+
+    swprintf_s(kbuf, L"   ray bounces:      reflection %u   refraction %u",
+               ReflectionBounces(), RefractionBounces());
+    drawKeyLine(L", .", kbuf);
+
+    swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
+    drawKeyLine(L"[P]", kbuf);
+
+    m_spriteBatch->End();
+}
+
+
 
 void D3D12RaytracingClusteredGeometry::CreateDescriptorHeapAndRaytracingOutput()
 {
     auto device = m_deviceResources->GetD3DDevice();
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 4;
+    heapDesc.NumDescriptors = 8;    // slot 0 = RT-output UAV, slot 1 = font SRV (DirectXTK), spare = 6
     heapDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_descriptorHeap)));
@@ -2939,11 +3886,26 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
 {
     if (!m_sceneCBMapped) return;
 
-    // Slowly orbit around the scene center. Period = 30s for a full revolution.
-    const double t = m_animSeconds;
-    const float  angle  = float(t * (2.0 * M_PI / 30.0));
-    const float  radius = 6.5f;                                 // dollied IN a touch (was 8.0) - frame slightly tighter on the scene
-    const float  height = 1.5f;                                 // eye lifted (was 0.8) - higher vantage
+    // Slowly orbit around the scene center.  Two independent cycles so the
+    // camera traces a Lissajous-style path that doesn't repeat for tens of
+    // minutes:
+    //   - YAW (pan):   2 pi / 30 s   per cycle  -- full revolution every 30 s.
+    //   - DOLLY (z):   2 pi / 19 s   per cycle  -- radius pulses INWARD only.
+    // 30 and 19 are coprime (19 is prime), so the eye never re-visits the
+    // same (yaw, radius) tuple within a reasonable session.  The dolly uses a
+    // (1 - cos)/2 envelope rather than a bare sin so the camera NEVER goes
+    // farther back than the rest position -- it only swings closer to the
+    // scene, framing interior cluster detail at the inner peak.  Range:
+    // [kBaseRadius - kDollyAmp, kBaseRadius].
+    const double t           = m_animSeconds;
+    const float  angle       = float(t * (2.0 * M_PI / 30.0));
+    constexpr float kBaseRadius  = 6.5f;     // outermost orbit distance (= rest position)
+    constexpr float kDollyAmp    = 3.0f;     // inward swing magnitude; radius sweeps 3.5..6.5
+    constexpr float kDollyPeriod = 19.0f;    // seconds; coprime with 30s pan period (full in-and-out every 19 s)
+    const float  dollyPhase  = float(t * (2.0 * M_PI / kDollyPeriod));
+    const float  radius      = kBaseRadius
+                             - kDollyAmp * 0.5f * (1.0f - std::cos(dollyPhase));
+    const float  height      = 1.5f;                                 // eye lifted (was 0.8) - higher vantage
     XMVECTOR eye = XMVectorSet(radius * std::sin(angle), height,
                                -radius * std::cos(angle), 1.0f);
     XMVECTOR at  = XMVectorSet(0.5f, 0.0f, 0.0f, 1.0f);   // look-at LOWERED (was 1.2) - camera now pitches DOWN noticeably -> floor reads as the dominant surface, sky shrinks to a band at the top, slab gets seen more from above
@@ -2966,6 +3928,11 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     cb.miscParams.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60deg vertical FOV
     cb.miscParams.z = (float)m_aaSamplesPerPixel;                  // raygen sample count (1/2/4)
     cb.miscParams.w = m_clusterTint;                               // 0..1 cluster-rainbow tint blend
+
+    // Runtime knobs the shader reads each TraceRay.  See SceneConstantBuffer
+    // in RaytracingHlslCompat.h for the slot reservations.
+    cb.runtimeParams.x = ReflectionBounces();                      // computed from m_bounceSlider
+    cb.runtimeParams.y = RefractionBounces();                      // ditto (= refl or refl+2 with clamps)
     // Sun in upper-back-right. Direction TO the light, normalized. .w is the
     // ambient floor: even fully-shadowed pixels get this fraction of base
     // colour so the scene reads instead of going pitch black.
@@ -3050,24 +4017,45 @@ void D3D12RaytracingClusteredGeometry::DoRender()
                 m_pfQueryReadback->Unmap(0, &noWrite);
 
                 const double freq = (double)m_timestampFrequency;
-                const double animMs = (ts[1] >= ts[0]) ? (double)(ts[1] - ts[0]) * 1000.0 / freq : 0.0;
-                const double tlasMs = (ts[3] >= ts[2]) ? (double)(ts[3] - ts[2]) * 1000.0 / freq : 0.0;
+                // 3 op pairs: (0,1)=INSTANTIATE, (2,3)=BLAS, (4,5)=TLAS.
+                const double instMs = (ts[1] >= ts[0]) ? (double)(ts[1] - ts[0]) * 1000.0 / freq : 0.0;
+                const double blasMs = (ts[3] >= ts[2]) ? (double)(ts[3] - ts[2]) * 1000.0 / freq : 0.0;
+                const double tlasMs = (ts[5] >= ts[4]) ? (double)(ts[5] - ts[4]) * 1000.0 / freq : 0.0;
                 // EMA, alpha=0.1 for a sub-second smoothing window.
                 constexpr double a = 0.1;
-                m_pfAnimRebuildMs = m_pfAnimRebuildMs * (1.0 - a) + animMs * a;
+                m_pfInstantiateMs = m_pfInstantiateMs * (1.0 - a) + instMs * a;
+                m_pfBlasRebuildMs = m_pfBlasRebuildMs * (1.0 - a) + blasMs * a;
                 m_pfTlasRebuildMs = m_pfTlasRebuildMs * (1.0 - a) + tlasMs * a;
+
+                // Snap timing into m_overlayStats once the ring has refilled
+                // post-rebuild.  After CaptureOverlayStatsSnapshot arms the
+                // countdown to (kPerFrameRingSlots+2), we decrement here once
+                // per frame in which we successfully read a sample; when it
+                // hits 0 the EMAs reflect post-rebuild timings and we lock
+                // them in as the displayed values until the next rebuild.
+                if (m_overlayStatsArmCountdown > 0)
+                {
+                    --m_overlayStatsArmCountdown;
+                    if (m_overlayStatsArmCountdown == 0)
+                    {
+                        m_overlayStats.pfInstantiateMs = m_pfInstantiateMs;
+                        m_overlayStats.pfBlasRebuildMs = m_pfBlasRebuildMs;
+                        m_overlayStats.pfTlasRebuildMs = m_pfTlasRebuildMs;
+                        m_overlayStats.pfTimingValid   = true;
+                    }
+                }
             }
         }
 
-        // Record this frame's per-frame work, straddled with timestamps.
+        // Record this frame's per-frame work.  UpdateAnimatedObjectPerFrame
+        // emits timestamp pairs at base+0/1 (INSTANTIATE) and base+2/3 (BLAS);
+        // we bracket the TLAS rebuild here at base+4/5.
         const UINT base = m_pfWriteSlot * kPerFrameTsPerSlot;
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 0);
-        UpdateAnimatedObjectPerFrame();   // INSTANTIATE + BLAS rebuild + barriers
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 1);
+        UpdateAnimatedObjectPerFrame(base);
 
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 2);
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 4);
         RebuildTlasPerFrame();
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 3);
+        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 5);
 
         cl->ResolveQueryData(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             base, kPerFrameTsPerSlot, m_pfQueryReadback.Get(),
@@ -3129,7 +4117,20 @@ void D3D12RaytracingClusteredGeometry::DoRender()
             D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
     };
     cl->ResourceBarrier(_countof(toRtAndPresent), toRtAndPresent);
+
+    // Paint on-screen overlay text (stats, key bindings).  The back buffer is
+    // now in RENDER_TARGET; SpriteBatch binds it as an RTV, draws text, and
+    // we hand off to Present() which transitions to PRESENT internally.
+    RenderUI();
+
     m_deviceResources->Present();
+
+    // DirectXTK: tag per-frame upload pages with the queue's current fence value
+    // AFTER the cmd list has been executed (Present did ExecuteCommandList).  This
+    // is the canonical placement -- calling Commit before Present would signal the
+    // fence on a queue position before our text-draw commands and the ring
+    // allocator could reclaim live upload pages.
+    if (m_graphicsMemory) m_graphicsMemory->Commit(m_deviceResources->GetCommandQueue());
 }
 
 // =====================================================================================
@@ -3180,10 +4181,9 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     SampleLog::Write(L"OnDestroy: starting shutdown\n");
     if (m_animatedObjectEnabled && m_pfFramesCaptured >= kPerFrameRingSlots)
     {
-        SampleLog::LogF(L"[per-frame wall-clock, EMA] animated AS rebuild=%.4f ms "
-                        L"(INSTANTIATE + BLAS), TLAS rebuild=%.4f ms, total=%.4f ms\n",
-                        m_pfAnimRebuildMs, m_pfTlasRebuildMs,
-                        m_pfAnimRebuildMs + m_pfTlasRebuildMs);
+        SampleLog::LogF(L"[per-frame wall-clock, EMA] INSTANTIATE=%.4f ms  BLAS=%.4f ms  TLAS=%.4f ms  total=%.4f ms\n",
+                        m_pfInstantiateMs, m_pfBlasRebuildMs, m_pfTlasRebuildMs,
+                        m_pfInstantiateMs + m_pfBlasRebuildMs + m_pfTlasRebuildMs);
     }
 
     if (m_deviceResources)
@@ -3206,8 +4206,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     // releasing them (same hang-avoidance reason as m_sceneCB above).
     {
         auto& a = m_animatedObject;
-        if (a.perFrameVertexBuffer  && a.perFrameVertexBufferMapped)
-            { a.perFrameVertexBuffer->Unmap(0, nullptr);  a.perFrameVertexBufferMapped  = nullptr; }
+        // perFrameVertexBuffer is now a DEFAULT-heap UAV (no map), so no unmap.
         if (a.perFrameInstArgsBuffer && a.perFrameInstArgsMapped)
             { a.perFrameInstArgsBuffer->Unmap(0, nullptr); a.perFrameInstArgsMapped = nullptr; }
         if (a.blasArgsBuffer && a.blasArgsMapped)
@@ -3216,6 +4215,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
         a.templateResultBuffer.Reset();
         a.templateScratchBuffer.Reset();
         a.templateAddressArray.Reset();
+        a.restPositionsBuffer.Reset();
         a.perFrameVertexBuffer.Reset();
         a.perFrameInstArgsBuffer.Reset();
         a.perFrameClasResultBuffer.Reset();
@@ -3249,9 +4249,16 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_rayGenShaderTable.Reset();
     m_missShaderTable.Reset();
     m_hitGroupShaderTable.Reset();
+    m_animComputePSO.Reset();
+    m_animComputeRS.Reset();
     m_descriptorHeap.Reset();
     m_raytracingOutput.Reset();
     m_sceneCB.Reset();
+    // DirectXTK UI resources (must be torn down before the device that
+    // owns their backing GPU resources is released).
+    m_uiFont.reset();
+    m_spriteBatch.reset();
+    m_graphicsMemory.reset();
     m_dxr2CommandList.Reset();
     m_dxr2Device.Reset();
     m_dxrCommandList.Reset();
@@ -3262,10 +4269,95 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
 
 void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
 {
+    // ----- A/V/P primary toggles -----
     if (key == 'P' || key == 'p')
     {
         m_animPaused = !m_animPaused;
         SampleLog::LogF(L"[input] animation %s\n", m_animPaused ? L"PAUSED" : L"resumed");
+    }
+    else if (key == 'A' || key == 'a')
+    {
+        // Cycle CLAS allocation strategy: Implicit -> GetSizes -> Compact -> ...
+        // Triggers a full GPU flush + rebuild of the static AS pipeline.
+        switch (m_clasAllocMode)
+        {
+        case ClasAllocMode::Implicit: m_clasAllocMode = ClasAllocMode::GetSizes; break;
+        case ClasAllocMode::GetSizes: m_clasAllocMode = ClasAllocMode::Compact;  break;
+        case ClasAllocMode::Compact:  m_clasAllocMode = ClasAllocMode::Implicit; break;
+        }
+        SampleLog::LogF(L"[input] CLAS alloc mode -> %s\n", ClasAllocModeName());
+        RebuildStaticAccelerationStructures(L"alloc-mode toggle");
+    }
+    else if (key == 'V' || key == 'v')
+    {
+        // Cycle vertex format: FLOAT32_3 <-> COMPRESSED1.
+        // NOTE: COMPRESSED1 currently exposes an NVIDIA driver bug (see the
+        // long comment in BuildScene above); on RTX hardware the second
+        // cycle may render geometry artifacts on some clusters.  WARP
+        // ("d3dconfig device force-warp=true") renders both paths cleanly.
+        m_vertexMode = (m_vertexMode == VertexMode::Float32_3)
+                     ? VertexMode::Compressed1
+                     : VertexMode::Float32_3;
+        SampleLog::LogF(L"[input] vertex format -> %s\n",
+                        m_vertexMode == VertexMode::Compressed1 ? L"COMPRESSED1" : L"FLOAT32_3");
+        RebuildStaticAccelerationStructures(L"vertex-format toggle");
+    }
+    // ----- ',' / '.' = bounce-depth slider.  See m_bounceSlider in the
+    //   header for the canonical mapping table.  Slider direction has a
+    //   single meaning at every position -- moving '.' bumps the higher
+    //   value first (refraction) and once it saturates at 5, starts
+    //   bumping the lower one (reflection).  Moving ',' is the mirror
+    //   image.  Going up and back down ALWAYS lands at the same (refl,
+    //   refr) pair the slider passed through on the way up -- so the
+    //   default +2 gap is restored automatically.  No rebuild needed.
+    else if (key == VK_OEM_COMMA)            // ','
+    {
+        if (m_bounceSlider <= kBounceSliderMin) return;
+        --m_bounceSlider;
+        SampleLog::LogF(L"[input] bounce slider %d -> refl %u  refr %u\n",
+                        m_bounceSlider, ReflectionBounces(), RefractionBounces());
+    }
+    else if (key == VK_OEM_PERIOD)           // '.'
+    {
+        if (m_bounceSlider >= kBounceSliderMax) return;
+        ++m_bounceSlider;
+        SampleLog::LogF(L"[input] bounce slider %d -> refl %u  refr %u\n",
+                        m_bounceSlider, ReflectionBounces(), RefractionBounces());
+    }
+    // ----- '[' / ']' = per-cluster precision slider.  Direction is the same
+    //   in both modes: '[' -> LESS precision, ']' -> MORE precision.
+    //   Internally:
+    //     FLOAT32_3   -> m_positionTruncateBits in [0, 23].  '[' increments
+    //                    (truncates more bits); ']' decrements (keeps more).
+    //                    23 is float32's mantissa width -- truncating more
+    //                    than that just zeros the whole mantissa.
+    //     COMPRESSED1 -> m_compressedBitsPerComponent in [1, 16].  '['
+    //                    decrements; ']' increments.  16 is the per-axis
+    //                    cap in the D3D12 COMPRESSED1 encoding; 1 is the
+    //                    minimum (0 would divide-by-zero in our encoder).
+    //   Either change triggers a full static-AS rebuild (CLAS is re-encoded
+    //   in the COMPRESSED1 case via EncodeCompressedClusters inside Rebuild).
+    else if (key == VK_OEM_4 || key == VK_OEM_6)
+    {
+        const bool wantLess = (key == VK_OEM_4);
+        if (m_vertexMode == VertexMode::Float32_3)
+        {
+            const UINT prev = m_positionTruncateBits;
+            if (wantLess)  m_positionTruncateBits = (prev >= 23u) ? prev : prev + 1u;
+            else           m_positionTruncateBits = (prev == 0u)  ? 0u  : prev - 1u;
+            if (m_positionTruncateBits == prev) return;
+            SampleLog::LogF(L"[input] position truncate bits -> %u  (%u bits kept)\n",
+                            m_positionTruncateBits, 32u - m_positionTruncateBits);
+        }
+        else
+        {
+            const UINT prev = m_compressedBitsPerComponent;
+            if (wantLess)  m_compressedBitsPerComponent = (prev <= 1u)  ? 1u  : prev - 1u;
+            else           m_compressedBitsPerComponent = (prev >= 16u) ? prev : prev + 1u;
+            if (m_compressedBitsPerComponent == prev) return;
+            SampleLog::LogF(L"[input] compressed1 bits/component -> %u\n", m_compressedBitsPerComponent);
+        }
+        RebuildStaticAccelerationStructures(L"precision slider");
     }
 }
 

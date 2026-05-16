@@ -17,6 +17,7 @@
 #else
 #include <DirectXMath.h>
 typedef DirectX::XMFLOAT4   XMFLOAT4;
+typedef DirectX::XMUINT4    XMUINT4;
 typedef DirectX::XMMATRIX   XMMATRIX;
 typedef UINT                uint;
 #endif
@@ -25,10 +26,18 @@ struct SceneConstantBuffer
 {
     XMMATRIX  viewToWorld;       // ray gen camera basis (also applies translation)
     XMFLOAT4  cameraPosition;    // .xyz = world-space eye position
-    XMFLOAT4  miscParams;        // .x = aspect ratio, .y = tan(fov/2), .z/.w = unused
+    XMFLOAT4  miscParams;        // .x = aspect ratio, .y = tan(fov/2),
+                                 // .z = AA sample count, .w = cluster-rainbow tint blend (0..1)
     XMFLOAT4  lightDir;          // .xyz = world-space direction TO the sun (normalized),
                                  // .w   = ambient floor [0..1] (so shadowed regions remain
                                  //        readable instead of pitch black)
+    // Runtime tweakable knobs (live-cycled via the keyboard, see OnKeyDown).
+    // Kept distinct from miscParams so adding more sliders doesn't disturb
+    // the existing fields the raygen / closesthit shaders already read.
+    XMUINT4   runtimeParams;     // .x = max ray bounces (0..16, applied to BOTH
+                                 //      reflection AND refraction recursion in
+                                 //      Opaque/GlassHit). 0 = primary only.
+                                 // .y/.z/.w reserved for future sliders.
 };
 
 // Per-instance material.  Each instance carries an independent BLEND of

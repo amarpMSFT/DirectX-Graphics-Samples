@@ -506,7 +506,10 @@ void OpaqueHit(inout Payload p, in Attribs a)
 
     float3 finalColor = ctx.base;
 
-    if (ctx.mat.reflectivity > 0.0 && p.depth <= 2)
+    // Bounce gate: g_scene.runtimeParams.x = reflection-bounce cap,
+    // .y = refraction-bounce cap (kept locked +2 apart via the ',' / '.'
+    // slider, see OnKeyDown).  0 = no reflection (mirror-disabled).
+    if (ctx.mat.reflectivity > 0.0 && p.depth < g_scene.runtimeParams.x)
     {
         // Mirror bounce.  Opaque-only path: reflection ray uses
         // RAY_FLAG_CULL_BACK_FACING_TRIANGLES (we're in air, never
@@ -550,7 +553,7 @@ void GlassHit(inout Payload p, in Attribs a)
 
     bool tirHappened = false;
 
-    if (ctx.mat.refractivity > 0.0 && myDepth <= 4)
+    if (ctx.mat.refractivity > 0.0 && myDepth < g_scene.runtimeParams.y)
     {
         // ENTERING/EXITING decision: TOGGLE based on p.inGlass count
         // (not on HitKind() or on the smooth-normal dot product).
@@ -628,7 +631,7 @@ void GlassHit(inout Payload p, in Attribs a)
         }
     }
 
-    if (!tirHappened && ctx.mat.reflectivity > 0.0 && myDepth <= 2)
+    if (!tirHappened && ctx.mat.reflectivity > 0.0 && myDepth < g_scene.runtimeParams.x)
     {
         // Reflection keeps the ray in the SAME medium (no depth change).
         uint childInGlass = p.inGlass;

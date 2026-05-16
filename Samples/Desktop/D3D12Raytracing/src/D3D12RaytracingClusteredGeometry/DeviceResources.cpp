@@ -570,14 +570,16 @@ void DeviceResources::WaitForGpu() noexcept
             // Wait until the Signal has been processed.
             if (SUCCEEDED(m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent.Get())))
             {
-                const DWORD kFenceTimeoutMs = 2000;
-                DWORD wr = WaitForSingleObjectEx(m_fenceEvent.Get(), kFenceTimeoutMs, FALSE);
-                if (wr == WAIT_TIMEOUT)
-                {
-                    // GPU appears wedged - log and proceed. Shutting down is
-                    // higher priority than a clean fence completion.
-                    OutputDebugStringW(L"[DeviceResources] WaitForGpu timed out after 2s; continuing anyway\n");
-                }
+                // INFINITE wait by design: callers (resize path, mid-frame
+                // template-GVA readback, etc.) MUST see the GPU drained
+                // before they release / re-allocate the resources the GPU
+                // was using.  A bounded wait that times out and proceeds
+                // anyway hits D3D12 debug runtime "id=921 CORRUPTION: ...
+                // referenced by GPU operations in-flight" on WARP where a
+                // single frame can routinely take >2 s.  TDR is the system-
+                // level escape hatch if the GPU genuinely wedges; we don't
+                // need a per-app one.
+                WaitForSingleObjectEx(m_fenceEvent.Get(), INFINITE, FALSE);
 
                 // Increment the fence value for the current frame.
                 m_fenceValues[m_backBufferIndex]++;
@@ -657,6 +659,22 @@ void DeviceResources::InitializeAdapter(IDXGIAdapter1** ppAdapter)
         if (FAILED(m_dxgiFactory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))))
         {
             throw exception("WARP12 not available. Enable the 'Graphics Tools' optional feature");
+        }
+
+        // Populate the description on the WARP fallback path -- otherwise the
+        // on-screen overlay's "Adapter:" line shows blank when d3dconfig
+        // force-warp causes the discrete enumeration above to skip every
+        // candidate (SOFTWARE flag = WARP gets filtered out, then we land
+        // here without ever assigning m_adapterDescription).
+        DXGI_ADAPTER_DESC1 warpDesc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&warpDesc)))
+        {
+            m_adapterID          = 0;
+            m_adapterDescription = warpDesc.Description;
+        }
+        else
+        {
+            m_adapterDescription = L"WARP12";
         }
 
         OutputDebugStringA("Direct3D Adapter - WARP12\n");

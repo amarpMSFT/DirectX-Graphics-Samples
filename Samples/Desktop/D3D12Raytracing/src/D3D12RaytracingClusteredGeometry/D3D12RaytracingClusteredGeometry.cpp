@@ -2099,6 +2099,43 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 // cluster path's ClusterID()).  Used when m_geometryMode == Traditional.
 // TLAS hands these BLAS GVAs out via obj.tradBlasGPUVA.
 //
+// ------------------------------------------------------------------------
+// WHY ONE GEOMETRY DESC PER CLUSTER (READ THIS BEFORE COPYING):
+//
+// The per-cluster geometry-desc layout we use here is a SAMPLE-ONLY
+// choice driven by the demo's apples-to-apples comparison goal.  We
+// want the traditional path's closest-hit to be able to recover the
+// same per-cluster identity the cluster path gets from ClusterID(),
+// so we lay one geometry desc per cluster inside the per-object BLAS
+// and feed g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
+// back into the SAME g_clusterMeta / g_clusterNormals / etc. tables.
+// That gets you visually identical output between the two paths with
+// the smallest possible code delta, which is what makes the memory
+// + build-cost numbers in the overlay directly comparable.
+//
+// A real app shipping the traditional path would almost certainly
+// NOT subdivide a mesh into ~50 geometry descs per object just to
+// preserve cluster scope -- it costs measurable BLAS bytes (the
+// BVH carries per-geometry split metadata) and build scratch (see
+// the overlay numbers).  The natural unit a real app picks is
+// MATERIALS: one geometry desc per material region of the mesh,
+// because that's the boundary at which the closest-hit needs to
+// branch.  Material count is typically O(few) per object instead
+// of O(hundreds) of clusters, so the BVH overhead is small.
+//
+// Worth noting: even in the cluster path, a real app would also
+// usually use multiple geometry descs at the TLAS-instance level
+// to express materials -- cluster boundaries are placed for spatial
+// coherence and traversal efficiency, NOT material coherence, so a
+// single cluster will routinely straddle multiple materials in
+// real meshes.  The cluster path gives you finer-than-material
+// granularity (per-cluster overrides, per-cluster opacity flags,
+// per-cluster precision) AS WELL AS material-driven geometries --
+// the two layers compose; they're not alternatives.  Our demo
+// scene happens to be one-material-per-object so we don't exercise
+// that, but the API supports it cleanly.
+// ------------------------------------------------------------------------
+//
 // Two allocation strategies, cycled via [A] in traditional mode (mirrors
 // the cluster path's [A] CLAS alloc-mode toggle):
 //
@@ -2175,6 +2212,13 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         totalIbBytes += idx32.size() * sizeof(UINT32);
 
         // Per-cluster geometry descs sharing the per-object VB/IB.
+        // (Sample-only layout for cluster-vs-traditional A/B comparison
+        // -- see the long comment above the function for why a real
+        // app would key these on materials instead of clusters.)
+        // Opacity flag is per-object here (matches the cluster path
+        // which derives it from material translucency); per-geometry
+        // OPAQUE flags are valid too if you have heterogeneous opacity
+        // within an object.
         const auto& mat = m_materials[obj.instanceID];
         const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
         const auto geomFlag = isOpaqueLike

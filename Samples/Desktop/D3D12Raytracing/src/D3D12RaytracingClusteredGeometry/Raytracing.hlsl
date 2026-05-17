@@ -48,6 +48,14 @@ ByteAddressBuffer                 g_clusterOffsets : register(t4);   // uint2 st
 // lives in CPU-authored data; the shader just loads the meta and applies
 // the override fields uniformly.  See RaytracingHlslCompat.h ClusterMeta.
 ByteAddressBuffer                 g_clusterMeta    : register(t5);
+// Traditional-path shader-side buffers (Project 4 [T] toggle).  Same
+// layout as the cluster channels but indexed by InstanceID() instead
+// of ClusterID().  See BuildTraditionalShaderSideBuffers in the .cpp
+// for the build, and LoadHitContext below for the per-hit branch on
+// g_scene.runtimeParams.z (0 = clusters, 1 = traditional).
+ByteAddressBuffer                 g_tradNormals    : register(t6);   // float3 stored as 16 bytes (concatenated per-object)
+ByteAddressBuffer                 g_tradIndices    : register(t7);   // uint   stored as  4 bytes (object-local indices)
+ByteAddressBuffer                 g_tradOffsets    : register(t8);   // uint2  stored as  8 bytes (per-instance: normalsBase, indicesBase)
 
 ClusterMeta LoadClusterMeta(uint cid)
 {
@@ -67,6 +75,27 @@ ClusterMeta LoadClusterMeta(uint cid)
     m._pad0          = 0;
     m._pad1          = 0;
     m._pad2          = 0;
+    return m;
+}
+
+// Traditional (DXR1) path has no per-cluster metadata -- each instance
+// uses its material's raw values with no per-cluster overrides, no per-
+// cluster color tint, no interior-surface flag.  This identity meta is
+// what LoadHitContext substitutes in traditional mode so the rest of
+// the closest-hit logic stays unchanged.
+ClusterMeta LoadClusterMetaDefault()
+{
+    ClusterMeta m;
+    m.colorIndex     = 0xFFFFFFFFu;  // sentinel: "no cluster colour, use 0.6 grey"
+    m.flags          = 0;
+    m.overrideRefl   = -1.0f;
+    m.overrideRefr   = -1.0f;
+    m.overrideIor    = -1.0f;
+    m.baseColorScale = 1.0f;
+    m.surfTintMul    = 0.0f;          // no cluster-rainbow tint contribution
+    m.refrTintMul    = 0.0f;
+    m.reflTintMul    = 0.0f;
+    m._pad0 = m._pad1 = m._pad2 = 0;
     return m;
 }
 
@@ -389,29 +418,53 @@ struct HitContext
 
 void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
 {
-    const uint cid = ClusterID();
-    ctx.meta = LoadClusterMeta(cid);
-    ctx.mat  = g_materials[InstanceID()];
+    const bool isTraditional = (g_scene.runtimeParams.z != 0u);
+    const uint primIdx = PrimitiveIndex();
+    uint  i0, i1, i2;
+    float3 n0, n1, n2;
 
-    // Per-cluster material overrides (sentinel <0 = no override).
-    if (ctx.meta.overrideRefl >= 0.0) ctx.mat.reflectivity = ctx.meta.overrideRefl;
-    if (ctx.meta.overrideRefr >= 0.0) ctx.mat.refractivity = ctx.meta.overrideRefr;
-    if (ctx.meta.overrideIor  >= 0.0) ctx.mat.ior          = ctx.meta.overrideIor;
-    ctx.mat.baseColor.xyz *= ctx.meta.baseColorScale;
+    if (isTraditional)
+    {
+        // Traditional (DXR1) path: per-instance offsets table; each instance
+        // has its own slice of g_tradNormals (per-vertex) and g_tradIndices
+        // (per-triangle, object-local).  No per-cluster meta -- material
+        // applies as-is from g_materials[InstanceID()].
+        ctx.meta = LoadClusterMetaDefault();
+        ctx.mat  = g_materials[InstanceID()];
 
-    // ============================================================================
-    // World-space surface normal: smoothed via per-vertex cluster-normal
-    // side-channel keyed by (ClusterID, PrimitiveIndex).
-    // ============================================================================
-    uint primIdx = PrimitiveIndex();
-    uint2 off    = g_clusterOffsets.Load2(cid * 8);
-    uint  idxBase= (off.y + primIdx * 3) * 4;
-    uint  i0     = g_clusterIndices.Load(idxBase + 0);
-    uint  i1     = g_clusterIndices.Load(idxBase + 4);
-    uint  i2     = g_clusterIndices.Load(idxBase + 8);
-    float3 n0    = asfloat(g_clusterNormals.Load3((off.x + i0) * 16));
-    float3 n1    = asfloat(g_clusterNormals.Load3((off.x + i1) * 16));
-    float3 n2    = asfloat(g_clusterNormals.Load3((off.x + i2) * 16));
+        uint2 off    = g_tradOffsets.Load2(InstanceID() * 8);
+        uint  idxBase= (off.y + primIdx * 3) * 4;
+        i0 = g_tradIndices.Load(idxBase + 0);
+        i1 = g_tradIndices.Load(idxBase + 4);
+        i2 = g_tradIndices.Load(idxBase + 8);
+        n0 = asfloat(g_tradNormals.Load3((off.x + i0) * 16));
+        n1 = asfloat(g_tradNormals.Load3((off.x + i1) * 16));
+        n2 = asfloat(g_tradNormals.Load3((off.x + i2) * 16));
+    }
+    else
+    {
+        // Clustered (DXR2) path: per-cluster meta + per-cluster vertex
+        // normals indexed by ClusterID() + PrimitiveIndex().
+        const uint cid = ClusterID();
+        ctx.meta = LoadClusterMeta(cid);
+        ctx.mat  = g_materials[InstanceID()];
+
+        // Per-cluster material overrides (sentinel <0 = no override).
+        if (ctx.meta.overrideRefl >= 0.0) ctx.mat.reflectivity = ctx.meta.overrideRefl;
+        if (ctx.meta.overrideRefr >= 0.0) ctx.mat.refractivity = ctx.meta.overrideRefr;
+        if (ctx.meta.overrideIor  >= 0.0) ctx.mat.ior          = ctx.meta.overrideIor;
+        ctx.mat.baseColor.xyz *= ctx.meta.baseColorScale;
+
+        uint2 off    = g_clusterOffsets.Load2(cid * 8);
+        uint  idxBase= (off.y + primIdx * 3) * 4;
+        i0 = g_clusterIndices.Load(idxBase + 0);
+        i1 = g_clusterIndices.Load(idxBase + 4);
+        i2 = g_clusterIndices.Load(idxBase + 8);
+        n0 = asfloat(g_clusterNormals.Load3((off.x + i0) * 16));
+        n1 = asfloat(g_clusterNormals.Load3((off.x + i1) * 16));
+        n2 = asfloat(g_clusterNormals.Load3((off.x + i2) * 16));
+    }
+
     float  bw1   = a.bary.x;
     float  bw2   = a.bary.y;
     float  bw0   = 1.0 - bw1 - bw2;

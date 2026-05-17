@@ -35,6 +35,12 @@ namespace GlobalRootSig {
                                     //                                                      vertOff, idxOff)
         ClusterMetaSRVSlot,         // Refactor: ByteAddressBuffer of ClusterMeta[] - data-driven
                                     //           per-cluster material/colour override metadata.
+        // ---- Project 4: traditional (DXR1) per-instance shader-side
+        // lookup buffers.  Bound at the same time as the cluster buffers;
+        // shader picks which set to use based on g_scene.geometryMode.
+        TradNormalsSRVSlot,         // float3-padded[] per-vertex normals (concatenated objs)
+        TradIndicesSRVSlot,         // uint32[] per-triangle indices (object-local)
+        TradOffsetsSRVSlot,         // uint2[]  per-instance (normalsBase, indicesBase)
         Count
     };
 }
@@ -147,6 +153,14 @@ private:
     UINT64 m_traditionalStaticTotalResultBytes  = 0;
     UINT64 m_traditionalStaticTotalScratchBytes = 0;
     double m_traditionalStaticBuildMs            = 0.0;
+    // Shader-side per-vertex normal / per-triangle index / per-instance
+    // offset buffers for the traditional path's smooth shading.  See
+    // BuildTraditionalShaderSideBuffers (called from BuildTraditionalStaticAS)
+    // for the layout.  Indexed in the closest-hit by InstanceID() +
+    // PrimitiveIndex() when m_geometryMode == Traditional.
+    ComPtr<ID3D12Resource>               m_tradNormalsBuffer;
+    ComPtr<ID3D12Resource>               m_tradIndicesBuffer;
+    ComPtr<ID3D12Resource>               m_tradOffsetsBuffer;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
     // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
@@ -608,6 +622,12 @@ private:
     UINT                                 m_clusterIndicesCount = 0;
     UINT                                 m_clusterOffsetsCount = 0;
     void BuildClusterShaderSideBuffers();
+    // Per-instance shader-side buffers for traditional (DXR1) hits.
+    // Built unconditionally at init regardless of m_geometryMode so the
+    // root signature always has valid bindings -- the closest-hit picks
+    // which set to use (cluster vs traditional) per hit via a scene-CB
+    // flag.  See m_tradNormalsBuffer / m_tradIndicesBuffer / m_tradOffsetsBuffer.
+    void BuildTraditionalShaderSideBuffers();
 
     // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -

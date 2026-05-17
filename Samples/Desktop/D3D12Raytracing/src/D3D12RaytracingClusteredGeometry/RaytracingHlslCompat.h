@@ -34,10 +34,13 @@ struct SceneConstantBuffer
     // Runtime tweakable knobs (live-cycled via the keyboard, see OnKeyDown).
     // Kept distinct from miscParams so adding more sliders doesn't disturb
     // the existing fields the raygen / closesthit shaders already read.
-    XMUINT4   runtimeParams;     // .x = max ray bounces (0..16, applied to BOTH
-                                 //      reflection AND refraction recursion in
-                                 //      Opaque/GlassHit). 0 = primary only.
-                                 // .y/.z/.w reserved for future sliders.
+    XMUINT4   runtimeParams;     // .x = max reflection bounces (0..5).
+                                 // .y = max refraction bounces (0..5).
+                                 // .z = geometryMode (0 = clustered/DXR2 -- use
+                                 //      ClusterID() lookups; 1 = traditional/
+                                 //      DXR1 -- use InstanceID() + per-instance
+                                 //      offsets table).
+                                 // .w reserved for future sliders.
 };
 
 // Per-instance material.  Each instance carries an independent BLEND of

@@ -376,6 +376,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildAccelerationStructures();
     SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
     BuildClusterShaderSideBuffers();
+    SampleLog::Write(L">>> BuildTraditionalShaderSideBuffers\n");
+    BuildTraditionalShaderSideBuffers();
     SampleLog::Write(L">>> BuildClusterMetadata\n");
     BuildClusterMetadata();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
@@ -2209,6 +2211,65 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
     m_traditionalStaticBuildMs           = cpuMs;
 }
 
+// =====================================================================================
+// Build per-instance shader-side buffers for the traditional path's smooth
+// shading.  Called once at init regardless of m_geometryMode so the global
+// root signature always has valid SRV bindings on slots TradNormals /
+// TradIndices / TradOffsets -- the closest-hit chooses which set to use
+// (cluster vs traditional) per hit via a scene-CB flag.
+//
+// Layout (concatenated across all objects in m_objects order):
+//   m_tradNormalsBuffer : XMFLOAT4[]  per-vertex normals (.w padded to 16B
+//                                     to match ByteAddressBuffer.Load3 stride)
+//   m_tradIndicesBuffer : uint32[]    per-triangle vertex indices (object-
+//                                     local: each index addresses that
+//                                     object's slice of the normals buffer)
+//   m_tradOffsetsBuffer : XMUINT2[N_obj]  indexed by InstanceID:
+//                                         .x = normals base, .y = indices base
+// Vertex ordering within an object is cluster-major (same order as
+// obj.tradVertexBuffer + m_clusterNormalsBuffer), so cluster-mode and
+// traditional-mode lookups produce identical normals for the same world-
+// space hit point.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildTraditionalShaderSideBuffers()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    std::vector<XMFLOAT4> allNormals;
+    std::vector<UINT32>   allIndices;
+    std::vector<XMUINT2>  offsets(m_objects.size(), XMUINT2(0u, 0u));
+    for (size_t oi = 0; oi < m_objects.size(); ++oi)
+    {
+        const auto& obj = m_objects[oi];
+        offsets[oi].x = (UINT)allNormals.size();
+        offsets[oi].y = (UINT)allIndices.size();
+        UINT vertOffset = 0;
+        for (const auto& cl : obj.mesh.clusters)
+        {
+            for (const auto& n : cl.normals)
+                allNormals.push_back(XMFLOAT4(n.x, n.y, n.z, 0.0f));
+            for (auto i : cl.indices)
+                allIndices.push_back((UINT32)i + vertOffset);
+            vertOffset += (UINT)cl.positions.size();
+        }
+    }
+    AllocateUploadBuffer(device, allNormals.data(),
+                         allNormals.size() * sizeof(XMFLOAT4),
+                         &m_tradNormalsBuffer, L"Traditional per-vertex normals (per-instance)");
+    AllocateUploadBuffer(device, allIndices.data(),
+                         allIndices.size() * sizeof(UINT32),
+                         &m_tradIndicesBuffer, L"Traditional per-triangle indices (per-instance)");
+    AllocateUploadBuffer(device, offsets.data(),
+                         offsets.size() * sizeof(XMUINT2),
+                         &m_tradOffsetsBuffer, L"Traditional per-instance offset table");
+    SampleLog::LogF(L"[traditional shader-side] %zu normals + %zu indices + %zu offset slots (~%zu KB)\n",
+                    allNormals.size(), allIndices.size(), offsets.size(),
+                    (allNormals.size() * sizeof(XMFLOAT4)
+                     + allIndices.size() * sizeof(UINT32)
+                     + offsets.size() * sizeof(XMUINT2)) / 1024);
+}
+
+
 
 void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
 {
@@ -3578,6 +3639,14 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         // per-instance / per-cid-range branches in the closesthit.  See
         // RaytracingHlslCompat.h ClusterMeta.
         params[GlobalRootSig::ClusterMetaSRVSlot].InitAsShaderResourceView(5);
+        // Traditional-path shader-side buffers (Project 4).  Same trick
+        // as the cluster channels but indexed by InstanceID() + the
+        // per-instance offset table instead of by ClusterID().  Bound
+        // unconditionally; the closest-hit picks which set to use based
+        // on a scene-CB flag.
+        params[GlobalRootSig::TradNormalsSRVSlot].InitAsShaderResourceView(6);
+        params[GlobalRootSig::TradIndicesSRVSlot].InitAsShaderResourceView(7);
+        params[GlobalRootSig::TradOffsetsSRVSlot].InitAsShaderResourceView(8);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -4673,6 +4742,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // in RaytracingHlslCompat.h for the slot reservations.
     cb.runtimeParams.x = ReflectionBounces();                      // computed from m_bounceSlider
     cb.runtimeParams.y = RefractionBounces();                      // ditto (= refl or refl+2 with clamps)
+    cb.runtimeParams.z = IsTraditional() ? 1u : 0u;                // 1 -> closest-hit uses per-instance lookups instead of ClusterID
     // Sun in upper-back-right. Direction TO the light, normalized. .w is the
     // ambient floor: even fully-shadowed pixels get this fraction of base
     // colour so the scene reads instead of going pitch black.
@@ -4969,6 +5039,12 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         m_clusterOffsetsBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterMetaSRVSlot,
         m_clusterMetaBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradNormalsSRVSlot,
+        m_tradNormalsBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradIndicesSRVSlot,
+        m_tradIndicesBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradOffsetsSRVSlot,
+        m_tradOffsetsBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();

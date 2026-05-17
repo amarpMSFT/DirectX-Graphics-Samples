@@ -47,6 +47,11 @@
 //
 //---------------------------------------------------------------------------
 
+// Pulls in DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND for the
+// BaseGeometryIndex stamping gate further down.
+#define HLSL
+#include "RaytracingHlslCompat.h"
+
 cbuffer Constants : register(b0)
 {
     uint g_baseGpuVaLo;
@@ -108,19 +113,14 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint2 ibGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, ibOff);
 
     // BaseGeometryIndex packed into upper 24 bits of BaseGeometryIndexAndFlags.
-    // KNOWN LIMITATION on the NVIDIA DXR2 preview driver: non-zero
-    // BaseGeometryIndex on CLAS causes a TDR hang in
-    // BUILD_BLAS_FROM_CLAS (tried Apr 2026 SDK on RTX 4090).  The
-    // traditional path uses its own D3D12_RAYTRACING_GEOMETRY_DESC
-    // arrays so GeometryIndex() works there normally; the cluster
-    // path therefore keeps all CLAS at BaseGeometryIndex=0 and
-    // recovers per-region material via the per-cluster meta table
-    // (ClusterMeta::materialSlot, keyed on ClusterID() in the shader).
-    // When the driver bug is fixed, change `0u` to `matRegionIdx`
-    // below and drop the per-cluster materialSlot fallback in the
-    // cluster path -- both paths can then use the same shader-table
-    // GeometryIndex() routing.
+    // See RaytracingHlslCompat.h's DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
+    // gate for the rationale -- non-zero values currently hang
+    // BUILD_BLAS_FROM_CLAS on the NVIDIA DXR2 preview driver.
+#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
     const uint baseGeomIdxAndFlags = (0u << 8) | (opaqueFlag & 0xFFu);
+#else
+    const uint baseGeomIdxAndFlags = (matRegionIdx << 8) | (opaqueFlag & 0xFFu);
+#endif
 
     const uint baseByte = idx * 80u;
     g_argsOut.Store (baseByte +  0, clusterID);                                                // ClusterID

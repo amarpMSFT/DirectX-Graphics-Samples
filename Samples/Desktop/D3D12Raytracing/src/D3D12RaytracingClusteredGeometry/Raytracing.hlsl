@@ -89,9 +89,15 @@ ClusterMeta LoadClusterMeta(uint cid)
     m.surfTintMul    = asfloat(g_clusterMeta.Load(base + 24));
     m.refrTintMul    = asfloat(g_clusterMeta.Load(base + 28));
     m.reflTintMul    = asfloat(g_clusterMeta.Load(base + 32));
+#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
     m.materialSlot   = g_clusterMeta.Load(base + 36);
     m._pad0          = 0;
     m._pad1          = 0;
+#else
+    m._pad0          = 0;
+    m._pad1          = 0;
+    m._pad2          = 0;
+#endif
     return m;
 }
 
@@ -460,33 +466,35 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
 
     ctx.meta = LoadClusterMeta(cid);
     {
-        // Material slot lookup -- per-region (multi-material objects).
-        //   Cluster path: BaseGeometryIndex stamping on CLAS is currently
-        //                 broken on the NVIDIA DXR2 preview driver, so
-        //                 GeometryIndex() in the closest-hit always
-        //                 returns 0.  We use ClusterMeta::materialSlot
-        //                 (CPU-baked from each cluster's matRegionIdx +
-        //                 ClusterObject::perRegionMaterialSlot) instead.
-        //   Traditional path: GeometryIndex() correctly returns the
-        //                 per-region geom-desc slot (real DXR1 BLAS
-        //                 with one geom desc per material region), so
-        //                 we route the lookup through
-        //                 g_perInstGeomMaterial[InstIdx*MaxGeoms + GeomIdx].
-        //                 This is the canonical DXR way to express
-        //                 multi-material objects -- combined with
-        //                 MultiplierForGeometryContributionToHitGroupIndex=2
-        //                 the chrome region routes to OpaqueHitGroup
-        //                 (no any-hit dispatch) and the glass region
-        //                 routes to GlassHitGroup (any-hit runs).
-        // When the driver bug is fixed both paths can use the
-        // GeometryIndex() route and ClusterMeta::materialSlot becomes
-        // redundant.
+        // Per-(region) material lookup.  Canonical path: every hit reads
+        // g_perInstGeomMaterial[InstanceIndex()*MaxGeoms + GeometryIndex()]
+        // -- the geometry-index slot is set up correctly in both modes
+        // (trad path via per-region geom-desc layout, cluster path via
+        // BaseGeometryIndex stamping on each CLAS).  Combined with
+        // MultiplierForGeometryContributionToHitGroupIndex=2 in TraceRay
+        // this is what gets the chrome region of the mixed sphere to
+        // OpaqueHitGroup (no any-hit dispatch) and the glass region to
+        // GlassHitGroup automatically -- the canonical DXR way to
+        // express multi-material objects.
+        //
+        // Workaround path: the cluster path falls back to per-cluster
+        // ClusterMeta::materialSlot (CPU-baked from matRegionIdx +
+        // ClusterObject::perRegionMaterialSlot), because the NVIDIA
+        // DXR2 preview driver hangs on non-zero CLAS BaseGeometryIndex
+        // so GeometryIndex() in cluster mode is stuck at 0 and the
+        // canonical lookup would always return geom 0's material.
+        // See RaytracingHlslCompat.h for the gate definition.
         uint matSlot;
+#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
         if (isTraditional)
             matSlot = g_perInstGeomMaterial.Load(
                 (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
         else
             matSlot = ctx.meta.materialSlot;
+#else
+        matSlot = g_perInstGeomMaterial.Load(
+            (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
+#endif
         ctx.mat = g_materials[matSlot];
     }
 

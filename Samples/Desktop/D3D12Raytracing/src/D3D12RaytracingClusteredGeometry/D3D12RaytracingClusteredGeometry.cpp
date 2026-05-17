@@ -1145,15 +1145,18 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
             m.surfTintMul    = surfTintMul;
             m.refrTintMul    = refrTintMul;
             m.reflTintMul    = reflTintMul;
-            // Per-cluster material slot: cluster-path closest-hit
-            // reads this in lieu of g_materials[InstanceID()] so multi-
-            // material objects work even though we can't currently
-            // stamp BaseGeometryIndex on CLAS (driver bug).  For
-            // single-material objects this just == defaultMaterialSlot
-            // (which is obj.instanceID).
+#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
+            // Per-cluster material slot for the cluster-path fallback
+            // (see RaytracingHlslCompat.h driver-workaround gate).  When
+            // the gate goes to 0 this whole field disappears and the
+            // cluster path joins the trad path on g_perInstGeomMaterial.
             m.materialSlot   = (perRegionMaterialSlot && c.matRegionIdx < perRegionMaterialSlot->size())
                                 ? (*perRegionMaterialSlot)[c.matRegionIdx]
                                 : defaultMaterialSlot;
+#else
+            (void)perRegionMaterialSlot;
+            (void)defaultMaterialSlot;
+#endif
 
             if (checker.enabled)
             {

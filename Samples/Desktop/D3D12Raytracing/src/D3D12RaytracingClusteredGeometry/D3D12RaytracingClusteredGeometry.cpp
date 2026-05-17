@@ -4474,11 +4474,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double prevScrMb  = p.traditionalBlasScratchBytes / (1024.0 * 1024.0);
         const double inputsMb   = (s.traditionalVbBytes + s.traditionalIbBytes) / (1024.0 * 1024.0);
         const double prevInpMb  = (p.traditionalVbBytes + p.traditionalIbBytes) / (1024.0 * 1024.0);
-        const UINT64 totalTris  = s.totalTriangleCount;
-        const double avgKb      = (totalTris > 0)
-            ? (double)s.traditionalBlasActualBytes / (double)totalTris / 1024.0 : 0.0;
-        const double prevAvgKb  = (p.traditionalBlasActualBytes > 0 && p.totalTriangleCount > 0)
-            ? (double)p.traditionalBlasActualBytes / (double)p.totalTriangleCount / 1024.0 : 0.0;
+        // Per-geometry-desc average -- one geom desc per cluster, so this
+        // is the apples-to-apples comparison vs the cluster panel's
+        // "KB/cl" line (both divide by the same denominator -- the total
+        // static cluster count).
+        const double avgKb      = (s.totalClusterCount > 0)
+            ? (double)s.traditionalBlasActualBytes / (double)s.totalClusterCount / 1024.0 : 0.0;
+        const double prevAvgKb  = (p.totalClusterCount > 0 && p.traditionalBlasActualBytes > 0)
+            ? (double)p.traditionalBlasActualBytes / (double)p.totalClusterCount / 1024.0 : 0.0;
 
         XMFLOAT2 c = pos;
         drawSeg(L"  BLAS ", c, kSubtle);
@@ -4486,8 +4489,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(L" MB alloc  (", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
         drawSeg(L" MB actual, avg ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.3f", avgKb), c, deltaColour(avgKb, prevAvgKb));
-        drawSeg(L" KB/tri)", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", avgKb), c, deltaColour(avgKb, prevAvgKb));
+        drawSeg(L" KB/geom)", c, kSubtle);
         pos.y += kLineH;
         c = pos;
         drawSeg(L"  scratch ", c, kSubtle);

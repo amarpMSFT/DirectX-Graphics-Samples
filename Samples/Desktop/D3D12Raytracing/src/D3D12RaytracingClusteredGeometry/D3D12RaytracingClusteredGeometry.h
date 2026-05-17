@@ -20,6 +20,8 @@
 #include <DirectXMath.h>
 #include <array>
 #include <chrono>
+#include <string>
+#include <vector>
 
 namespace GlobalRootSig {
     enum {
@@ -149,6 +151,44 @@ private:
     // implicit / cycling with [A] for users who want the "no post-process,
     // worst-case alloc" baseline to compare against.
     ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Compact;
+
+    // ---------- Static-AS per-frame rebuild mode (cycled via [R]) ----------
+    // Simulates LOD-driven AS churn by forcing rebuilds every frame even
+    // though the inputs don't actually change.  The timing readouts in the
+    // overlay show the per-frame cost.
+    //   None        - static AS built once at init (current default)
+    //   BlasOnly    - re-run BUILD_BLAS_FROM_CLAS every frame, in place
+    //   ClasAndBlas - re-run static CLAS build AND BLAS build every frame
+    //                 (only works in CLAS Implicit alloc-mode; in other
+    //                 modes the existing CLAS result buffer is sized for
+    //                 compacted/exact-fit output and can't safely host a
+    //                 re-run, so this falls back to BlasOnly with an
+    //                 overlay note)
+    enum class StaticRebuildMode { None, BlasOnly, ClasAndBlas };
+    StaticRebuildMode                    m_staticRebuildMode = StaticRebuildMode::None;
+    // Headless measurement helpers (set via --log-pf-every / --exit-after-frames /
+    // --at <frame>:<action>).  Zero = disabled.  Frame counter already exists
+    // as m_framesRendered.  See OnRender for usage.
+    UINT                                 m_logPfEveryFrames   = 0;
+    UINT                                 m_logRawPfEveryFrames = 0;
+    UINT                                 m_exitAfterFrames    = 0;
+    // Scheduled actions: each entry = (frame index, action key).  Action keys
+    // are short strings matched in OnRender; supported = "alloc-implicit" /
+    // "alloc-getsizes" / "alloc-compact" / "rebuild-none" / "rebuild-blas" /
+    // "rebuild-clas-blas" / "log" / "exit".  Multiple --at args allowed,
+    // executed in frame order (stable).
+    struct ScheduledAction { UINT frame; std::wstring action; };
+    std::vector<ScheduledAction>         m_scheduledActions;
+    const wchar_t*                       StaticRebuildModeName() const
+    {
+        switch (m_staticRebuildMode)
+        {
+        case StaticRebuildMode::None:        return L"off";
+        case StaticRebuildMode::BlasOnly:    return L"BLAS only";
+        case StaticRebuildMode::ClasAndBlas: return L"CLAS + BLAS";
+        }
+        return L"?";
+    }
 
     // ---------- Position-truncate bits (FLOAT32_3 mode only) ----------
     // Per-vertex float positions can have their LOW N mantissa bits zeroed
@@ -519,10 +559,13 @@ private:
     ComPtr<ID3D12QueryHeap>              m_pfQueryHeap;
     ComPtr<ID3D12Resource>               m_pfQueryReadback;
     static const UINT                    kBuildTimestampCount    = 8;
-    // 3 op pairs per frame: INSTANTIATE / BLAS-from-CLAS / TLAS rebuild.
-    // Splitting INSTANTIATE out from BLAS lets the overlay attribute time
-    // changes to vertex format and precision (which only affect INSTANTIATE).
-    static const UINT                    kPerFrameTsPerSlot      = 6;
+    // 5 op pairs per frame: INSTANTIATE / BLAS-from-CLAS (animated) /
+    // TLAS rebuild / static-BLAS rebuild / static-CLAS rebuild.  The
+    // last two are unused when m_staticRebuildMode == None (timestamps
+    // still recorded, just delta = ~0).  Splitting INSTANTIATE out from
+    // BLAS lets the overlay attribute time changes to vertex format and
+    // precision (which only affect INSTANTIATE).
+    static const UINT                    kPerFrameTsPerSlot      = 10;
     static const UINT                    kPerFrameRingSlots      = 3;
     UINT64                               m_timestampFrequency = 0;
     double                               m_clasBuildMs        = 0.0;
@@ -532,8 +575,10 @@ private:
     // Per-frame (EMA-smoothed) - split out so the precision / vertex-format
     // sweep can attribute time changes to the right op.
     double                               m_pfInstantiateMs    = 0.0;  // INSTANTIATE_CLUSTER_TEMPLATES alone
-    double                               m_pfBlasRebuildMs    = 0.0;  // BUILD_BLAS_FROM_CLAS alone
+    double                               m_pfBlasRebuildMs    = 0.0;  // BUILD_BLAS_FROM_CLAS alone (animated)
     double                               m_pfTlasRebuildMs    = 0.0;  // TLAS rebuild
+    double                               m_pfStaticBlasMs     = 0.0;  // [R] mode 1+2: re-run static BLAS
+    double                               m_pfStaticClasMs     = 0.0;  // [R] mode 2: re-run static CLAS
     UINT                                 m_pfWriteSlot        = 0;
     UINT                                 m_pfFramesCaptured   = 0;
     UINT64                               m_totalClasBytes     = 0;
@@ -569,6 +614,8 @@ private:
         double pfInstantiateMs           = 0.0;
         double pfBlasRebuildMs           = 0.0;
         double pfTlasRebuildMs           = 0.0;
+        double pfStaticBlasMs            = 0.0;  // [R] per-frame static BLAS
+        double pfStaticClasMs            = 0.0;  // [R] per-frame static CLAS
         bool   pfTimingValid             = false;
         // Cluster + tri counts (only change when geometry changes; updated at rebuild).
         UINT   totalClusterCount         = 0;
@@ -589,11 +636,35 @@ private:
     // wall-clock (animation-pause independent).
     std::chrono::steady_clock::time_point m_overlayStatsDeltaUntil =
         std::chrono::steady_clock::time_point::min();
-    // Number of frames remaining before we snap the timing values from the
-    // ring-buffer EMA into m_overlayStats.  Set to kPerFrameRingSlots + a
-    // small margin at the end of every rebuild; decremented each frame; once
-    // it reaches 0 we capture and set m_overlayStats.pfTimingValid = true.
-    INT                                  m_overlayStatsArmCountdown = 0;
+    // Per-frame timing snapshot: rolling fixed-window mean of N raw samples,
+    // continuously refreshed (~1 s at 60 FPS).  Numbers in the overlay
+    // update live so users can see current GPU cost evolving; the red/green
+    // delta colouring is gated separately to a 5-second window after each
+    // mode toggle (see m_overlayStatsDeltaUntil + m_overlayStatsPrev) so
+    // colour reflects "what changed because of the toggle", not just the
+    // tiny frame-to-frame noise of the rolling refresh.
+    //
+    // On toggle (CaptureOverlayStatsSnapshot):
+    //   - Save current overlay values to m_overlayStatsPrev (colour baseline)
+    //   - Reset the accumulator and skip kPerFrameRingSlots readbacks so the
+    //     first new snap is fully post-toggle data
+    //
+    // Each frame:
+    //   - If still skipping, decrement and return
+    //   - Else accumulate this frame's raw deltas
+    //   - When kSnapshotSampleCount samples have been collected, divide and
+    //     write into m_overlayStats, then immediately start the next window
+    static const INT                     kSnapshotSampleCount = 60;
+    INT                                  m_pfSnapSkipFramesLeft   = 0;
+    INT                                  m_pfSnapSamplesCollected = 0;
+    struct PfSnapAccum {
+        double instMs       = 0.0;
+        double blasMs       = 0.0;
+        double tlasMs       = 0.0;
+        double staticBlasMs = 0.0;
+        double staticClasMs = 0.0;
+    };
+    PfSnapAccum                          m_pfSnapAccum;
 
     // ---------- App state ----------
     StepTimer m_timer;
@@ -630,6 +701,11 @@ private:
     void BuildBlasFromClasIndirect();
     void BuildTlasClassic();
     void RebuildTlasPerFrame();
+    // Per-frame static-AS rebuild paths (driven by m_staticRebuildMode = [R]).
+    // Both re-issue their RTAS op against the existing static buffers (no
+    // allocations).  Caller emits the surrounding EndQuery timestamps.
+    void RebuildStaticBlasPerFrame();
+    void RebuildStaticClasPerFrame();
     void BuildAnimatedObjectSetup();          // generates mesh, builds templates ONCE
     // Per-frame animated rebuild.  When pfTimestampBase != UINT_MAX the
     // function emits two timestamp pairs against m_pfQueryHeap at

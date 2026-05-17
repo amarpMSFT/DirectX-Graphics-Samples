@@ -376,8 +376,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildAccelerationStructures();
     SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
     BuildClusterShaderSideBuffers();
-    SampleLog::Write(L">>> BuildTraditionalShaderSideBuffers\n");
-    BuildTraditionalShaderSideBuffers();
+    SampleLog::Write(L">>> BuildPerInstanceFirstCidTable\n");
+    BuildPerInstanceFirstCidTable();
     SampleLog::Write(L">>> BuildClusterMetadata\n");
     BuildClusterMetadata();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
@@ -2116,57 +2116,93 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
     UINT64 totalScratchBytes = 0;
     UINT64 totalVbBytes      = 0;
     UINT64 totalIbBytes      = 0;
+    UINT   totalGeomDescs    = 0;
 
     for (auto& obj : m_objects)
     {
-        // Concatenate per-cluster vertex + index data.
+        // -------------------------------------------------------------
+        // One BLAS per object, ONE GEOMETRY DESC PER CLUSTER.
+        //
+        // The traditional / DXR1 way to express what the cluster path
+        // calls "clusters" is multiple D3D12_RAYTRACING_GEOMETRY_DESC
+        // entries in a single BLAS, each pointing at a slice of the
+        // per-object vertex+index buffer.  At hit time the shader uses
+        // GeometryIndex() (DXR1.1 intrinsic) to discover which slice
+        // (== which cluster) was hit; combined with a per-instance
+        // first-cluster-ID lookup it recovers the same global cluster
+        // ID the cluster path's ClusterID() returns -- so the same
+        // g_clusterMeta / g_clusterNormals / g_clusterIndices /
+        // g_clusterOffsets buffers feed both paths.  Result: identical
+        // visuals on the same scene with no per-path extra data.
+        //
+        // Vertex / index layout per object:
+        //   VB = [cluster 0 verts][cluster 1 verts]...[cluster N-1 verts]
+        //   IB = [cluster 0 idx ][cluster 1 idx ]...[cluster N-1 idx ]
+        // Each cluster's indices are 0-based INTO ITS OWN VB SLICE -- the
+        // geometry desc's VertexBuffer.StartAddress is biased per cluster
+        // so each cluster's index 0 points at the cluster's first vertex.
+        // -------------------------------------------------------------
         std::vector<XMFLOAT3> verts;
         std::vector<UINT32>   idx32;
-        UINT vertOffset = 0;
-        for (const auto& cl : obj.mesh.clusters)
+        std::vector<size_t>   clusterVbByteOff(obj.clusterCount);
+        std::vector<size_t>   clusterIbByteOff(obj.clusterCount);
+        std::vector<UINT>     clusterVertCount(obj.clusterCount);
+        std::vector<UINT>     clusterTriCount(obj.clusterCount);
+        for (UINT c = 0; c < obj.clusterCount; ++c)
         {
+            const auto& cl = obj.mesh.clusters[c];
+            clusterVbByteOff[c] = verts.size() * sizeof(XMFLOAT3);
             for (const auto& p : cl.positions)
                 verts.push_back({ p.x, p.y, p.z });
+            clusterIbByteOff[c] = idx32.size() * sizeof(UINT32);
             for (auto i : cl.indices)
-                idx32.push_back((UINT32)i + vertOffset);
-            vertOffset += (UINT)cl.positions.size();
+                idx32.push_back((UINT32)i);   // cluster-local: addresses this cluster's VB slice
+            clusterVertCount[c] = (UINT)cl.positions.size();
+            clusterTriCount[c]  = (UINT)(cl.indices.size() / 3);
         }
         obj.tradVertexCount   = (UINT)verts.size();
         obj.tradTriangleCount = (UINT)(idx32.size() / 3);
 
         AllocateUploadBuffer(device, verts.data(), verts.size() * sizeof(XMFLOAT3),
-                             &obj.tradVertexBuffer, L"Traditional vertices");
+                             &obj.tradVertexBuffer, L"Traditional vertices (per-object, cluster-major)");
         AllocateUploadBuffer(device, idx32.data(), idx32.size() * sizeof(UINT32),
-                             &obj.tradIndexBuffer,  L"Traditional indices");
+                             &obj.tradIndexBuffer,  L"Traditional indices (per-object, cluster-local)");
         totalVbBytes += verts.size() * sizeof(XMFLOAT3);
         totalIbBytes += idx32.size() * sizeof(UINT32);
 
-        // Geometry desc for the BLAS prebuild + build.  Material's opaque-
-        // ness is per-cluster in the cluster path; here we set per-object
-        // OPAQUE flag based on the material's translucency/refractivity
-        // -- same logic as the per-cluster path, applied at object grain.
+        // Per-cluster geometry descs.  Each points at this cluster's
+        // slice of the per-object VB/IB.  Opacity flag is per-object
+        // (matches the cluster path which derives it from the material).
         const auto& mat = m_materials[obj.instanceID];
         const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
-
-        D3D12_RAYTRACING_GEOMETRY_DESC geomDesc = {};
-        geomDesc.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-        geomDesc.Flags = isOpaqueLike
+        const auto geomFlag = isOpaqueLike
             ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
             : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-        geomDesc.Triangles.Transform3x4                = 0;
-        geomDesc.Triangles.IndexFormat                 = DXGI_FORMAT_R32_UINT;
-        geomDesc.Triangles.IndexCount                  = obj.tradTriangleCount * 3;
-        geomDesc.Triangles.IndexBuffer                 = obj.tradIndexBuffer->GetGPUVirtualAddress();
-        geomDesc.Triangles.VertexFormat                = DXGI_FORMAT_R32G32B32_FLOAT;
-        geomDesc.Triangles.VertexCount                 = obj.tradVertexCount;
-        geomDesc.Triangles.VertexBuffer.StartAddress   = obj.tradVertexBuffer->GetGPUVirtualAddress();
-        geomDesc.Triangles.VertexBuffer.StrideInBytes  = sizeof(XMFLOAT3);
+
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs(obj.clusterCount);
+        const auto vbGVA = obj.tradVertexBuffer->GetGPUVirtualAddress();
+        const auto ibGVA = obj.tradIndexBuffer->GetGPUVirtualAddress();
+        for (UINT c = 0; c < obj.clusterCount; ++c)
+        {
+            auto& gd = geomDescs[c];
+            gd.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            gd.Flags = geomFlag;
+            gd.Triangles.Transform3x4                = 0;
+            gd.Triangles.IndexFormat                 = DXGI_FORMAT_R32_UINT;
+            gd.Triangles.IndexCount                  = clusterTriCount[c] * 3;
+            gd.Triangles.IndexBuffer                 = ibGVA + clusterIbByteOff[c];
+            gd.Triangles.VertexFormat                = DXGI_FORMAT_R32G32B32_FLOAT;
+            gd.Triangles.VertexCount                 = clusterVertCount[c];
+            gd.Triangles.VertexBuffer.StartAddress   = vbGVA + clusterVbByteOff[c];
+            gd.Triangles.VertexBuffer.StrideInBytes  = sizeof(XMFLOAT3);
+        }
+        totalGeomDescs += obj.clusterCount;
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
         inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
         inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        inputs.NumDescs       = 1;
-        inputs.pGeometryDescs = &geomDesc;
+        inputs.NumDescs       = obj.clusterCount;
+        inputs.pGeometryDescs = geomDescs.data();
         inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
                               | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
 
@@ -2199,8 +2235,8 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 
     const auto t1 = std::chrono::steady_clock::now();
     const double cpuMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    SampleLog::LogF(L"[traditional BLAS] %zu objects, result=%llu  scratch=%llu  vb=%llu  ib=%llu (bytes) -- CPU=%.3f ms\n",
-                    m_objects.size(),
+    SampleLog::LogF(L"[traditional BLAS] %zu objects, %u geometry descs total (per-cluster), result=%llu  scratch=%llu  vb=%llu  ib=%llu (bytes) -- CPU=%.3f ms\n",
+                    m_objects.size(), totalGeomDescs,
                     (unsigned long long)totalResultBytes,
                     (unsigned long long)totalScratchBytes,
                     (unsigned long long)totalVbBytes,
@@ -2212,63 +2248,49 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 }
 
 // =====================================================================================
-// Build per-instance shader-side buffers for the traditional path's smooth
-// shading.  Called once at init regardless of m_geometryMode so the global
-// root signature always has valid SRV bindings on slots TradNormals /
-// TradIndices / TradOffsets -- the closest-hit chooses which set to use
-// (cluster vs traditional) per hit via a scene-CB flag.
+// Build the small per-instance cluster-ID lookup table used by the
+// traditional path's closest-hit.  One uint per TLAS instance: the
+// cluster ID of cluster 0 of that instance's object.  At hit time
+// the traditional shader computes
 //
-// Layout (concatenated across all objects in m_objects order):
-//   m_tradNormalsBuffer : XMFLOAT4[]  per-vertex normals (.w padded to 16B
-//                                     to match ByteAddressBuffer.Load3 stride)
-//   m_tradIndicesBuffer : uint32[]    per-triangle vertex indices (object-
-//                                     local: each index addresses that
-//                                     object's slice of the normals buffer)
-//   m_tradOffsetsBuffer : XMUINT2[N_obj]  indexed by InstanceID:
-//                                         .x = normals base, .y = indices base
-// Vertex ordering within an object is cluster-major (same order as
-// obj.tradVertexBuffer + m_clusterNormalsBuffer), so cluster-mode and
-// traditional-mode lookups produce identical normals for the same world-
-// space hit point.
+//     cid = g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
+//
+// to recover the SAME global cluster ID that ClusterID() returns on
+// the cluster path.  Combined with the per-cluster geometry-desc
+// layout of BuildTraditionalStaticAS (one geom desc per cluster
+// inside the per-object BLAS), this gives both paths read access to
+// the same g_clusterMeta / g_clusterNormals / g_clusterIndices /
+// g_clusterOffsets buffers and identical visuals.
+//
+// Built once at init regardless of m_geometryMode so the global root-
+// sig binding is always valid; only the traditional path actually
+// reads it.  Cost: 4 bytes per TLAS instance (i.e. ~32 bytes total).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildTraditionalShaderSideBuffers()
+void D3D12RaytracingClusteredGeometry::BuildPerInstanceFirstCidTable()
 {
     auto device = m_deviceResources->GetD3DDevice();
 
-    std::vector<XMFLOAT4> allNormals;
-    std::vector<UINT32>   allIndices;
-    std::vector<XMUINT2>  offsets(m_objects.size(), XMUINT2(0u, 0u));
-    for (size_t oi = 0; oi < m_objects.size(); ++oi)
-    {
-        const auto& obj = m_objects[oi];
-        offsets[oi].x = (UINT)allNormals.size();
-        offsets[oi].y = (UINT)allIndices.size();
-        UINT vertOffset = 0;
-        for (const auto& cl : obj.mesh.clusters)
-        {
-            for (const auto& n : cl.normals)
-                allNormals.push_back(XMFLOAT4(n.x, n.y, n.z, 0.0f));
-            for (auto i : cl.indices)
-                allIndices.push_back((UINT32)i + vertOffset);
-            vertOffset += (UINT)cl.positions.size();
-        }
-    }
-    AllocateUploadBuffer(device, allNormals.data(),
-                         allNormals.size() * sizeof(XMFLOAT4),
-                         &m_tradNormalsBuffer, L"Traditional per-vertex normals (per-instance)");
-    AllocateUploadBuffer(device, allIndices.data(),
-                         allIndices.size() * sizeof(UINT32),
-                         &m_tradIndicesBuffer, L"Traditional per-triangle indices (per-instance)");
-    AllocateUploadBuffer(device, offsets.data(),
-                         offsets.size() * sizeof(XMUINT2),
-                         &m_tradOffsetsBuffer, L"Traditional per-instance offset table");
-    SampleLog::LogF(L"[traditional shader-side] %zu normals + %zu indices + %zu offset slots (~%zu KB)\n",
-                    allNormals.size(), allIndices.size(), offsets.size(),
-                    (allNormals.size() * sizeof(XMFLOAT4)
-                     + allIndices.size() * sizeof(UINT32)
-                     + offsets.size() * sizeof(XMUINT2)) / 1024);
-}
+    // Animated ball's clusters are mapped to ClusterIDs in the 800+ range
+    // (see BuildClusterShaderSideBuffers::kAnimatedClusterIdOffset).  Mirror
+    // that here so the animated instance (when present) returns the same
+    // cid base from this table.
+    constexpr UINT kAnimatedClusterIdOffset = 800;
+    std::vector<UINT> firstCids;
+    firstCids.reserve(m_objects.size() + 1);
+    for (const auto& obj : m_objects)
+        firstCids.push_back(obj.mesh.clusters.empty() ? 0u : obj.mesh.clusters[0].clusterID);
+    if (m_animatedObjectEnabled)
+        firstCids.push_back(m_animatedObject.mesh.clusters.empty()
+            ? kAnimatedClusterIdOffset
+            : m_animatedObject.mesh.clusters[0].clusterID + kAnimatedClusterIdOffset);
 
+    AllocateUploadBuffer(device, firstCids.data(),
+                         firstCids.size() * sizeof(UINT),
+                         &m_perInstanceFirstCidBuffer,
+                         L"Per-instance first-cluster-ID lookup (traditional path)");
+    SampleLog::LogF(L"[traditional] per-instance-first-cid table: %zu entries (%zu bytes)\n",
+                    firstCids.size(), firstCids.size() * sizeof(UINT));
+}
 
 
 void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
@@ -3639,14 +3661,10 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         // per-instance / per-cid-range branches in the closesthit.  See
         // RaytracingHlslCompat.h ClusterMeta.
         params[GlobalRootSig::ClusterMetaSRVSlot].InitAsShaderResourceView(5);
-        // Traditional-path shader-side buffers (Project 4).  Same trick
-        // as the cluster channels but indexed by InstanceID() + the
-        // per-instance offset table instead of by ClusterID().  Bound
-        // unconditionally; the closest-hit picks which set to use based
-        // on a scene-CB flag.
-        params[GlobalRootSig::TradNormalsSRVSlot].InitAsShaderResourceView(6);
-        params[GlobalRootSig::TradIndicesSRVSlot].InitAsShaderResourceView(7);
-        params[GlobalRootSig::TradOffsetsSRVSlot].InitAsShaderResourceView(8);
+        // Tiny per-instance first-cluster-ID lookup (uint per TLAS
+        // instance) -- read only by the traditional-BLAS path so it can
+        // compute the same cid the cluster path's ClusterID() returns.
+        params[GlobalRootSig::PerInstanceFirstCidSRVSlot].InitAsShaderResourceView(6);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -4294,10 +4312,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     draw(L"SCENE:", pos, kAccent);
     pos.y += kLineH;
     if (isTraditional)
-        swprintf_s(buf, L"  %u BLAS  /  %s tris   (traditional / DXR1)",
+        swprintf_s(buf, L"  %u BLAS  /  %s tris   (traditional BLAS)",
                    sceneBlasCount, trisBuf);
     else
-        swprintf_s(buf, L"  %u BLAS  /  %u CLAS  /  %s tris   (clustered / DXR2)",
+        swprintf_s(buf, L"  %u BLAS  /  %u CLAS  /  %s tris   (clustered BLAS)",
                    sceneBlasCount, sceneClusterCount, trisBuf);
     draw(buf, pos, kSubtle);
     pos.y += kLineH + kSectionGap;
@@ -4603,7 +4621,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     {
         // [F] is only meaningful in traditional mode (animated BLAS
         // update strategy).  Hide in cluster mode.
-        swprintf_s(kbuf, L"   anim BLAS update: %s   (DXR1 ALLOW_UPDATE)",
+        swprintf_s(kbuf, L"   anim BLAS update: %s   (per-frame rebuild vs ALLOW_UPDATE refit)",
                    TraditionalAnimModeName());
         drawKeyLine(L"[F]", kbuf);
     }
@@ -5039,12 +5057,8 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         m_clusterOffsetsBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterMetaSRVSlot,
         m_clusterMetaBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradNormalsSRVSlot,
-        m_tradNormalsBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradIndicesSRVSlot,
-        m_tradIndicesBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradOffsetsSRVSlot,
-        m_tradOffsetsBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::PerInstanceFirstCidSRVSlot,
+        m_perInstanceFirstCidBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();

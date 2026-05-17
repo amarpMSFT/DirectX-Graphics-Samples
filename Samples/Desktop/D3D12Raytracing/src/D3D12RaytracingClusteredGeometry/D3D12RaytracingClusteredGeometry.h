@@ -35,12 +35,11 @@ namespace GlobalRootSig {
                                     //                                                      vertOff, idxOff)
         ClusterMetaSRVSlot,         // Refactor: ByteAddressBuffer of ClusterMeta[] - data-driven
                                     //           per-cluster material/colour override metadata.
-        // ---- Project 4: traditional (DXR1) per-instance shader-side
-        // lookup buffers.  Bound at the same time as the cluster buffers;
-        // shader picks which set to use based on g_scene.geometryMode.
-        TradNormalsSRVSlot,         // float3-padded[] per-vertex normals (concatenated objs)
-        TradIndicesSRVSlot,         // uint32[] per-triangle indices (object-local)
-        TradOffsetsSRVSlot,         // uint2[]  per-instance (normalsBase, indicesBase)
+        // Tiny per-instance first-cluster-ID lookup table used ONLY by
+        // the traditional-BLAS closest-hit (cluster path uses ClusterID()
+        // directly and never reads this).  Bound unconditionally so the
+        // root-sig is single-shape; the buffer is ~32 bytes total.
+        PerInstanceFirstCidSRVSlot,
         Count
     };
 }
@@ -153,14 +152,16 @@ private:
     UINT64 m_traditionalStaticTotalResultBytes  = 0;
     UINT64 m_traditionalStaticTotalScratchBytes = 0;
     double m_traditionalStaticBuildMs            = 0.0;
-    // Shader-side per-vertex normal / per-triangle index / per-instance
-    // offset buffers for the traditional path's smooth shading.  See
-    // BuildTraditionalShaderSideBuffers (called from BuildTraditionalStaticAS)
-    // for the layout.  Indexed in the closest-hit by InstanceID() +
-    // PrimitiveIndex() when m_geometryMode == Traditional.
-    ComPtr<ID3D12Resource>               m_tradNormalsBuffer;
-    ComPtr<ID3D12Resource>               m_tradIndicesBuffer;
-    ComPtr<ID3D12Resource>               m_tradOffsetsBuffer;
+    // Per-instance first-cluster-ID lookup table.  One uint per TLAS
+    // instance: the cluster ID of cluster 0 of that instance's object.
+    // Read by the traditional path's closest-hit as
+    //   cid = g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
+    // to recover the same global cluster ID the cluster path's
+    // ClusterID() returns -- so both paths use the same
+    // g_clusterMeta / g_clusterNormals / g_clusterIndices /
+    // g_clusterOffsets buffers and produce identical visuals.  See
+    // BuildPerInstanceFirstCidTable.
+    ComPtr<ID3D12Resource>               m_perInstanceFirstCidBuffer;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
     // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
@@ -622,12 +623,12 @@ private:
     UINT                                 m_clusterIndicesCount = 0;
     UINT                                 m_clusterOffsetsCount = 0;
     void BuildClusterShaderSideBuffers();
-    // Per-instance shader-side buffers for traditional (DXR1) hits.
-    // Built unconditionally at init regardless of m_geometryMode so the
-    // root signature always has valid bindings -- the closest-hit picks
-    // which set to use (cluster vs traditional) per hit via a scene-CB
-    // flag.  See m_tradNormalsBuffer / m_tradIndicesBuffer / m_tradOffsetsBuffer.
-    void BuildTraditionalShaderSideBuffers();
+    // Tiny per-instance lookup table used by the traditional-BLAS
+    // closest-hit to recover the global cluster ID without the cluster-
+    // path's DXR2 ClusterID() intrinsic.  4 bytes per TLAS instance --
+    // negligible.  Built unconditionally at init so the root-sig
+    // binding is always valid; only the traditional path reads it.
+    void BuildPerInstanceFirstCidTable();
 
     // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -

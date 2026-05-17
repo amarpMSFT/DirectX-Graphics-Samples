@@ -66,6 +66,13 @@ ByteAddressBuffer                 g_clusterMeta    : register(t5);
 #define MAX_GEOMS_PER_INSTANCE 8
 ByteAddressBuffer                 g_tradTriToCid      : register(t6);
 ByteAddressBuffer                 g_tradGeomTriBase   : register(t7);
+// Per-(InstanceIdx, GeometryIdx) -> material-slot lookup.  Replaces
+// the old g_materials[InstanceID()] indexing so multi-region objects
+// (the mixed-material small sphere, etc.) can present different
+// materials per geometry slot.  Single-region objects have only
+// entry 0 meaningful (set to the per-instance material slot, so the
+// lookup matches the legacy behaviour).
+ByteAddressBuffer                 g_perInstGeomMaterial : register(t8);
 
 ClusterMeta LoadClusterMeta(uint cid)
 {
@@ -82,9 +89,9 @@ ClusterMeta LoadClusterMeta(uint cid)
     m.surfTintMul    = asfloat(g_clusterMeta.Load(base + 24));
     m.refrTintMul    = asfloat(g_clusterMeta.Load(base + 28));
     m.reflTintMul    = asfloat(g_clusterMeta.Load(base + 32));
+    m.materialSlot   = g_clusterMeta.Load(base + 36);
     m._pad0          = 0;
     m._pad1          = 0;
-    m._pad2          = 0;
     return m;
 }
 
@@ -245,7 +252,7 @@ void RayGen()
             RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
             /*InstanceInclusionMask*/0xff,
             /*RayContributionToHitGroupIndex*/0,
-            /*MultiplierForGeometryContributionToHitGroupIndex*/0,
+            /*MultiplierForGeometryContributionToHitGroupIndex*/2,
             /*MissShaderIndex*/0,
             r, p);
         accum += p.color.rgb;
@@ -342,7 +349,7 @@ float ShadowVisibility(float3 hitPos, float3 nWorld, float3 toSun)
             | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER
             | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
             | RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
-        0xff, /*RayContrib*/1, /*MultiplierGeoContrib*/0, /*MissIdx*/1,
+        0xff, /*RayContrib*/1, /*MultiplierGeoContrib*/2, /*MissIdx*/1,
         shadow, sp);
     return sp.inShadow ? 0.0 : 1.0;
 }
@@ -367,7 +374,7 @@ float3 TraceBounce(float3 origin, float3 dir, uint cullFlags, uint childDepth, u
     bp.color   = float4(0, 0, 0, 1);
     bp.depth   = childDepth;        // dedicated write(caller)/read(closesthit) field
     bp.inGlass = childInGlass;      // 1 if the new ray is travelling INSIDE a glass volume
-    TraceRay(Scene, cullFlags, 0xff, /*RayContrib*/0, /*MultiplierGeoContrib*/0,
+    TraceRay(Scene, cullFlags, 0xff, /*RayContrib*/0, /*MultiplierGeoContrib*/2,
              /*MissIdx*/0, r, bp);
     return bp.color.rgb;
 }
@@ -452,7 +459,36 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
     }
 
     ctx.meta = LoadClusterMeta(cid);
-    ctx.mat  = g_materials[InstanceID()];
+    {
+        // Material slot lookup -- per-region (multi-material objects).
+        //   Cluster path: BaseGeometryIndex stamping on CLAS is currently
+        //                 broken on the NVIDIA DXR2 preview driver, so
+        //                 GeometryIndex() in the closest-hit always
+        //                 returns 0.  We use ClusterMeta::materialSlot
+        //                 (CPU-baked from each cluster's matRegionIdx +
+        //                 ClusterObject::perRegionMaterialSlot) instead.
+        //   Traditional path: GeometryIndex() correctly returns the
+        //                 per-region geom-desc slot (real DXR1 BLAS
+        //                 with one geom desc per material region), so
+        //                 we route the lookup through
+        //                 g_perInstGeomMaterial[InstIdx*MaxGeoms + GeomIdx].
+        //                 This is the canonical DXR way to express
+        //                 multi-material objects -- combined with
+        //                 MultiplierForGeometryContributionToHitGroupIndex=2
+        //                 the chrome region routes to OpaqueHitGroup
+        //                 (no any-hit dispatch) and the glass region
+        //                 routes to GlassHitGroup (any-hit runs).
+        // When the driver bug is fixed both paths can use the
+        // GeometryIndex() route and ClusterMeta::materialSlot becomes
+        // redundant.
+        uint matSlot;
+        if (isTraditional)
+            matSlot = g_perInstGeomMaterial.Load(
+                (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
+        else
+            matSlot = ctx.meta.materialSlot;
+        ctx.mat = g_materials[matSlot];
+    }
 
     // Per-cluster material overrides (sentinel <0 = no override).
     if (ctx.meta.overrideRefl >= 0.0) ctx.mat.reflectivity = ctx.meta.overrideRefl;

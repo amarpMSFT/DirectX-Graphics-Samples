@@ -125,7 +125,14 @@ struct ClusterMeta
     float surfTintMul;         // surface base-colour blend.  1.0 = use clusterTint as-is.
     float refrTintMul;         // refraction tint blend.  Default 0.50.
     float reflTintMul;         // reflection tint blend.  Default ~1.08 (= 0.70 / 0.65).
+    // Per-cluster material-slot override for multi-material objects.
+    // Cluster path reads this in the closest-hit (g_materials[materialSlot])
+    // because BaseGeometryIndex stamping is currently broken on the
+    // NVIDIA DXR2 preview driver (see FillClasFromTrianglesArgs.hlsl).
+    // For single-material clusters this is just the per-instance default
+    // (== obj.instanceID), so the lookup matches what
+    // g_materials[InstanceID()] used to give.
+    uint  materialSlot;
     uint  _pad0;
     uint  _pad1;
-    uint  _pad2;
 };

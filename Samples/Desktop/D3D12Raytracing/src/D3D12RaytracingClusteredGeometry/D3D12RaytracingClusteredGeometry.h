@@ -42,6 +42,11 @@ namespace GlobalRootSig {
         // clusters into one material-region geometry.
         TradTriToCidSRVSlot,
         TradGeomTriBaseSRVSlot,
+        // Per-(InstIdx, GeomIdx) material-slot lookup.  Read by both
+        // paths -- replaces the InstanceID()-based g_materials lookup
+        // so multi-geometry instances can present different materials
+        // per geom (the mixed-material small sphere demo).
+        PerInstGeomMaterialSRVSlot,
         Count
     };
 }
@@ -93,6 +98,16 @@ struct ClusterObject
     // don't care about orientation.
     DirectX::XMFLOAT3                        worldRotEuler = { 0, 0, 0 };
     UINT                                     instanceID    = 0;
+    // Per-(material-region) material-slot override.  Empty for single-
+    // region (single-material) objects -- closest-hit then falls back
+    // to instanceID for every region.  For mixed-material objects (one
+    // GeometryIndex() per matRegionIdx), provide one entry per region
+    // -- index N is the g_materials[] slot to use for the cluster's
+    // matRegionIdx == N.  Drives both the shader-side material lookup
+    // AND the InstanceContributionToHitGroupIndex picked at TLAS-
+    // build time (so geom 0 chrome -> OpaqueHitGroup, geom 1 glass ->
+    // GlassHitGroup via the shader-table multiplier).
+    std::vector<UINT>                        perRegionMaterialSlot;
 
     // ------------------------------------------------------------------
     // Per-object SCENE/ART config copied from SceneData::ObjectSpec at
@@ -172,6 +187,23 @@ private:
     // for the geom tri-base table.  See BuildTradCidLookup.
     ComPtr<ID3D12Resource>               m_tradTriToCidBuffer;
     ComPtr<ID3D12Resource>               m_tradGeomTriBaseBuffer;
+    // Per-(InstanceIdx, GeometryIdx) material slot lookup.  One uint
+    // per slot.  Closesthit reads
+    //   matSlot = g_perInstGeomMaterial[InstIdx*MaxGeoms + GeomIdx]
+    //   mat     = g_materials[matSlot]
+    // For single-region objects only entry 0 is meaningful (set to
+    // obj.instanceID so the lookup matches the legacy InstanceID()-
+    // based behaviour).  For multi-region objects (e.g. the mixed-
+    // material small sphere with chrome upper / glass lower) each
+    // region gets its own material slot.
+    //
+    // Combined with shader-table indexing
+    // MultiplierForGeometryContributionToHitGroupIndex=2, the chrome
+    // region routes to OpaqueHitGroup (no any-hit dispatch) and the
+    // glass region routes to GlassHitGroup (any-hit runs for
+    // stochastic translucency) -- no per-pixel branch needed.  This
+    // is the canonical DXR way to express multi-material objects.
+    ComPtr<ID3D12Resource>               m_perInstGeomMaterialBuffer;
     // Max geometries per instance the shader is willing to look up.
     // Padding for the flat per-(InstIdx, GeomIdx) layout.  Bump if a
     // future object grows past it.
@@ -668,6 +700,10 @@ private:
     // PrimitiveIndex()) -> cid.  Called as part of the traditional
     // build path; rebuilt on any geometry-mode toggle.
     void BuildTradCidLookup();
+    // Per-(InstIdx, GeomIdx) material-slot lookup.  Built unconditionally
+    // at init so the binding's always valid; rebuilt when scene clusters
+    // are re-emitted.  See m_perInstGeomMaterialBuffer.
+    void BuildPerInstGeomMaterialTable();
 
     // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -

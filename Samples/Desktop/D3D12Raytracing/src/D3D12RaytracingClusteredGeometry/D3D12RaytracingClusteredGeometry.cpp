@@ -387,6 +387,8 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     BuildClusterShaderSideBuffers();
     SampleLog::Write(L">>> BuildTradCidLookup\n");
     BuildTradCidLookup();   // built unconditionally for root-sig binding; cluster path doesn't read it
+    SampleLog::Write(L">>> BuildPerInstGeomMaterialTable\n");
+    BuildPerInstGeomMaterialTable();
     SampleLog::Write(L">>> BuildClusterMetadata\n");
     BuildClusterMetadata();
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
@@ -498,6 +500,69 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
         obj.reflTintMul   = s.reflTintMul;
         obj.nonOrientable = s.nonOrientable;
         m_objects.push_back(std::move(obj));
+    }
+
+    // -------------------------------------------------------------
+    // Mixed-material demo: split the smallest sphere (sphere3, was
+    // amethyst glass) into chrome upper hemisphere + amethyst glass
+    // lower hemisphere.  Per-cluster matRegionIdx assignment drives
+    //   - the cluster path's CLAS BaseGeometryIndex stamp (so
+    //     GeometryIndex() at hit time returns the region),
+    //   - the traditional path's per-region geom-desc layout (one
+    //     geom desc per region, NOT per cluster),
+    //   - per-(InstIdx, GeomIdx) material lookup
+    //     (chrome for region 0, amethyst glass for region 1),
+    //   - fixed-function shader-table routing via
+    //     MultiplierForGeometryContributionToHitGroupIndex=2 (chrome
+    //     hemisphere -> OpaqueHitGroup with no any-hit dispatch;
+    //     glass hemisphere -> GlassHitGroup whose any-hit runs for
+    //     stochastic translucency).
+    // Region split is by cluster centroid Y in object space -- the
+    // cluster's tile boundaries already align with parametric latitude
+    // rings on the UV sphere, so the equator is a clean cluster seam
+    // (no partial-cluster splits).
+    // -------------------------------------------------------------
+    // -------------------------------------------------------------
+    // Mixed-material demo: split the smallest sphere (sphere3, was
+    // amethyst glass) into chrome upper hemisphere + amethyst glass
+    // lower hemisphere.  Per-cluster matRegionIdx assignment drives:
+    //   - the traditional path's per-region geom-desc layout (one
+    //     geom desc per region, NOT per cluster) + per-(InstIdx,
+    //     GeomIdx) material lookup + fixed-function shader-table
+    //     routing via MultiplierForGeometryContributionToHitGroupIndex=2
+    //     so chrome hits OpaqueHitGroup (no any-hit dispatch) and
+    //     glass hits GlassHitGroup (any-hit runs).
+    //   - the cluster path's per-cluster material override via
+    //     ClusterMeta::materialSlot (CPU-baked from matRegionIdx +
+    //     ClusterObject::perRegionMaterialSlot).
+    //     [TODO: when the NVIDIA DXR2 preview driver fixes the
+    //     non-zero-BaseGeometryIndex hang on CLAS, the cluster path
+    //     can also route via GeometryIndex() and the per-cluster
+    //     materialSlot becomes redundant -- both paths converge.]
+    // Region split is by cluster centroid Y in object space -- the
+    // cluster's tile boundaries already align with parametric latitude
+    // rings on the UV sphere, so the equator is a clean cluster seam.
+    // -------------------------------------------------------------
+    for (auto& obj : m_objects)
+    {
+        if (obj.instanceID != 3) continue;  // only sphere3 (amethyst -> mixed)
+
+        for (auto& cl : obj.mesh.clusters)
+        {
+            float centroidY = 0.0f;
+            for (const auto& p : cl.positions) centroidY += p.y;
+            centroidY /= (float)cl.positions.size();
+            cl.matRegionIdx = (centroidY >= 0.0f) ? 0u : 1u;   // 0 = upper (chrome), 1 = lower (glass)
+        }
+        // Region 0 = chrome (material slot 0, same as sphere0's body).
+        // Region 1 = amethyst glass (material slot 3, sphere3's original).
+        obj.perRegionMaterialSlot = { 0u, 3u };
+        SampleLog::LogF(L"[mixed sphere] obj instanceID=%u split into 2 regions "
+                        L"(upper hemisphere -> material slot %u, lower -> %u)\n",
+                        obj.instanceID,
+                        obj.perRegionMaterialSlot[0],
+                        obj.perRegionMaterialSlot[1]);
+        break;
     }
 
     // Determine per-cluster offsets in the global cluster array (used by the
@@ -870,6 +935,9 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
         // is wired up separately in a follow-up step).
         BuildTraditionalStaticAS();
     }
+    // Per-(InstIdx, GeomIdx) material table must track the animated-
+    // enabled state (which flips between modes).
+    BuildPerInstGeomMaterialTable();
     BuildTlasClassic();
 
     m_deviceResources->ExecuteCommandList();
@@ -1063,7 +1131,9 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
     auto fillFromMesh = [&](const ProceduralGeometry::Mesh& mesh,
                             UINT cidOffset,
                             const CheckerConfig& checker,
-                            float surfTintMul, float refrTintMul, float reflTintMul)
+                            float surfTintMul, float refrTintMul, float reflTintMul,
+                            UINT defaultMaterialSlot,
+                            const std::vector<UINT>* perRegionMaterialSlot = nullptr)
     {
         for (const auto& c : mesh.clusters)
         {
@@ -1075,6 +1145,15 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
             m.surfTintMul    = surfTintMul;
             m.refrTintMul    = refrTintMul;
             m.reflTintMul    = reflTintMul;
+            // Per-cluster material slot: cluster-path closest-hit
+            // reads this in lieu of g_materials[InstanceID()] so multi-
+            // material objects work even though we can't currently
+            // stamp BaseGeometryIndex on CLAS (driver bug).  For
+            // single-material objects this just == defaultMaterialSlot
+            // (which is obj.instanceID).
+            m.materialSlot   = (perRegionMaterialSlot && c.matRegionIdx < perRegionMaterialSlot->size())
+                                ? (*perRegionMaterialSlot)[c.matRegionIdx]
+                                : defaultMaterialSlot;
 
             if (checker.enabled)
             {
@@ -1091,7 +1170,9 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
 
     for (const auto& obj : m_objects)
         fillFromMesh(obj.mesh, 0u, obj.checker,
-                     obj.surfTintMul, obj.refrTintMul, obj.reflTintMul);
+                     obj.surfTintMul, obj.refrTintMul, obj.reflTintMul,
+                     obj.instanceID,
+                     obj.perRegionMaterialSlot.empty() ? nullptr : &obj.perRegionMaterialSlot);
     if (m_animatedObjectEnabled)
     {
         // Animated object: alternating cluster checker - even parity
@@ -1108,7 +1189,8 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
         checker.oddParity.overrideRefr  = -1.0f;   // keep baseline refractivity (0.78)
         checker.oddParity.overrideIor   = -1.0f;   // keep baseline ior (2.4)
         fillFromMesh(m_animatedObject.mesh, kAnimatedClusterIdOffset,
-                     checker, /*surf*/1.0f, /*refr*/0.75f, /*refl*/1.20f);
+                     checker, /*surf*/1.0f, /*refr*/0.75f, /*refl*/1.20f,
+                     m_animatedObject.instanceID);
     }
 
     AllocateUploadBuffer(device, meta.data(), meta.size() * sizeof(ClusterMeta),
@@ -2590,6 +2672,67 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
                     geomTriBase.size(), geomTriBase.size() * sizeof(UINT));
 }
 
+// =====================================================================================
+// Per-(InstanceIdx, GeometryIdx) -> material-slot lookup table.
+//
+// Replaces the in-shader `g_materials[InstanceID()]` lookup with one
+// that's keyed on both the TLAS instance AND the per-region GeometryIndex().
+// For single-region objects the table just has one meaningful entry per
+// instance (set to obj.instanceID, so the closesthit gets the same
+// material it used to).  For multi-region objects (e.g. the mixed-
+// material small sphere with chrome upper / glass lower hemispheres)
+// each region gets its own entry pointing at whichever g_materials[]
+// slot the region should render as.
+//
+// Flat 2D layout: uint per (InstIdx, GeomIdx), padded to
+// kMaxGeomsPerInstance entries per instance.  Unused slots are 0.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildPerInstGeomMaterialTable()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+
+    // Include the animated instance (when enabled) -- InstanceIndex()
+    // ranges 0..N_static for the animated case, so the table must be
+    // sized to cover it.  Animated has a single region using its
+    // own per-instance material slot.
+    const UINT animSlots = m_animatedObjectEnabled ? 1u : 0u;
+    const UINT N_inst    = (UINT)m_objects.size() + animSlots;
+    std::vector<UINT> table(N_inst * kMaxGeomsPerInstance, 0);
+    for (size_t oi = 0; oi < m_objects.size(); ++oi)
+    {
+        const auto& obj = m_objects[oi];
+        // Discover how many regions the object actually uses (== max
+        // matRegionIdx + 1).  Skipped if perRegionMaterialSlot is set,
+        // in which case its size IS the region count.
+        UINT regionCount = (UINT)obj.perRegionMaterialSlot.size();
+        if (regionCount == 0)
+        {
+            for (const auto& cl : obj.mesh.clusters)
+                regionCount = std::max(regionCount, cl.matRegionIdx + 1);
+            if (regionCount == 0) regionCount = 1;
+        }
+        for (UINT r = 0; r < std::min(regionCount, kMaxGeomsPerInstance); ++r)
+        {
+            const UINT slot = (r < (UINT)obj.perRegionMaterialSlot.size())
+                ? obj.perRegionMaterialSlot[r]
+                : obj.instanceID;
+            table[oi * kMaxGeomsPerInstance + r] = slot;
+        }
+    }
+    if (m_animatedObjectEnabled)
+    {
+        // Animated instance: single-region with the animated obj's material slot.
+        table[m_objects.size() * kMaxGeomsPerInstance + 0] = m_animatedObject.instanceID;
+    }
+    AllocateUploadBuffer(device, table.data(),
+                         table.size() * sizeof(UINT),
+                         &m_perInstGeomMaterialBuffer,
+                         L"Per-(InstIdx, GeomIdx) material-slot lookup");
+    SampleLog::LogF(L"[per-inst-geom-material] %zu entries (%zu bytes)\n",
+                    table.size(), table.size() * sizeof(UINT));
+}
+
+
 void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
 {
     if (!m_blasArgsBuffer || !m_blasResultAddrBuffer || !m_blasScratchBuffer) return;
@@ -3693,11 +3836,32 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID  = obj.instanceID;
         instances[i].InstanceMask= 0xFF;
-        const bool isGlass = needsGlass(m_materials[obj.instanceID], obj);
+        // Hit-group contribution.  For multi-region objects we route
+        // by the FIRST region's material kind (geometryIndex 0 lands
+        // there with MultiplierForGeometryContributionToHitGroupIndex=2),
+        // and subsequent regions add Multiplier*GeomIdx to pick their
+        // own hit group automatically -- so the mixed sphere's chrome
+        // region (region 0, slot 0) lands at OpaqueHitGroup and its
+        // glass region (region 1, slot 3) lands at GlassHitGroup with
+        // NO per-pixel shader branch.
+        UINT firstRegionMatSlot = obj.perRegionMaterialSlot.empty()
+            ? obj.instanceID
+            : obj.perRegionMaterialSlot[0];
+        const bool firstIsGlass = needsGlass(m_materials[firstRegionMatSlot], obj);
+        // If this is a multi-region instance and ANY region is glass,
+        // we need any-hit (FORCE_OPAQUE would skip it).  Detect that
+        // separately from firstIsGlass for the FORCE_OPAQUE decision.
+        bool anyRegionIsGlass = firstIsGlass;
+        for (UINT r = 1; r < (UINT)obj.perRegionMaterialSlot.size(); ++r)
+        {
+            anyRegionIsGlass = anyRegionIsGlass ||
+                needsGlass(m_materials[obj.perRegionMaterialSlot[r]], obj);
+        }
         instances[i].InstanceContributionToHitGroupIndex =
-            isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
-        instances[i].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
-                                     : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+            firstIsGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
+        instances[i].Flags = anyRegionIsGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
+                                              : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        const bool isGlass = anyRegionIsGlass;  // for stats below
         // Non-orientable / self-intersecting surfaces need double-sided
         // traversal: their triangle winding doesn't have a consistent
         // global "outward" (Klein bottle's classic problem), and culling
@@ -3966,6 +4130,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         // compute the same cid the cluster path's ClusterID() returns.
         params[GlobalRootSig::TradTriToCidSRVSlot].InitAsShaderResourceView(6);
         params[GlobalRootSig::TradGeomTriBaseSRVSlot].InitAsShaderResourceView(7);
+        params[GlobalRootSig::PerInstGeomMaterialSRVSlot].InitAsShaderResourceView(8);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -5383,6 +5548,8 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         m_tradTriToCidBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradGeomTriBaseSRVSlot,
         m_tradGeomTriBaseBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::PerInstGeomMaterialSRVSlot,
+        m_perInstGeomMaterialBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();

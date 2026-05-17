@@ -58,18 +58,10 @@ int Win32Application::Run(DXSample* pSample, HINSTANCE hInstance, int nCmdShow)
         // Initialize the sample. OnInit is defined in each child-implementation of DXSample.
         pSample->OnInit();
 
-        // Default to maximised on real GPUs.  On WARP (CPU rasteriser) the
-        // raytracing throughput is hundreds of times lower, so a full-screen
-        // dispatch grinds to single-digit FPS -- we drop the window to its
-        // 1280x720 default so it stays interactive.  We sniff the adapter
-        // description for "WARP" / "Basic Render" (the two strings the
-        // d3d10warp.dll variants set); imperfect for the d3dconfig force-warp
-        // case where the adapter desc still shows the hardware adapter, but
-        // catches the common debug-fallback path.
         auto desc = pSample->GetDeviceResources()->GetAdapterDescription();
         bool isSoftwareAdapter = (wcsstr(desc, L"WARP") != nullptr) ||
                                  (wcsstr(desc, L"Basic Render") != nullptr);
-        ShowWindow(m_hwnd, isSoftwareAdapter ? SW_NORMAL : SW_MAXIMIZE);
+        ShowWindow(m_hwnd, SW_NORMAL);
 
         // On software adapters (WARP / Basic Render), spin up the async
         // display worker: the sample's OnRender (slow on a CPU rasterizer

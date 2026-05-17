@@ -252,9 +252,22 @@ private:
     UINT                                 m_totalClusterCount = 0;
     UINT                                 m_totalTriangleCount = 0;   // sum of all clusters' tris across static objects + animated (cached at scene-build time for the title bar)
 
-    // ---------- One big upload buffer holding all per-cluster vert+idx + the
-    // concatenated BUILD_CLAS_FROM_TRIANGLES_ARGS array. Built once at init. ----------
+    // ---------- One big upload buffer holding per-cluster vert+idx data
+    // for the static CLAS build.  Used to be interleaved with the args
+    // array too; now the args live in a separate DEFAULT-heap UAV
+    // (m_clasArgsBuffer below) so a compute shader can write them. ----------
     ComPtr<ID3D12Resource>               m_clusterInputBuffer;
+    // GPU-written args for the static BUILD_CLAS_FROM_TRIANGLES op.
+    // FillClasFromTrianglesArgs CS reads m_clasArgsMetaBuffer + a few root
+    // constants and writes here; the RTAS op then reads here as its
+    // IndirectArgumentArray.
+    ComPtr<ID3D12Resource>               m_clasArgsBuffer;
+    // Per-cluster metadata input for the CS above (24 bytes/cluster --
+    // see FillClasFromTrianglesArgs.hlsl for the schema).  Upload heap,
+    // rebuilt whenever the vertex-format / position-truncate-bits change.
+    // Distinct from the shader-side m_clusterMetaBuffer (per-cluster
+    // material + colour data consumed by raygen).
+    ComPtr<ID3D12Resource>               m_clasArgsMetaBuffer;
     D3D12_GPU_VIRTUAL_ADDRESS            m_clasArgsArrayGPUVA = 0;
     UINT                                 m_clasArgsStride     = 0;
 
@@ -268,7 +281,12 @@ private:
 
     // Single BLAS-from-CLAS build covers all BLASes (one per object).
     ComPtr<ID3D12Resource>               m_blasScratchBuffer;
+    // GPU-written N-object BUILD_BLAS_FROM_CLAS_ARGS buffer (was upload-mapped).
+    // Filled by FillBlasFromClasArgs CS from m_blasArgsMeta + root constants.
     ComPtr<ID3D12Resource>               m_blasArgsBuffer;         // N_objects x BUILD_BLAS_FROM_CLAS_ARGS
+    // Per-object {clusterCount, clasArrayGvaLo, clasArrayGvaHi} input for
+    // the BLAS-args CS.  12 bytes/object, upload heap, built once at init.
+    ComPtr<ID3D12Resource>               m_blasArgsMeta;
     ComPtr<ID3D12Resource>               m_blasResultAddrBuffer;   // N_objects x GVA (explicit dests)
 
     ComPtr<ID3D12Resource>               m_tlasBuffer;
@@ -299,8 +317,16 @@ private:
         UINT                                 instanceID   = 0;
 
         // --- Built once at init ---
-        // Hint vertex blob + per-cluster CLUSTER_TEMPLATES_FROM_TRIANGLES args.
+        // Hint vertex blob for the cluster-template build (positions + indices).
         Microsoft::WRL::ComPtr<ID3D12Resource> templateInputBuffer;
+        // Per-cluster BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS array.
+        // GPU-written by FillClusterTemplateArgs CS from templateMetaBuffer
+        // + root constants; was a CPU-mapped slice inside templateInputBuffer
+        // in the old single-buffer layout.
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateArgsBuffer;
+        // Per-cluster metadata for the template-args CS (16 bytes/cluster:
+        // triCount, vertCount, vbOff, ibOff -- see FillClusterTemplateArgs.hlsl).
+        Microsoft::WRL::ComPtr<ID3D12Resource> templateMetaBuffer;
         D3D12_GPU_VIRTUAL_ADDRESS              templateArgsArrayGPUVA = 0;
         UINT                                   templateArgsStride     = 0;
         // Template BVH storage (one templated CLAS per source cluster).
@@ -325,8 +351,17 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> perFrameVertexBuffer;
         // Per-frame INSTANTIATE_CLUSTER_TEMPLATES_ARGS array (one per cluster).
         // Each arg points to its cluster template + the slice of perFrameVertexBuffer.
-        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameInstArgsBuffer;      // upload heap, persistently mapped
-        D3D12_RTAS_OPERATION_INSTANTIATE_CLUSTER_TEMPLATES_ARGS* perFrameInstArgsMapped = nullptr;
+        // GPU-written by FillInstantiateArgs compute shader (see
+        // FillInstantiateArgs.hlsl) instead of the old CPU-side fill -- a
+        // real LOD-driven renderer would similarly emit these from a
+        // culling/selection CS.  Lives in UNORDERED_ACCESS state; CS write
+        // and INSTANTIATE read are separated by a UAV barrier.
+        Microsoft::WRL::ComPtr<ID3D12Resource> perFrameInstArgsBuffer;
+        // Per-cluster byte offset into perFrameVertexBuffer.  CPU-computed
+        // once via prefix sum of per-cluster vertex sizes, uploaded once,
+        // read every dispatch by FillInstantiateArgs.  Upload heap (constant
+        // across the object's lifetime).
+        Microsoft::WRL::ComPtr<ID3D12Resource> vertexOffsetArray;
         // Instantiated CLAS results (rewritten each frame in IMPLICIT_DESTINATIONS mode).
         Microsoft::WRL::ComPtr<ID3D12Resource> perFrameClasResultBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> perFrameClasScratchBuffer;
@@ -341,8 +376,15 @@ private:
         // BLAS storage (fixed GPU VA across frames, rebuilt in place every frame).
         Microsoft::WRL::ComPtr<ID3D12Resource> blasStorage;
         Microsoft::WRL::ComPtr<ID3D12Resource> blasScratchBuffer;
-        Microsoft::WRL::ComPtr<ID3D12Resource> blasArgsBuffer;              // upload, mapped, 1 entry
-        D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS* blasArgsMapped = nullptr;
+        // GPU-written single-entry BUILD_BLAS_FROM_CLAS_ARGS for this object,
+        // produced by FillBlasFromClasArgs CS (shared with the static path
+        // -- see CreateFillBlasArgsPipeline).  DEFAULT/UAV; the per-frame
+        // BLAS rebuild reads it as IndirectArgumentArray.  Was an
+        // UPLOAD-heap mapped buffer in the original CPU-driven path.
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasArgsBuffer;
+        // Input metadata for the BLAS-args CS (single 12-byte entry:
+        // {clusterCount, gvaLo, gvaHi} pointing at perFrameClasAddressArray).
+        Microsoft::WRL::ComPtr<ID3D12Resource> blasArgsMeta;
         Microsoft::WRL::ComPtr<ID3D12Resource> blasResultAddrBuffer;        // upload, 1 entry = blasStorage VA
         D3D12_GPU_VIRTUAL_ADDRESS              blasGPUVA = 0;
     };
@@ -366,6 +408,25 @@ private:
     // 64 verts, IM->UAV barrier, then INSTANTIATE_CLUSTER_TEMPLATES reads.
     ComPtr<ID3D12RootSignature>          m_animComputeRS;
     ComPtr<ID3D12PipelineState>          m_animComputePSO;
+    // GPU pipeline that writes per-cluster
+    // INSTANTIATE_CLUSTER_TEMPLATES_ARGS into AnimatedObject::
+    // perFrameInstArgsBuffer.  Built once at init by
+    // CreateFillInstantiateArgsPipeline, dispatched once at the end of
+    // BuildAnimatedObjectSetup (and on every config-change rebuild).
+    ComPtr<ID3D12RootSignature>          m_fillInstArgsRS;
+    ComPtr<ID3D12PipelineState>          m_fillInstArgsPSO;
+    // Args-fill pipelines for the remaining RTAS op types.  Each writes
+    // its corresponding D3D12_RTAS_OPERATION_*_ARGS array from a small
+    // CPU-prepared per-entry metadata buffer + a few root constants.
+    // See the matching .hlsl files for layout details.
+    ComPtr<ID3D12RootSignature>          m_fillMoveArgsRS;
+    ComPtr<ID3D12PipelineState>          m_fillMoveArgsPSO;
+    ComPtr<ID3D12RootSignature>          m_fillBlasArgsRS;
+    ComPtr<ID3D12PipelineState>          m_fillBlasArgsPSO;
+    ComPtr<ID3D12RootSignature>          m_fillClasTriArgsRS;
+    ComPtr<ID3D12PipelineState>          m_fillClasTriArgsPSO;
+    ComPtr<ID3D12RootSignature>          m_fillTemplateArgsRS;
+    ComPtr<ID3D12PipelineState>          m_fillTemplateArgsPSO;
 
     // ---------- Output texture + descriptor heap ----------
     // Descriptor heap layout (CBV_SRV_UAV, shader-visible):
@@ -600,6 +661,11 @@ private:
     // Compile-once-at-init compute pipeline used by the per-frame GPU ball
     // deformation pass (see UpdateAnimatedObjectPerFrame).
     void CreateAnimationComputePipeline();
+    void CreateFillInstantiateArgsPipeline();
+    void CreateFillMoveArgsPipeline();
+    void CreateFillBlasArgsPipeline();
+    void CreateFillClasTriArgsPipeline();
+    void CreateFillTemplateArgsPipeline();
     void CreateDescriptorHeapAndRaytracingOutput();
     void UpdateSceneConstantBuffer();
 

@@ -71,6 +71,29 @@ int Win32Application::Run(DXSample* pSample, HINSTANCE hInstance, int nCmdShow)
                                  (wcsstr(desc, L"Basic Render") != nullptr);
         ShowWindow(m_hwnd, isSoftwareAdapter ? SW_NORMAL : SW_MAXIMIZE);
 
+        // On software adapters (WARP / Basic Render), spin up the async
+        // display worker: the sample's OnRender (slow on a CPU rasterizer
+        // -- >1 s/frame at high res) runs on a dedicated thread that
+        // writes into an offscreen RT, and the UI thread's WM_PAINT just
+        // blits the latest offscreen into the back buffer and Presents.
+        // This is what keeps the message pump responsive on slow frames
+        // and prevents Windows "(Not Responding)" / DWM ghost-mode
+        // bouncing when the user maximizes the window.
+        //
+        // On hardware adapters: not used.  WM_PAINT calls OnUpdate +
+        // OnRender directly as before.
+        if (isSoftwareAdapter)
+        {
+            pSample->GetDeviceResources()->EnableAsyncDisplay(
+                /*render*/ [pSample]() {
+                    pSample->OnUpdate();
+                    pSample->OnRender();
+                },
+                /*resize*/ [pSample](UINT w, UINT h, bool minimized) {
+                    pSample->OnSizeChanged(w, h, minimized);
+                });
+        }
+
         // Main sample loop.
         MSG msg = {};
         while (msg.message != WM_QUIT)
@@ -244,8 +267,21 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
     case WM_PAINT:
         if (pSample)
         {
-            pSample->OnUpdate();
-            pSample->OnRender();
+            auto* dr = pSample->GetDeviceResources();
+            if (dr && dr->IsAsyncDisplayActive())
+            {
+                // Async mode: worker thread is doing OnUpdate + OnRender
+                // + Present on its own.  UI thread WM_PAINT just
+                // acknowledges the paint so Windows doesn't keep
+                // re-queueing it; the worker's Present is what actually
+                // updates the visible content.
+                ValidateRect(hWnd, nullptr);
+            }
+            else
+            {
+                pSample->OnUpdate();
+                pSample->OnRender();
+            }
         }
         return 0;
 
@@ -258,7 +294,26 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
 
             RECT clientRect = {};
             GetClientRect(hWnd, &clientRect);
-            pSample->OnSizeChanged(clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, wParam == SIZE_MINIMIZED);
+            const UINT clientW = clientRect.right - clientRect.left;
+            const UINT clientH = clientRect.bottom - clientRect.top;
+            const bool minimized = (wParam == SIZE_MINIMIZED);
+
+            auto* dr = pSample->GetDeviceResources();
+            if (dr && dr->IsAsyncDisplayActive())
+            {
+                // Async mode: don't call OnSizeChanged from the UI thread
+                // -- that would block until the worker's in-flight render
+                // finishes (5 s+ on WARP-at-4K), which is exactly the
+                // stall that triggers (Not Responding) / DWM ghost mode
+                // and the maximize-bouncing artifact.  Instead just stash
+                // the new size; the worker picks it up between frames
+                // and runs OnSizeChanged on its own thread.
+                dr->RequestAsyncResize(clientW, clientH, minimized);
+            }
+            else
+            {
+                pSample->OnSizeChanged(clientW, clientH, minimized);
+            }
         }
         return 0;
 

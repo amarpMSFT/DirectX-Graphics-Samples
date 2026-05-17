@@ -15,6 +15,11 @@
 
 #pragma once
 
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <functional>
+
 namespace DX
 {
     // Provides an interface for an application that owns DeviceResources to be notified of the device being lost or created.
@@ -70,6 +75,51 @@ namespace DX
         void ExecuteCommandList();
         void WaitForGpu() noexcept;
 
+        // -----------------------------------------------------------------
+        // Async display mode (for slow software rasterizers — primarily WARP).
+        //
+        // When enabled, the sample's per-frame render runs on a dedicated
+        // worker thread instead of the UI thread.  The sample is unaware
+        // -- it uses DeviceResources exactly as it does on HW, including
+        // calling Present (which still does the real swap-chain Present;
+        // we don't intercept it).  The UI thread is freed from the multi-
+        // second render and only handles message dispatch, so Windows
+        // never tags the window "(Not Responding)" and DWM never falls
+        // back to the ghost-window snapshot.
+        //
+        // WM_PAINT on the UI thread is a no-op (just ValidateRect) -- the
+        // worker thread Presents on its own schedule.
+        //
+        // WM_SIZE on the UI thread does NOT call the sample's
+        // OnSizeChanged directly (that would block the UI thread for an
+        // entire worker-render frame waiting for the in-flight GPU work
+        // to finish before ResizeBuffers).  Instead the UI thread stashes
+        // the new client size via RequestAsyncResize and returns; the
+        // worker thread sees the pending request between iterations and
+        // calls a "resize handler" callback (which runs the sample's
+        // OnSizeChanged on the worker thread) before its next render.
+        //
+        // Caveats: input handlers (WM_KEYDOWN, WM_MOUSEMOVE) dispatch on
+        // the UI thread and read/write scene state the worker is rendering
+        // from.  For a tech demo this is fine -- worst case is a visual
+        // glitch on the frame after a state change.  A production
+        // renderer would mutex the state or queue inputs.
+        //
+        // Zero sample-code changes required; the routing is fully inside
+        // DeviceResources + Win32Application.
+        // -----------------------------------------------------------------
+        using AsyncRenderCallback = std::function<void()>;
+        using AsyncResizeCallback = std::function<void(UINT width, UINT height, bool minimized)>;
+        void EnableAsyncDisplay(AsyncRenderCallback render,
+                                AsyncResizeCallback resize);
+        void DisableAsyncDisplay();
+        bool IsAsyncDisplayActive() const { return m_asyncDisplay; }
+        // Called from UI thread WM_SIZE in async mode.  Stashes the new
+        // client size; the worker thread picks it up before its next
+        // render iteration and runs the resize callback on its own thread.
+        // Returns immediately -- UI thread never blocks.
+        void RequestAsyncResize(UINT width, UINT height, bool minimized);
+
         // Device Accessors.
         RECT GetOutputSize() const { return m_outputSize; }
         bool IsWindowVisible() const { return m_isWindowVisible; }
@@ -109,6 +159,7 @@ namespace DX
     private:
         void MoveToNextFrame();
         void InitializeAdapter(IDXGIAdapter1** ppAdapter);
+        void AsyncWorkerThreadProc();
 
         const static size_t MAX_BACK_BUFFER_COUNT = 3;
 
@@ -159,5 +210,20 @@ namespace DX
 
         // The IDeviceNotify can be held directly as it owns the DeviceResources.
         IDeviceNotify*                                      m_deviceNotify;
+
+        // === Async display state (see EnableAsyncDisplay above) ===========
+        bool                                                m_asyncDisplay = false;
+        AsyncRenderCallback                                 m_asyncCallback;
+        AsyncResizeCallback                                 m_asyncResizeCallback;
+        std::thread                                         m_asyncWorkerThread;
+        std::atomic<bool>                                   m_asyncWorkerStop{false};
+        // Pending-resize state, written by UI thread on WM_SIZE, read by
+        // worker thread between iterations.  Mutex-protected because the
+        // members can't be atomically updated as a group.
+        std::mutex                                          m_asyncResizeMutex;
+        bool                                                m_asyncResizePending = false;
+        UINT                                                m_asyncResizeWidth = 0;
+        UINT                                                m_asyncResizeHeight = 0;
+        bool                                                m_asyncResizeMinimized = false;
     };
 }

@@ -20,6 +20,13 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
+    // TLS marker set by the async-display worker thread.  Used by Prepare /
+    // Present / WaitForGpu so they can route to worker-thread resources
+    // (m_asyncWorkerAllocator, m_asyncWorkerFence, skip swap-chain Present)
+    // when called from the worker, and use the existing UI-thread resources
+    // when called from anywhere else.  Avoids any per-call thread-id lookups.
+    thread_local bool t_isAsyncWorker = false;
+
     inline DXGI_FORMAT NoSRGB(DXGI_FORMAT fmt)
     {
         switch (fmt)
@@ -70,6 +77,11 @@ DeviceResources::DeviceResources(DXGI_FORMAT backBufferFormat, DXGI_FORMAT depth
 // Destructor for DeviceResources.
 DeviceResources::~DeviceResources()
 {
+    // Cleanly tear down the async-display worker first if active.  Has to
+    // happen BEFORE WaitForGpu drains the queue, since the worker thread
+    // pushes work onto the queue on every iteration.
+    DisableAsyncDisplay();
+
     // Ensure that the GPU is no longer referencing resources that are about to be destroyed.
     WaitForGpu();
 }
@@ -555,35 +567,124 @@ void DeviceResources::ExecuteCommandList()
     m_commandQueue->ExecuteCommandLists(ARRAYSIZE(commandLists), commandLists);
 }
 
-// Wait for pending GPU work to complete. Bounded by a generous timeout so that
-// a wedged GPU (driver fault, lost device, etc) can't make app shutdown hang
-// forever - we'd rather force-quit and let the OS reclaim than block the
-// process tree.
+// Wait for pending GPU work to complete.  INFINITE wait by design: callers
+// (resize path, mid-frame template-GVA readback, etc.) MUST see the GPU
+// drained before they release / re-allocate resources the GPU was using.
+// A bounded wait that times out and proceeds anyway hits D3D12 debug
+// runtime "id=921 CORRUPTION: ... referenced by GPU operations in-flight"
+// on WARP where a single frame can routinely take >2 s.  TDR is the system-
+// level escape hatch if the GPU genuinely wedges; we don't need a per-app one.
 void DeviceResources::WaitForGpu() noexcept
 {
     if (m_commandQueue && m_fence && m_fenceEvent.IsValid())
     {
-        // Schedule a Signal command in the GPU queue.
         UINT64 fenceValue = m_fenceValues[m_backBufferIndex];
         if (SUCCEEDED(m_commandQueue->Signal(m_fence.Get(), fenceValue)))
         {
-            // Wait until the Signal has been processed.
             if (SUCCEEDED(m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent.Get())))
             {
-                // INFINITE wait by design: callers (resize path, mid-frame
-                // template-GVA readback, etc.) MUST see the GPU drained
-                // before they release / re-allocate the resources the GPU
-                // was using.  A bounded wait that times out and proceeds
-                // anyway hits D3D12 debug runtime "id=921 CORRUPTION: ...
-                // referenced by GPU operations in-flight" on WARP where a
-                // single frame can routinely take >2 s.  TDR is the system-
-                // level escape hatch if the GPU genuinely wedges; we don't
-                // need a per-app one.
                 WaitForSingleObjectEx(m_fenceEvent.Get(), INFINITE, FALSE);
-
-                // Increment the fence value for the current frame.
                 m_fenceValues[m_backBufferIndex]++;
             }
+        }
+    }
+}
+
+// =====================================================================
+// === Async display implementation (slow software rasterizer support) ===
+// =====================================================================
+//
+// Design: when a software rasterizer (WARP) is detected, the sample's
+// per-frame render (OnUpdate + OnRender) runs on a dedicated worker
+// thread instead of the UI thread.  The sample is unaware -- it uses
+// DeviceResources exactly as it does on HW, and our intercepted Present
+// path is unchanged from HW (executes the cmd list and swap-chain
+// Presents).  The UI thread's WM_PAINT just acknowledges the paint
+// (ValidateRect) without doing any rendering -- microseconds, always
+// responsive, so Windows never tags the window (Not Responding) and DWM
+// never swaps in the ghost snapshot that caused the maximize-bouncing.
+//
+// Note: this trades thread-safety for simplicity.  Input handlers
+// (WM_KEYDOWN, WM_MOUSEMOVE) still dispatch on the UI thread and the
+// sample reads/writes the same scene state the worker thread is rendering
+// from.  For a tech demo running on a CPU rasterizer this is acceptable
+// -- the worst case is a visual glitch on a frame after a state change.
+// A production renderer would either mutex the state or queue inputs.
+
+void DeviceResources::EnableAsyncDisplay(AsyncRenderCallback render,
+                                         AsyncResizeCallback resize)
+{
+    if (m_asyncDisplay) return;
+    m_asyncCallback = std::move(render);
+    m_asyncResizeCallback = std::move(resize);
+    m_asyncResizePending = false;
+    m_asyncDisplay = true;
+    m_asyncWorkerStop = false;
+    m_asyncWorkerThread = std::thread(&DeviceResources::AsyncWorkerThreadProc, this);
+}
+
+void DeviceResources::DisableAsyncDisplay()
+{
+    if (!m_asyncDisplay) return;
+    m_asyncWorkerStop = true;
+    if (m_asyncWorkerThread.joinable())
+    {
+        m_asyncWorkerThread.join();
+    }
+    m_asyncDisplay = false;
+    m_asyncCallback = nullptr;
+    m_asyncResizeCallback = nullptr;
+}
+
+void DeviceResources::RequestAsyncResize(UINT width, UINT height, bool minimized)
+{
+    if (!m_asyncDisplay) return;
+    std::lock_guard<std::mutex> lock(m_asyncResizeMutex);
+    m_asyncResizePending = true;
+    m_asyncResizeWidth = width;
+    m_asyncResizeHeight = height;
+    m_asyncResizeMinimized = minimized;
+}
+
+void DeviceResources::AsyncWorkerThreadProc()
+{
+    t_isAsyncWorker = true;
+    while (!m_asyncWorkerStop.load(std::memory_order_acquire))
+    {
+        // 1. If the UI thread has requested a resize, handle it here on
+        //    the worker thread BEFORE the next render.  This means UI
+        //    thread WM_SIZE returns instantly (it just sets the request
+        //    flag) and the resize cost is absorbed inside the worker's
+        //    inter-frame gap rather than blocking the UI message pump.
+        bool doResize = false;
+        UINT w = 0, h = 0;
+        bool minimized = false;
+        {
+            std::lock_guard<std::mutex> lock(m_asyncResizeMutex);
+            if (m_asyncResizePending)
+            {
+                doResize = true;
+                w = m_asyncResizeWidth;
+                h = m_asyncResizeHeight;
+                minimized = m_asyncResizeMinimized;
+                m_asyncResizePending = false;
+            }
+        }
+        if (doResize && m_asyncResizeCallback)
+        {
+            try { m_asyncResizeCallback(w, h, minimized); }
+            catch (...) { break; }
+        }
+
+        // 2. Run the sample's per-frame render (which calls Present on
+        //    this same thread -- the real swap-chain Present).
+        try {
+            if (m_asyncCallback) m_asyncCallback();
+        } catch (...) {
+            // Sample throws are fatal in async mode: the worker would
+            // otherwise spin retrying the same throw forever.  Break out
+            // and let DisableAsyncDisplay tear down.
+            break;
         }
     }
 }

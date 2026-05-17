@@ -58,6 +58,23 @@ struct ClusterObject
     Microsoft::WRL::ComPtr<ID3D12Resource>   blasStorage;
     D3D12_GPU_VIRTUAL_ADDRESS                blasGPUVA = 0;
 
+    // ---- Traditional (DXR1) BLAS path -------------------------------------
+    // Populated by BuildTraditionalStaticAS().  Concatenated per-object data
+    // (vertices/indices/normals across all this object's clusters merged into
+    // single contiguous buffers, with indices renumbered to address into the
+    // per-object vertex buffer instead of per-cluster).  None of these live
+    // in Clusters mode -- they're allocated lazily on [T] -> Traditional.
+    Microsoft::WRL::ComPtr<ID3D12Resource>   tradVertexBuffer;     // float3[] all verts of this object
+    Microsoft::WRL::ComPtr<ID3D12Resource>   tradIndexBuffer;      // uint32[] all triangles (3*tri_count uints)
+    Microsoft::WRL::ComPtr<ID3D12Resource>   tradNormalsBuffer;    // float3[] per-vertex normals
+    Microsoft::WRL::ComPtr<ID3D12Resource>   tradBlasStorage;      // BLAS result
+    Microsoft::WRL::ComPtr<ID3D12Resource>   tradBlasScratch;      // BLAS scratch (rebuild) or refit scratch
+    D3D12_GPU_VIRTUAL_ADDRESS                tradBlasGPUVA = 0;
+    UINT                                     tradVertexCount = 0;
+    UINT                                     tradTriangleCount = 0;
+    UINT64                                   tradBlasResultBytes  = 0;
+    UINT64                                   tradBlasScratchBytes = 0;
+
     // Per-object world placement (used by TLAS instance desc).
     DirectX::XMFLOAT3                        worldPos      = { 0, 0, 0 };
     float                                    worldScale    = 1.0f;
@@ -124,6 +141,12 @@ private:
     ComPtr<ID3D12DeviceRaytracing2>      m_dxr2Device;
     ComPtr<ID3D12CommandListRaytracing2> m_dxr2CommandList;
     bool m_clustersAndPtlasSupported = false;
+    // Aggregated traditional-static-BLAS sizes, refreshed each rebuild for
+    // the overlay's apples-to-apples comparison vs the cluster path's
+    // CLAS+BLAS totals.  See BuildTraditionalStaticAS.
+    UINT64 m_traditionalStaticTotalResultBytes  = 0;
+    UINT64 m_traditionalStaticTotalScratchBytes = 0;
+    double m_traditionalStaticBuildMs            = 0.0;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
     // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
@@ -186,6 +209,50 @@ private:
         case StaticRebuildMode::None:        return L"off";
         case StaticRebuildMode::BlasOnly:    return L"BLAS only";
         case StaticRebuildMode::ClasAndBlas: return L"CLAS + BLAS";
+        }
+        return L"?";
+    }
+
+    // ---------- Geometry path ([T] toggle) ----------
+    // Lets the demo flip between the cluster-based DXR2 pipeline (default)
+    // and a traditional DXR1-style per-object monolithic BLAS, so the user
+    // can directly A/B the per-frame cost, memory footprint, build wall-
+    // clock, and per-cluster colour control between the two paths.
+    //
+    //   Clusters     - one CLAS per source cluster; per-object BLAS built
+    //                  from those CLAS (DXR2 path, current default)
+    //   Traditional  - one classic BLAS per object built from concatenated
+    //                  triangle data (DXR1 path)
+    enum class GeometryMode { Clusters, Traditional };
+    GeometryMode                         m_geometryMode = GeometryMode::Clusters;
+    const wchar_t*                       GeometryModeName() const
+    {
+        switch (m_geometryMode)
+        {
+        case GeometryMode::Clusters:    return L"clustered";
+        case GeometryMode::Traditional: return L"traditional";
+        }
+        return L"?";
+    }
+    bool IsTraditional() const { return m_geometryMode == GeometryMode::Traditional; }
+
+    // ---------- Animated-BLAS update strategy (Traditional mode only,
+    //            cycled via [F]) ----------
+    //   Rebuild - full BUILD_RAYTRACING_ACCELERATION_STRUCTURE each frame
+    //             from updated vertices.  Slowest, most correct, no
+    //             topology constraints.
+    //   Refit   - ALLOW_UPDATE + PERFORM_UPDATE flags; driver edits the
+    //             existing BLAS in place from updated vertex positions.
+    //             Cheaper but only valid while topology is unchanged
+    //             (same index/vertex count, same triangle ordering).
+    enum class TraditionalAnimMode { Rebuild, Refit };
+    TraditionalAnimMode                  m_traditionalAnimMode = TraditionalAnimMode::Rebuild;
+    const wchar_t*                       TraditionalAnimModeName() const
+    {
+        switch (m_traditionalAnimMode)
+        {
+        case TraditionalAnimMode::Rebuild: return L"rebuild";
+        case TraditionalAnimMode::Refit:   return L"refit";
         }
         return L"?";
     }
@@ -598,6 +665,15 @@ private:
         UINT64 staticClasActualBytes     = 0;          // sumActualBytes from rebuild
         UINT64 staticClasScratchBytes    = 0;
         UINT64 staticBlasTotalBytes      = 0;
+        // Traditional (DXR1) static path
+        UINT64 traditionalBlasTotalBytes      = 0;
+        UINT64 traditionalBlasScratchBytes    = 0;
+        UINT64 traditionalVbBytes             = 0;
+        UINT64 traditionalIbBytes             = 0;
+        double traditionalBuildMs             = 0.0;
+        // Geometry mode at snapshot time -- gates which lines the overlay
+        // shows + drives delta colouring across the [T] toggle.
+        int    geometryMode                   = 0;  // matches GeometryMode enum order
         // Animated path
         UINT64 animatedTemplateBytes     = 0;
         UINT64 animatedPerFrameClasAllocBytes  = 0;
@@ -699,6 +775,14 @@ private:
     void BuildClasGetSizes();              // ClasAllocMode::GetSizes
     void BuildClasCompact();               // ClasAllocMode::Compact
     void BuildBlasFromClasIndirect();
+    // Per-object traditional (DXR1) BLAS build for static objects.  Called
+    // instead of BuildBlasFromClasIndirect when m_geometryMode ==
+    // Traditional.  Concatenates each object's per-cluster vertex+index
+    // data into single buffers, then issues a classic
+    // BuildRaytracingAccelerationStructure for each object.
+    // (Cluster path's m_clasArgsBuffer / m_clasMoveArgsBuffer / etc. are
+    // simply not allocated in Traditional mode.)
+    void BuildTraditionalStaticAS();
     void BuildTlasClassic();
     void RebuildTlasPerFrame();
     // Per-frame static-AS rebuild paths (driven by m_staticRebuildMode = [R]).

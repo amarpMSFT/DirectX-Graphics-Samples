@@ -77,7 +77,8 @@ struct ClusterObject
     D3D12_GPU_VIRTUAL_ADDRESS                tradBlasGPUVA = 0;
     UINT                                     tradVertexCount = 0;
     UINT                                     tradTriangleCount = 0;
-    UINT64                                   tradBlasResultBytes  = 0;
+    UINT64                                   tradBlasResultBytes  = 0;  // == alloc bytes (worst-case prebuild size)
+    UINT64                                   tradBlasActualBytes  = 0;  // == result in Implicit; compacted size in Compact
     UINT64                                   tradBlasScratchBytes = 0;
 
     // Per-object world placement (used by TLAS instance desc).
@@ -149,7 +150,8 @@ private:
     // Aggregated traditional-static-BLAS sizes, refreshed each rebuild for
     // the overlay's apples-to-apples comparison vs the cluster path's
     // CLAS+BLAS totals.  See BuildTraditionalStaticAS.
-    UINT64 m_traditionalStaticTotalResultBytes  = 0;
+    UINT64 m_traditionalStaticTotalResultBytes  = 0;   // sum of obj.tradBlasResultBytes (== alloc bytes)
+    UINT64 m_traditionalStaticTotalActualBytes  = 0;   // == result bytes in Implicit; sum of compacted sizes in Compact
     UINT64 m_traditionalStaticTotalScratchBytes = 0;
     double m_traditionalStaticBuildMs            = 0.0;
     // Per-instance first-cluster-ID lookup table.  One uint per TLAS
@@ -261,13 +263,38 @@ private:
     //             Cheaper but only valid while topology is unchanged
     //             (same index/vertex count, same triangle ordering).
     enum class TraditionalAnimMode { Rebuild, Refit };
-    TraditionalAnimMode                  m_traditionalAnimMode = TraditionalAnimMode::Rebuild;
+    // Traditional-BLAS allocation strategy.  Mirrors the cluster path's
+    // ClasAllocMode but at the per-object-BLAS level rather than per-CLAS.
+    //   Implicit -- one shot: prebuild reports a worst-case size, allocate
+    //               that, build into it, done.  No post-build copy.  This
+    //               is the simplest path and the buffer is whatever size
+    //               the driver thinks the build needs at worst.
+    //   Compact  -- build with ALLOW_COMPACTION into a worst-case buffer,
+    //               emit POSTBUILD_INFO_COMPACTED_SIZE per BLAS, GPU-flush,
+    //               read back the actual compacted sizes, allocate a tight
+    //               compact buffer per object, CopyRaytracingAccelerationStructure
+    //               with COPY_MODE_COMPACT into it, release the worst-case
+    //               source.  This is what production engines actually
+    //               ship and gives the smaller of the two numbers on
+    //               every adapter I've measured.
+    enum class TraditionalAllocMode { Implicit, Compact };
+    TraditionalAnimMode                  m_traditionalAnimMode  = TraditionalAnimMode::Rebuild;
+    TraditionalAllocMode                 m_traditionalAllocMode = TraditionalAllocMode::Compact;
     const wchar_t*                       TraditionalAnimModeName() const
     {
         switch (m_traditionalAnimMode)
         {
         case TraditionalAnimMode::Rebuild: return L"rebuild";
         case TraditionalAnimMode::Refit:   return L"refit";
+        }
+        return L"?";
+    }
+    const wchar_t*                       TraditionalAllocModeName() const
+    {
+        switch (m_traditionalAllocMode)
+        {
+        case TraditionalAllocMode::Implicit: return L"implicit (no compaction)";
+        case TraditionalAllocMode::Compact:  return L"post-build compact";
         }
         return L"?";
     }
@@ -687,7 +714,8 @@ private:
         UINT64 staticClasScratchBytes    = 0;
         UINT64 staticBlasTotalBytes      = 0;
         // Traditional (DXR1) static path
-        UINT64 traditionalBlasTotalBytes      = 0;
+        UINT64 traditionalBlasTotalBytes      = 0;   // sum of per-obj worst-case prebuild sizes (== alloc)
+        UINT64 traditionalBlasActualBytes     = 0;   // sum of per-obj final-storage sizes (compacted in Compact mode)
         UINT64 traditionalBlasScratchBytes    = 0;
         UINT64 traditionalVbBytes             = 0;
         UINT64 traditionalIbBytes             = 0;

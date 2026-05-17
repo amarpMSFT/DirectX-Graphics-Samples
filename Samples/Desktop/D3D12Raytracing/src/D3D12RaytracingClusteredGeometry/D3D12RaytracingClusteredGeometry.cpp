@@ -116,6 +116,14 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             else if (_wcsicmp(argv[i+1], L"traditional") == 0) m_geometryMode = GeometryMode::Traditional;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--trad-alloc") == 0 && i + 1 < argc)
+        {
+            // [A] runtime toggle in traditional mode, set from CLI.  Mirrors
+            // the cluster path's --clas-alloc but two-mode instead of three.
+            if      (_wcsicmp(argv[i+1], L"implicit") == 0) m_traditionalAllocMode = TraditionalAllocMode::Implicit;
+            else if (_wcsicmp(argv[i+1], L"compact")  == 0) m_traditionalAllocMode = TraditionalAllocMode::Compact;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--rebuild-mode") == 0 && i + 1 < argc)
         {
             // Per-frame static-AS rebuild mode = [R] runtime toggle, set from CLI
@@ -827,6 +835,7 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     m_blasArgsMeta.Reset();
     m_blasResultAddrBuffer.Reset();
     m_traditionalStaticTotalResultBytes  = 0;
+    m_traditionalStaticTotalActualBytes  = 0;
     m_traditionalStaticTotalScratchBytes = 0;
     m_traditionalStaticBuildMs           = 0.0;
 
@@ -2084,64 +2093,59 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 // ---------------------------------------------------------------------------------
 
 // =====================================================================================
-// Traditional DXR1 BLAS build path -- one classic BLAS per static object,
-// built from concatenated per-cluster vertex+index data.  Used when
-// m_geometryMode == Traditional.  TLAS hands these BLAS GVAs out via
-// obj.tradBlasGPUVA instead of obj.blasGPUVA (cluster path).
+// Traditional BLAS build path -- one classic BLAS per static object, with
+// one D3D12_RAYTRACING_GEOMETRY_DESC per cluster inside that BLAS (so
+// GeometryIndex() at hit time recovers the cluster index, matching the
+// cluster path's ClusterID()).  Used when m_geometryMode == Traditional.
+// TLAS hands these BLAS GVAs out via obj.tradBlasGPUVA.
 //
-// For each object we:
-//   1. Concatenate cluster positions into a single per-object vertex buffer
-//      (clusters that share an edge produce duplicate verts at the seam --
-//      OK for BLAS, just slightly wastes memory).
-//   2. Concatenate cluster indices into a single per-object index buffer,
-//      remapped from per-cluster local 0..verts-1 to global 0..totalVerts-1
-//      by adding the running vertex offset.  Widened uint8 -> uint32 so
-//      BLAS can address objects with > 256 verts (largest in our scene is
-//      ~10k verts).
-//   3. Allocate UPLOAD-heap input buffers + DEFAULT-heap UAV BLAS storage
-//      and scratch via the BLAS prebuild info.
-//   4. Build with PREFER_FAST_TRACE | ALLOW_UPDATE -- the ALLOW_UPDATE flag
-//      lets the per-frame [F] refit toggle work for the animated object
-//      without rebuilding the BLAS infrastructure (cheap to specify on
-//      static BLAS too; flag costs a small build-time overhead but the
-//      sample is illustrative not benchmark-driven).
+// Two allocation strategies, cycled via [A] in traditional mode (mirrors
+// the cluster path's [A] CLAS alloc-mode toggle):
+//
+//   Implicit: one-shot.  Prebuild reports worst-case size, allocate that
+//             buffer, build into it, done.  obj.tradBlasActualBytes ==
+//             obj.tradBlasResultBytes.
+//
+//   Compact:  two-pass.
+//             Pass 1: build with ALLOW_COMPACTION into a worst-case
+//             temp BLAS + emit POSTBUILD_INFO_COMPACTED_SIZE.
+//             GPU flush, CPU readback of per-BLAS actual sizes.
+//             Pass 2: allocate tight compacted buffers per object,
+//             CopyRaytracingAccelerationStructure(COPY_MODE_COMPACT)
+//             into them, drop the worst-case temp buffers.
+//             obj.tradBlasActualBytes is the compacted size; the
+//             persistent obj.tradBlasStorage IS the compacted buffer
+//             (worst-case temp is freed at end of build).
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 {
-    auto device  = m_deviceResources->GetD3DDevice();
-    auto cmdList = m_deviceResources->GetCommandList();
+    auto device      = m_deviceResources->GetD3DDevice();
+    auto commandList = m_deviceResources->GetCommandList();
+    auto commandAllocator = m_deviceResources->GetCommandAllocator();
 
+    const bool wantCompact = (m_traditionalAllocMode == TraditionalAllocMode::Compact);
     const auto t0 = std::chrono::steady_clock::now();
-    UINT64 totalResultBytes  = 0;
+    UINT64 totalResultBytes  = 0;   // sum of worst-case sizes (== "alloc bytes" in overlay)
+    UINT64 totalActualBytes  = 0;   // sum of per-BLAS final-storage sizes (compacted in Compact mode)
     UINT64 totalScratchBytes = 0;
     UINT64 totalVbBytes      = 0;
     UINT64 totalIbBytes      = 0;
     UINT   totalGeomDescs    = 0;
 
-    for (auto& obj : m_objects)
+    // Per-object temp storage used only during the build, kept alive in
+    // these vectors so we can do a GPU flush mid-function (for Compact)
+    // and resume.
+    struct Temp { ComPtr<ID3D12Resource> srcBlas; };  // worst-case BLAS (Compact mode only)
+    std::vector<Temp> temps(m_objects.size());
+
+    // -------- Pass 1: build all BLASes (worst-case sized) and stash temps --------
+    for (size_t oi = 0; oi < m_objects.size(); ++oi)
     {
-        // -------------------------------------------------------------
-        // One BLAS per object, ONE GEOMETRY DESC PER CLUSTER.
-        //
-        // The traditional / DXR1 way to express what the cluster path
-        // calls "clusters" is multiple D3D12_RAYTRACING_GEOMETRY_DESC
-        // entries in a single BLAS, each pointing at a slice of the
-        // per-object vertex+index buffer.  At hit time the shader uses
-        // GeometryIndex() (DXR1.1 intrinsic) to discover which slice
-        // (== which cluster) was hit; combined with a per-instance
-        // first-cluster-ID lookup it recovers the same global cluster
-        // ID the cluster path's ClusterID() returns -- so the same
-        // g_clusterMeta / g_clusterNormals / g_clusterIndices /
-        // g_clusterOffsets buffers feed both paths.  Result: identical
-        // visuals on the same scene with no per-path extra data.
-        //
-        // Vertex / index layout per object:
-        //   VB = [cluster 0 verts][cluster 1 verts]...[cluster N-1 verts]
-        //   IB = [cluster 0 idx ][cluster 1 idx ]...[cluster N-1 idx ]
-        // Each cluster's indices are 0-based INTO ITS OWN VB SLICE -- the
-        // geometry desc's VertexBuffer.StartAddress is biased per cluster
-        // so each cluster's index 0 points at the cluster's first vertex.
-        // -------------------------------------------------------------
+        auto& obj = m_objects[oi];
+
+        // (Concatenate per-cluster VB + per-cluster IB into per-object
+        // buffers.  Indices stay 0-based within each cluster's vertex
+        // slice so each geometry desc points at its own clean range.)
         std::vector<XMFLOAT3> verts;
         std::vector<UINT32>   idx32;
         std::vector<size_t>   clusterVbByteOff(obj.clusterCount);
@@ -2156,7 +2160,7 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
                 verts.push_back({ p.x, p.y, p.z });
             clusterIbByteOff[c] = idx32.size() * sizeof(UINT32);
             for (auto i : cl.indices)
-                idx32.push_back((UINT32)i);   // cluster-local: addresses this cluster's VB slice
+                idx32.push_back((UINT32)i);
             clusterVertCount[c] = (UINT)cl.positions.size();
             clusterTriCount[c]  = (UINT)(cl.indices.size() / 3);
         }
@@ -2170,9 +2174,7 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         totalVbBytes += verts.size() * sizeof(XMFLOAT3);
         totalIbBytes += idx32.size() * sizeof(UINT32);
 
-        // Per-cluster geometry descs.  Each points at this cluster's
-        // slice of the per-object VB/IB.  Opacity flag is per-object
-        // (matches the cluster path which derives it from the material).
+        // Per-cluster geometry descs sharing the per-object VB/IB.
         const auto& mat = m_materials[obj.instanceID];
         const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
         const auto geomFlag = isOpaqueLike
@@ -2187,7 +2189,6 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
             auto& gd = geomDescs[c];
             gd.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             gd.Flags = geomFlag;
-            gd.Triangles.Transform3x4                = 0;
             gd.Triangles.IndexFormat                 = DXGI_FORMAT_R32_UINT;
             gd.Triangles.IndexCount                  = clusterTriCount[c] * 3;
             gd.Triangles.IndexBuffer                 = ibGVA + clusterIbByteOff[c];
@@ -2203,21 +2204,32 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
         inputs.NumDescs       = obj.clusterCount;
         inputs.pGeometryDescs = geomDescs.data();
+        // PREFER_FAST_TRACE for hit perf; ALLOW_UPDATE so the [F] refit
+        // toggle (animated path, future) can update without rebuild;
+        // ALLOW_COMPACTION only when we actually want to compact (the
+        // flag has a small build-cost on some drivers).
         inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
-                              | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+                              | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
+                              | (wantCompact
+                                   ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+                                   : (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS)0);
 
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
         m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
 
+        // Worst-case source BLAS.  In Compact mode this is a temp -- the
+        // final obj.tradBlasStorage gets reallocated to the compacted
+        // size in pass 2.  In Implicit mode this IS obj.tradBlasStorage.
+        ComPtr<ID3D12Resource> srcBlas;
         AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
-                          &obj.tradBlasStorage,
+                          &srcBlas,
                           D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                          L"Traditional BLAS result");
+                          wantCompact ? L"Traditional BLAS result (temp, pre-compact)"
+                                      : L"Traditional BLAS result");
         AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
                           &obj.tradBlasScratch,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           L"Traditional BLAS scratch");
-        obj.tradBlasGPUVA         = obj.tradBlasStorage->GetGPUVirtualAddress();
         obj.tradBlasResultBytes   = prebuild.ResultDataMaxSizeInBytes;
         obj.tradBlasScratchBytes  = prebuild.ScratchDataSizeInBytes;
         totalResultBytes  += prebuild.ResultDataMaxSizeInBytes;
@@ -2225,24 +2237,149 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
         buildDesc.Inputs                             = inputs;
-        buildDesc.DestAccelerationStructureData      = obj.tradBlasGPUVA;
+        buildDesc.DestAccelerationStructureData      = srcBlas->GetGPUVirtualAddress();
         buildDesc.ScratchAccelerationStructureData   = obj.tradBlasScratch->GetGPUVirtualAddress();
         m_dxrCommandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
 
-        auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(obj.tradBlasStorage.Get());
+        auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(srcBlas.Get());
         m_dxrCommandList->ResourceBarrier(1, &barrier);
+
+        if (wantCompact)
+        {
+            temps[oi].srcBlas = srcBlas;          // keep alive across mid-function flush
+        }
+        else
+        {
+            // Implicit: srcBlas IS the final storage.  Stash it onto the obj.
+            obj.tradBlasStorage = srcBlas;
+            obj.tradBlasGPUVA   = srcBlas->GetGPUVirtualAddress();
+            obj.tradBlasActualBytes = prebuild.ResultDataMaxSizeInBytes;
+            totalActualBytes += prebuild.ResultDataMaxSizeInBytes;
+        }
     }
 
-    const auto t1 = std::chrono::steady_clock::now();
-    const double cpuMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    SampleLog::LogF(L"[traditional BLAS] %zu objects, %u geometry descs total (per-cluster), result=%llu  scratch=%llu  vb=%llu  ib=%llu (bytes) -- CPU=%.3f ms\n",
+    // -------- Implicit mode: done. --------
+    if (!wantCompact)
+    {
+        const double cpuMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        SampleLog::LogF(L"[traditional BLAS][implicit] %zu objects, %u geom descs, "
+                        L"result=%llu  scratch=%llu  vb=%llu  ib=%llu (bytes) -- CPU=%.3f ms\n",
+                        m_objects.size(), totalGeomDescs,
+                        (unsigned long long)totalResultBytes,
+                        (unsigned long long)totalScratchBytes,
+                        (unsigned long long)totalVbBytes,
+                        (unsigned long long)totalIbBytes,
+                        cpuMs);
+        m_traditionalStaticTotalResultBytes  = totalResultBytes;
+        m_traditionalStaticTotalActualBytes  = totalActualBytes;
+        m_traditionalStaticTotalScratchBytes = totalScratchBytes;
+        m_traditionalStaticBuildMs           = cpuMs;
+        return;
+    }
+
+    // -------- Compact mode: emit postbuild sizes, flush, readback, compact-copy. --------
+    const UINT N = (UINT)m_objects.size();
+    const UINT64 postbuildBytes = (UINT64)N * sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE_DESC);
+
+    ComPtr<ID3D12Resource> postbuildBuf;     // DEFAULT-heap UAV the driver writes into
+    AllocateUAVBuffer(device, postbuildBytes, &postbuildBuf,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"Traditional BLAS postbuild-info (compacted-size)");
+    ComPtr<ID3D12Resource> postbuildReadback;
+    {
+        auto rbHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto rbDesc  = CD3DX12_RESOURCE_DESC::Buffer(postbuildBytes);
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&postbuildReadback)));
+    }
+
+    // Emit one COMPACTED_SIZE postbuild-info per BLAS.  Single API call --
+    // EmitRaytracingAccelerationStructurePostbuildInfo takes an array of
+    // BLAS GVAs and writes the descs back-to-back into postbuildBuf.
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srcGvas(N);
+    for (UINT i = 0; i < N; ++i)
+        srcGvas[i] = temps[i].srcBlas->GetGPUVirtualAddress();
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pbDesc = {};
+    pbDesc.DestBuffer = postbuildBuf->GetGPUVirtualAddress();
+    pbDesc.InfoType   = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+    m_dxrCommandList->EmitRaytracingAccelerationStructurePostbuildInfo(&pbDesc, N, srcGvas.data());
+
+    // Copy postbuild info into the CPU-readable readback buffer.
+    auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(postbuildBuf.Get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList->ResourceBarrier(1, &toCopy);
+    commandList->CopyBufferRegion(postbuildReadback.Get(), 0, postbuildBuf.Get(), 0, postbuildBytes);
+    auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(postbuildBuf.Get(),
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    commandList->ResourceBarrier(1, &fromCopy);
+
+    // Flush + wait for postbuild info.
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+
+    // CPU-side: read compacted sizes.
+    std::vector<UINT64> compactedSizes(N);
+    {
+        D3D12_RANGE readAll = { 0, postbuildBytes };
+        void* mapped = nullptr;
+        ThrowIfFailed(postbuildReadback->Map(0, &readAll, &mapped));
+        auto* p = (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE_DESC*)mapped;
+        for (UINT i = 0; i < N; ++i) compactedSizes[i] = p[i].CompactedSizeInBytes;
+        D3D12_RANGE wrote = { 0, 0 };
+        postbuildReadback->Unmap(0, &wrote);
+    }
+
+    // Pass 2: allocate compacted destinations + copy with COMPACT mode.
+    ThrowIfFailed(commandAllocator->Reset());
+    ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
+
+    for (UINT i = 0; i < N; ++i)
+    {
+        auto& obj = m_objects[i];
+        AllocateUAVBuffer(device, compactedSizes[i], &obj.tradBlasStorage,
+                          D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                          L"Traditional BLAS result (compacted)");
+        m_dxrCommandList->CopyRaytracingAccelerationStructure(
+            obj.tradBlasStorage->GetGPUVirtualAddress(),
+            temps[i].srcBlas->GetGPUVirtualAddress(),
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+
+        auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(obj.tradBlasStorage.Get());
+        m_dxrCommandList->ResourceBarrier(1, &barrier);
+
+        obj.tradBlasGPUVA       = obj.tradBlasStorage->GetGPUVirtualAddress();
+        obj.tradBlasActualBytes = compactedSizes[i];
+        totalActualBytes       += compactedSizes[i];
+    }
+
+    // Execute + wait HERE so the worst-case temps stay alive until the
+    // GPU finishes copying out of them; if we let the caller's
+    // ExecuteCommandList run, temps[].srcBlas would release at function
+    // return (before submit) and the cmd-list close-time validation
+    // would fire D3D12 ERROR 921 ("resource deleted prior to closing").
+    // Reset cmd list/allocator afterwards so the caller can keep
+    // recording (TLAS build, etc.) into an empty list as it expects.
+    m_deviceResources->ExecuteCommandList();
+    m_deviceResources->WaitForGpu();
+    ThrowIfFailed(commandAllocator->Reset());
+    ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
+
+    const double cpuMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    SampleLog::LogF(L"[traditional BLAS][compact] %zu objects, %u geom descs, "
+                    L"worst-case=%llu  compacted=%llu (%.1f%% of wc)  scratch=%llu  "
+                    L"vb=%llu  ib=%llu (bytes) -- CPU=%.3f ms\n",
                     m_objects.size(), totalGeomDescs,
                     (unsigned long long)totalResultBytes,
+                    (unsigned long long)totalActualBytes,
+                    100.0 * (double)totalActualBytes / (double)totalResultBytes,
                     (unsigned long long)totalScratchBytes,
                     (unsigned long long)totalVbBytes,
                     (unsigned long long)totalIbBytes,
                     cpuMs);
     m_traditionalStaticTotalResultBytes  = totalResultBytes;
+    m_traditionalStaticTotalActualBytes  = totalActualBytes;
     m_traditionalStaticTotalScratchBytes = totalScratchBytes;
     m_traditionalStaticBuildMs           = cpuMs;
 }
@@ -3146,19 +3283,22 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     // BuildTraditionalStaticAS itself.
     s.geometryMode                = (int)m_geometryMode;
     {
-        UINT64 tradBlasSum    = 0;
-        UINT64 tradScratchSum = 0;
-        UINT64 tradVbSum      = 0;
-        UINT64 tradIbSum      = 0;
+        // For Implicit alloc: alloc == actual.  For Compact alloc: alloc
+        // is the worst-case prebuild size we used during the build (now
+        // freed!), actual is the compacted size that obj.tradBlasStorage
+        // currently holds.  m_traditionalStaticTotalResultBytes /
+        // ...ActualBytes are populated by BuildTraditionalStaticAS using
+        // the values captured DURING the build (so they're correct for
+        // Compact even after the worst-case temp is dropped).
+        s.traditionalBlasTotalBytes   = m_traditionalStaticTotalResultBytes;
+        s.traditionalBlasActualBytes  = m_traditionalStaticTotalActualBytes;
+        s.traditionalBlasScratchBytes = m_traditionalStaticTotalScratchBytes;
+        UINT64 tradVbSum = 0, tradIbSum = 0;
         for (const auto& obj : m_objects)
         {
-            if (obj.tradBlasStorage) tradBlasSum    += obj.tradBlasStorage->GetDesc().Width;
-            if (obj.tradBlasScratch) tradScratchSum += obj.tradBlasScratch->GetDesc().Width;
-            if (obj.tradVertexBuffer) tradVbSum     += obj.tradVertexBuffer->GetDesc().Width;
-            if (obj.tradIndexBuffer)  tradIbSum     += obj.tradIndexBuffer->GetDesc().Width;
+            if (obj.tradVertexBuffer) tradVbSum += obj.tradVertexBuffer->GetDesc().Width;
+            if (obj.tradIndexBuffer)  tradIbSum += obj.tradIndexBuffer->GetDesc().Width;
         }
-        s.traditionalBlasTotalBytes   = tradBlasSum;
-        s.traditionalBlasScratchBytes = tradScratchSum;
         s.traditionalVbBytes          = tradVbSum;
         s.traditionalIbBytes          = tradIbSum;
         s.traditionalBuildMs          = m_traditionalStaticBuildMs;
@@ -4326,22 +4466,26 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     if (isTraditional)
     {
         const auto& p = m_overlayStatsPrev;
-        const double blasMb     = s.traditionalBlasTotalBytes   / (1024.0 * 1024.0);
-        const double prevBlasMb = p.traditionalBlasTotalBytes   / (1024.0 * 1024.0);
+        const double allocMb    = s.traditionalBlasTotalBytes     / (1024.0 * 1024.0);
+        const double prevAllocMb= p.traditionalBlasTotalBytes     / (1024.0 * 1024.0);
+        const double actualMb   = s.traditionalBlasActualBytes    / (1024.0 * 1024.0);
+        const double prevActMb  = p.traditionalBlasActualBytes    / (1024.0 * 1024.0);
         const double scratchMb  = s.traditionalBlasScratchBytes / (1024.0 * 1024.0);
         const double prevScrMb  = p.traditionalBlasScratchBytes / (1024.0 * 1024.0);
         const double inputsMb   = (s.traditionalVbBytes + s.traditionalIbBytes) / (1024.0 * 1024.0);
         const double prevInpMb  = (p.traditionalVbBytes + p.traditionalIbBytes) / (1024.0 * 1024.0);
-        const UINT64 totalTris  = s.totalTriangleCount; // anim ball not in trad mode yet
+        const UINT64 totalTris  = s.totalTriangleCount;
         const double avgKb      = (totalTris > 0)
-            ? (double)s.traditionalBlasTotalBytes / (double)totalTris / 1024.0 : 0.0;
-        const double prevAvgKb  = (p.traditionalBlasTotalBytes > 0 && p.totalTriangleCount > 0)
-            ? (double)p.traditionalBlasTotalBytes / (double)p.totalTriangleCount / 1024.0 : 0.0;
+            ? (double)s.traditionalBlasActualBytes / (double)totalTris / 1024.0 : 0.0;
+        const double prevAvgKb  = (p.traditionalBlasActualBytes > 0 && p.totalTriangleCount > 0)
+            ? (double)p.traditionalBlasActualBytes / (double)p.totalTriangleCount / 1024.0 : 0.0;
 
         XMFLOAT2 c = pos;
         drawSeg(L"  BLAS ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", blasMb), c, deltaColour(blasMb, prevBlasMb));
-        drawSeg(L" MB  (avg ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
+        drawSeg(L" MB alloc  (", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
+        drawSeg(L" MB actual, avg ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.3f", avgKb), c, deltaColour(avgKb, prevAvgKb));
         drawSeg(L" KB/tri)", c, kSubtle);
         pos.y += kLineH;
@@ -4448,11 +4592,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const UINT64 prevAnimatedTotal = p.animatedTemplateBytes
                                        + p.animatedPerFrameClasAllocBytes
                                        + p.animatedBlasBytes;
+        // TOTAL line shows the bytes currently RESIDENT in GPU memory.
+        // For Compact traditional, the worst-case temp buffer is freed
+        // after the build, so the resident total uses the compacted
+        // (actual) size, not the original prebuild alloc.
         const UINT64 staticTotal       = isTraditional
-            ? s.traditionalBlasTotalBytes
+            ? s.traditionalBlasActualBytes
             : (s.staticClasAllocBytes + s.staticBlasTotalBytes);
         const UINT64 prevStaticTotal   = (p.geometryMode != (int)GeometryMode::Clusters)
-            ? p.traditionalBlasTotalBytes
+            ? p.traditionalBlasActualBytes
             : (p.staticClasAllocBytes + p.staticBlasTotalBytes);
         const UINT64 grandTotal     = staticTotal + animatedTotal + s.tlasBytes;
         const UINT64 prevGrandTotal = prevStaticTotal + prevAnimatedTotal + p.tlasBytes;
@@ -4619,6 +4767,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     if (IsTraditional())
     {
+        // [A] cycles traditional BLAS alloc mode (compact <-> implicit).
+        swprintf_s(kbuf, L"   BLAS alloc mode:  %s", TraditionalAllocModeName());
+        drawKeyLine(L"[A]", kbuf);
+
         // [F] is only meaningful in traditional mode (animated BLAS
         // update strategy).  Hide in cluster mode.
         swprintf_s(kbuf, L"   anim BLAS update: %s   (per-frame rebuild vs ALLOW_UPDATE refit)",
@@ -4843,6 +4995,12 @@ void D3D12RaytracingClusteredGeometry::OnRender()
             else if (_wcsicmp(act, L"geom-traditional")  == 0)
             {   m_geometryMode = GeometryMode::Traditional;
                 RebuildStaticAccelerationStructures(L"scheduled geom-traditional"); }
+            else if (_wcsicmp(act, L"trad-implicit")     == 0)
+            {   m_traditionalAllocMode = TraditionalAllocMode::Implicit;
+                RebuildStaticAccelerationStructures(L"scheduled trad-implicit"); }
+            else if (_wcsicmp(act, L"trad-compact")      == 0)
+            {   m_traditionalAllocMode = TraditionalAllocMode::Compact;
+                RebuildStaticAccelerationStructures(L"scheduled trad-compact"); }
             else if (_wcsicmp(act, L"anim-rebuild")      == 0)
             {   m_traditionalAnimMode = TraditionalAnimMode::Rebuild;
                 CaptureOverlayStatsSnapshot(); }
@@ -5266,15 +5424,27 @@ void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
     }
     else if (key == 'A' || key == 'a')
     {
-        // Cycle CLAS allocation strategy: Implicit -> GetSizes -> Compact -> ...
-        // Triggers a full GPU flush + rebuild of the static AS pipeline.
-        switch (m_clasAllocMode)
+        // [A] cycles the alloc strategy for whichever path is active:
+        //   Clustered BLAS: CLAS alloc mode (Implicit -> GetSizes -> Compact -> ...)
+        //   Traditional BLAS: BLAS alloc mode (Compact <-> Implicit)
+        // Either triggers a full GPU flush + rebuild of the static AS pipeline.
+        if (m_geometryMode == GeometryMode::Clusters)
         {
-        case ClasAllocMode::Implicit: m_clasAllocMode = ClasAllocMode::GetSizes; break;
-        case ClasAllocMode::GetSizes: m_clasAllocMode = ClasAllocMode::Compact;  break;
-        case ClasAllocMode::Compact:  m_clasAllocMode = ClasAllocMode::Implicit; break;
+            switch (m_clasAllocMode)
+            {
+            case ClasAllocMode::Implicit: m_clasAllocMode = ClasAllocMode::GetSizes; break;
+            case ClasAllocMode::GetSizes: m_clasAllocMode = ClasAllocMode::Compact;  break;
+            case ClasAllocMode::Compact:  m_clasAllocMode = ClasAllocMode::Implicit; break;
+            }
+            SampleLog::LogF(L"[input] CLAS alloc mode -> %s\n", ClasAllocModeName());
         }
-        SampleLog::LogF(L"[input] CLAS alloc mode -> %s\n", ClasAllocModeName());
+        else
+        {
+            m_traditionalAllocMode = (m_traditionalAllocMode == TraditionalAllocMode::Compact)
+                                     ? TraditionalAllocMode::Implicit
+                                     : TraditionalAllocMode::Compact;
+            SampleLog::LogF(L"[input] traditional BLAS alloc mode -> %s\n", TraditionalAllocModeName());
+        }
         RebuildStaticAccelerationStructures(L"alloc-mode toggle");
     }
     else if (key == 'V' || key == 'v')

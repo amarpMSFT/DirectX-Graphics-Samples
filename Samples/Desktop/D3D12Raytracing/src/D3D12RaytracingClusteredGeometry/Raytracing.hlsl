@@ -48,16 +48,24 @@ ByteAddressBuffer                 g_clusterOffsets : register(t4);   // uint2 st
 // lives in CPU-authored data; the shader just loads the meta and applies
 // the override fields uniformly.  See RaytracingHlslCompat.h ClusterMeta.
 ByteAddressBuffer                 g_clusterMeta    : register(t5);
-// Tiny per-instance lookup used by the traditional-BLAS closest-hit
-// (cluster path uses ClusterID() directly and never reads this).
-// One uint per TLAS instance: the cluster ID of cluster 0 of that
-// instance's object.  Traditional path computes
-//   cid = g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
-// which gives the SAME global cluster ID the cluster path's
-// ClusterID() returns -- so the cluster-meta / cluster-normals /
-// cluster-indices / cluster-offsets buffers above feed both paths
-// and the closest-hit logic stays identical between modes.
-ByteAddressBuffer                 g_perInstanceFirstCid : register(t6);
+// Traditional-BLAS cid recovery: per-tri cluster-ID lookup table
+// (one uint per static-scene triangle) + per-(InstanceIdx, GeomIdx)
+// tri-base table (a flat 2D array padded to MAX_GEOMS_PER_INSTANCE
+// entries per instance).  At hit time the traditional path does
+//
+//   uint base = g_tradGeomTriBase[InstanceIndex()*MAX_GEOMS + GeomIdx]
+//   uint cid  = g_tradTriToCid[base + PrimitiveIndex()]
+//
+// to recover the same global cluster ID the cluster path gets from
+// ClusterID() -- so g_clusterMeta / g_clusterNormals / g_clusterIndices
+// / g_clusterOffsets feed both paths identically.  Cluster path does
+// NOT read these (ClusterID() is free); they're bound unconditionally
+// just so the root sig is single-shape.
+//
+// MAX_GEOMS_PER_INSTANCE matches kMaxGeomsPerInstance on the CPU.
+#define MAX_GEOMS_PER_INSTANCE 8
+ByteAddressBuffer                 g_tradTriToCid      : register(t6);
+ByteAddressBuffer                 g_tradGeomTriBase   : register(t7);
 
 ClusterMeta LoadClusterMeta(uint cid)
 {
@@ -81,10 +89,10 @@ ClusterMeta LoadClusterMeta(uint cid)
 }
 
 // Traditional-BLAS path piggybacks on this same loader by computing
-// cid = g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
-// in LoadHitContext below.  No separate "default meta" needed -- the
-// same per-cluster overrides, palette tints, and interior-surface
-// flags apply, so visuals are identical between paths.
+// cid from the per-tri lookup table indexed by GeometryIndex() +
+// PrimitiveIndex() in LoadHitContext below.  No separate "default meta"
+// needed -- the same per-cluster overrides, palette tints, and interior-
+// surface flags apply, so visuals are identical between paths.
 
 struct [raypayload] Payload
 {
@@ -405,21 +413,43 @@ struct HitContext
 
 void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
 {
-    // Recover the cluster ID identically for both paths.
+    // Recover the cluster ID + cluster-local primitive index identically
+    // for both paths.
     //   Clustered BLAS: ClusterID() is a DXR2 intrinsic that returns the
-    //                   cluster ID the CPU stamped into each CLAS at build.
-    //   Traditional BLAS: clusters are expressed as separate geometry
-    //                   descs inside the per-object BLAS, so we get the
-    //                   geometry slot from GeometryIndex() (DXR1.1) and
-    //                   add the per-instance first-cluster-ID base from
-    //                   a tiny lookup table (one uint per TLAS instance).
-    // Either way the SAME global cid value comes out, so g_clusterMeta
+    //                   cluster ID the CPU stamped into each CLAS at
+    //                   build, and PrimitiveIndex() is the triangle slot
+    //                   WITHIN that CLAS -- i.e. already cluster-local,
+    //                   so we use both intrinsics as-is.
+    //   Traditional BLAS: GeometryIndex() returns the material-region
+    //                   slot (NOT the cluster) because the per-region
+    //                   geom-desc layout groups multiple clusters into
+    //                   one geometry.  PrimitiveIndex() is the triangle
+    //                   index within the GEOMETRY DESC, spanning many
+    //                   clusters' worth of triangles -- NOT a per-cluster
+    //                   primitive index.  We use those two to index a
+    //                   precomputed per-triangle (cid, localPrim) table
+    //                   that was built in matRegionIdx-sorted cluster
+    //                   order, recovering the same (cid, primIdx) pair
+    //                   the cluster path's intrinsics give.
+    // Either way the SAME (cid, primIdx) pair comes out, so g_clusterMeta
     // + g_clusterNormals + g_clusterIndices + g_clusterOffsets are
     // queried identically below.
     const bool isTraditional = (g_scene.runtimeParams.z != 0u);
-    const uint cid = isTraditional
-        ? (g_perInstanceFirstCid.Load(InstanceIndex() * 4) + GeometryIndex())
-        : ClusterID();
+    uint cid;
+    uint primIdx;
+    if (isTraditional)
+    {
+        const uint geomBase = g_tradGeomTriBase.Load(
+            (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
+        const uint2 cidAndLocal = g_tradTriToCid.Load2((geomBase + PrimitiveIndex()) * 8);
+        cid     = cidAndLocal.x;
+        primIdx = cidAndLocal.y;
+    }
+    else
+    {
+        cid     = ClusterID();
+        primIdx = PrimitiveIndex();
+    }
 
     ctx.meta = LoadClusterMeta(cid);
     ctx.mat  = g_materials[InstanceID()];
@@ -432,9 +462,9 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
 
     // ============================================================================
     // World-space surface normal: smoothed via per-vertex cluster-normal
-    // side-channel keyed by (cid, PrimitiveIndex).
+    // side-channel keyed by (cid, primIdx).  primIdx here is the
+    // CLUSTER-LOCAL triangle index recovered above for both paths.
     // ============================================================================
-    const uint primIdx = PrimitiveIndex();
     uint2 off    = g_clusterOffsets.Load2(cid * 8);
     uint  idxBase= (off.y + primIdx * 3) * 4;
     uint  i0     = g_clusterIndices.Load(idxBase + 0);

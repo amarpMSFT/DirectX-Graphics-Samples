@@ -13,7 +13,7 @@
 // buffer + a few global constants; this CS expands each metadata entry
 // into the full 80-byte args struct.
 //
-// Per-cluster metadata layout (24 bytes/cluster, matches ClasArgsMeta in
+// Per-cluster metadata layout (28 bytes/cluster, matches ClasArgsMeta in
 // the C++ side):
 //
 //   offset  0 (4 B)   UINT   clusterID
@@ -22,6 +22,7 @@
 //   offset 12 (4 B)   UINT   vbByteOffset    (from g_baseGpuVa)
 //   offset 16 (4 B)   UINT   ibByteOffset    (from g_baseGpuVa)
 //   offset 20 (4 B)   UINT   opaqueFlag      (0 or D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE)
+//   offset 24 (4 B)   UINT   matRegionIdx    (becomes per-CLAS BaseGeometryIndex)
 //
 // Layout of D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS (80 bytes):
 //
@@ -55,7 +56,16 @@ cbuffer Constants : register(b0)
     uint g_positionTruncateBits;   // 0..23
 };
 
-// Input: 24 bytes/cluster of metadata.
+// Input: 28 bytes/cluster of metadata.  Layout (matches CPU ClasArgsMeta):
+//   offset  0 (4 B)   UINT   clusterID
+//   offset  4 (4 B)   UINT   triangleCount   (must fit in u16)
+//   offset  8 (4 B)   UINT   vertexCount     (must fit in u16)
+//   offset 12 (4 B)   UINT   vbByteOffset    (from g_baseGpuVa)
+//   offset 16 (4 B)   UINT   ibByteOffset    (from g_baseGpuVa)
+//   offset 20 (4 B)   UINT   opaqueFlag      (0 or D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE)
+//   offset 24 (4 B)   UINT   matRegionIdx    (24-bit unsigned, packed into upper 24
+//                                              bits of BaseGeometryIndexAndFlags so
+//                                              GeometryIndex() at hit time returns it)
 ByteAddressBuffer   g_meta    : register(t0);
 
 // Output: 80 bytes/cluster.
@@ -81,25 +91,31 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint idx = tid.x;
     if (idx >= g_clusterCount) return;
 
-    // Load 24 bytes of per-cluster metadata.
-    const uint3 m0 = g_meta.Load3(idx * 24u +  0);  // {clusterID, triCount, vertCount}
-    const uint3 m1 = g_meta.Load3(idx * 24u + 12);  // {vbOff, ibOff, opaqueFlag}
+    // Load 28 bytes of per-cluster metadata.
+    const uint3 m0 = g_meta.Load3(idx * 28u +  0);  // {clusterID, triCount, vertCount}
+    const uint3 m1 = g_meta.Load3(idx * 28u + 12);  // {vbOff, ibOff, opaqueFlag}
+    const uint  m2 = g_meta.Load (idx * 28u + 24);  // {matRegionIdx}
 
-    const uint  clusterID   = m0.x;
-    const uint  triCount    = m0.y;
-    const uint  vertCount   = m0.z;
-    const uint  vbOff       = m1.x;
-    const uint  ibOff       = m1.y;
-    const uint  opaqueFlag  = m1.z;
+    const uint  clusterID    = m0.x;
+    const uint  triCount     = m0.y;
+    const uint  vertCount    = m0.z;
+    const uint  vbOff        = m1.x;
+    const uint  ibOff        = m1.y;
+    const uint  opaqueFlag   = m1.z;
+    const uint  matRegionIdx = m2;
 
     const uint2 vbGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, vbOff);
     const uint2 ibGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, ibOff);
+
+    // BaseGeometryIndexAndFlags layout: low 8 bits = flags, upper 24 bits
+    // = BaseGeometryIndex.  GeometryIndex() at hit returns the BaseGeometryIndex.
+    const uint baseGeomIdxAndFlags = (matRegionIdx << 8) | (opaqueFlag & 0xFFu);
 
     const uint baseByte = idx * 80u;
     g_argsOut.Store (baseByte +  0, clusterID);                                                // ClusterID
     g_argsOut.Store (baseByte +  4, 0u);                                                       // ClusterFlags
     g_argsOut.Store (baseByte +  8, pack16(triCount, vertCount));                              // TriCount/VertCount
-    g_argsOut.Store (baseByte + 12, opaqueFlag);                                               // BaseGeometryIndexAndFlags
+    g_argsOut.Store (baseByte + 12, baseGeomIdxAndFlags);                                      // BaseGeometryIndexAndFlags
     g_argsOut.Store (baseByte + 16, 0u);                                                       // OpacityMicromapBaseLocation
     g_argsOut.Store (baseByte + 20, pack16(g_vertexBufferStride, 1u));                         // VBStride/IBStride
     g_argsOut.Store (baseByte + 24, pack16(0u, 0u));                                           // OMM IB Stride / GeomIdxAndFlagsArrayStride

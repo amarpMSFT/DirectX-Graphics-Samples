@@ -74,6 +74,24 @@ namespace ProceduralGeometry
                                                    // TOP tile's cid so the colour layer
                                                    // is unified across the slab volume.
         unsigned int            flags = 0;         // CLUSTER_FLAG_* bits.
+        // ------------------------------------------------------------------
+        // Material region index within the owning OBJECT.  Lets a single
+        // object split into multiple material regions: clusters with
+        // matRegionIdx=0 form geometry 0 of the object's BLAS, clusters
+        // with matRegionIdx=1 form geometry 1, etc.  Used by both paths:
+        //   Cluster:     BUILD_CLAS_FROM_TRIANGLES_ARGS::BaseGeometryIndex
+        //                gets stamped with this value per CLAS, so the
+        //                BLAS-from-CLAS has geometries grouped by region
+        //                and GeometryIndex() in the closest-hit returns
+        //                this value at hit time.
+        //   Traditional: clusters are reordered within each object so
+        //                same-region clusters are contiguous in the VB+IB,
+        //                and one D3D12_RAYTRACING_GEOMETRY_DESC is emitted
+        //                per region (covering all that region's clusters).
+        // Default 0 (single-region object) is what every procedural
+        // generator emits; scene code overrides for multi-material objects
+        // like the mixed-material small sphere.
+        unsigned int            matRegionIdx = 0;
     };
 
     struct Mesh

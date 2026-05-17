@@ -35,11 +35,13 @@ namespace GlobalRootSig {
                                     //                                                      vertOff, idxOff)
         ClusterMetaSRVSlot,         // Refactor: ByteAddressBuffer of ClusterMeta[] - data-driven
                                     //           per-cluster material/colour override metadata.
-        // Tiny per-instance first-cluster-ID lookup table used ONLY by
-        // the traditional-BLAS closest-hit (cluster path uses ClusterID()
-        // directly and never reads this).  Bound unconditionally so the
-        // root-sig is single-shape; the buffer is ~32 bytes total.
-        PerInstanceFirstCidSRVSlot,
+        // Traditional-BLAS path: per-triangle cluster-ID lookup +
+        // per-(InstIdx, GeomIdx) tri-base table.  Lets the traditional
+        // closest-hit recover the same cid the cluster path gets from
+        // ClusterID(), even though geom descs now group multiple
+        // clusters into one material-region geometry.
+        TradTriToCidSRVSlot,
+        TradGeomTriBaseSRVSlot,
         Count
     };
 }
@@ -154,16 +156,26 @@ private:
     UINT64 m_traditionalStaticTotalActualBytes  = 0;   // == result bytes in Implicit; sum of compacted sizes in Compact
     UINT64 m_traditionalStaticTotalScratchBytes = 0;
     double m_traditionalStaticBuildMs            = 0.0;
-    // Per-instance first-cluster-ID lookup table.  One uint per TLAS
-    // instance: the cluster ID of cluster 0 of that instance's object.
-    // Read by the traditional path's closest-hit as
-    //   cid = g_perInstanceFirstCid[InstanceIndex()] + GeometryIndex()
-    // to recover the same global cluster ID the cluster path's
-    // ClusterID() returns -- so both paths use the same
-    // g_clusterMeta / g_clusterNormals / g_clusterIndices /
-    // g_clusterOffsets buffers and produce identical visuals.  See
-    // BuildPerInstanceFirstCidTable.
-    ComPtr<ID3D12Resource>               m_perInstanceFirstCidBuffer;
+    // Per-triangle cluster-ID lookup table for the traditional-BLAS
+    // closest-hit.  Indexed by a (per-instance, per-geom) tri base +
+    // PrimitiveIndex().  Returns the global cluster ID for that
+    // triangle's source CLAS in the cluster path, so the same
+    // g_clusterMeta / g_clusterNormals / etc. tables feed both paths.
+    //
+    // Cluster path does NOT read this: it uses ClusterID() directly
+    // (DXR2 intrinsic).  Traditional path needs it because grouping
+    // multiple clusters into one geometry desc (per-material-region
+    // layout) means GeometryIndex() no longer maps 1:1 to clusters.
+    //
+    // Sizes for the static scene: ~44k tris × 4 = 176 KB tri-to-cid;
+    // ~32 entries (8 instances × up to MaxGeomsPerInst) × 4 = 128 B
+    // for the geom tri-base table.  See BuildTradCidLookup.
+    ComPtr<ID3D12Resource>               m_tradTriToCidBuffer;
+    ComPtr<ID3D12Resource>               m_tradGeomTriBaseBuffer;
+    // Max geometries per instance the shader is willing to look up.
+    // Padding for the flat per-(InstIdx, GeomIdx) layout.  Bump if a
+    // future object grows past it.
+    static constexpr UINT                kMaxGeomsPerInstance = 8;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
     // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
@@ -650,12 +662,12 @@ private:
     UINT                                 m_clusterIndicesCount = 0;
     UINT                                 m_clusterOffsetsCount = 0;
     void BuildClusterShaderSideBuffers();
-    // Tiny per-instance lookup table used by the traditional-BLAS
-    // closest-hit to recover the global cluster ID without the cluster-
-    // path's DXR2 ClusterID() intrinsic.  4 bytes per TLAS instance --
-    // negligible.  Built unconditionally at init so the root-sig
-    // binding is always valid; only the traditional path reads it.
-    void BuildPerInstanceFirstCidTable();
+    // Traditional-BLAS cid recovery: builds the per-triangle cid table
+    // + per-(InstanceIdx, GeometryIdx) tri-base table that the
+    // traditional path's closest-hit uses to map (GeometryIndex(),
+    // PrimitiveIndex()) -> cid.  Called as part of the traditional
+    // build path; rebuilt on any geometry-mode toggle.
+    void BuildTradCidLookup();
 
     // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -

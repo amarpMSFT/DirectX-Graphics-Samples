@@ -790,6 +790,8 @@ private:
         UINT64 staticClasActualBytes     = 0;          // sumActualBytes from rebuild
         UINT64 staticClasScratchBytes    = 0;
         UINT64 staticBlasTotalBytes      = 0;
+        UINT64 staticBlasScratchBytes    = 0;    // BLAS-from-CLAS scratch (cluster path)
+        UINT64 staticClusterInputBytes   = 0;    // m_clusterInputBuffer (vertex+index data) -- cluster-path analog of trad's VB+IB
         // Traditional (DXR1) static path
         UINT64 traditionalBlasTotalBytes      = 0;   // sum of per-obj worst-case prebuild sizes (== alloc)
         UINT64 traditionalBlasActualBytes     = 0;   // sum of per-obj final-storage sizes (compacted in Compact mode)
@@ -802,10 +804,14 @@ private:
         int    geometryMode                   = 0;  // matches GeometryMode enum order
         // Animated path
         UINT64 animatedTemplateBytes     = 0;
+        UINT64 animatedTemplateScratchBytes = 0;        // template build scratch (cluster path)
+        UINT64 animatedTemplateInputBytes   = 0;        // templateInputBuffer (hint verts + indices)
+        UINT64 animatedRestPositionsBytes   = 0;        // restPositionsBuffer (input to AnimateBall.cs every frame, both modes)
         UINT64 animatedPerFrameClasAllocBytes  = 0;
         UINT64 animatedPerFrameClasActualBytes = 0;    // sumActual from one-shot INSTANTIATE size readback
         UINT64 animatedPerFrameClasScratchBytes = 0;
         UINT64 animatedBlasBytes         = 0;
+        UINT64 animatedBlasScratchBytes  = 0;           // BLAS-from-CLAS scratch (cluster path animated)
         // Traditional-mode animated BLAS (DXR1 per-frame rebuild/refit).
         // Populated when geometryMode==Traditional; zero otherwise.  The
         // resident-memory value is the BLAS storage (tradBlasResultBytes);

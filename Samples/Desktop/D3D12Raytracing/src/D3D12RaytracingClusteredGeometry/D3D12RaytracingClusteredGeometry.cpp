@@ -3891,6 +3891,8 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     for (const auto& obj : m_objects)
         if (obj.blasStorage) blasSum += obj.blasStorage->GetDesc().Width;
     s.staticBlasTotalBytes   = blasSum;
+    s.staticBlasScratchBytes = sizeOf(m_blasScratchBuffer);
+    s.staticClusterInputBytes = sizeOf(m_clusterInputBuffer);
 
     // Animated  (animatedPerFrameClasActualBytes is set by
     // MeasureAnimatedClasBytesOneShot and we leave it alone here).
@@ -3898,9 +3900,13 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     {
         const auto& a = m_animatedObject;
         s.animatedTemplateBytes            = sizeOf(a.templateResultBuffer);
+        s.animatedTemplateScratchBytes     = sizeOf(a.templateScratchBuffer);
+        s.animatedTemplateInputBytes       = sizeOf(a.templateInputBuffer);
+        s.animatedRestPositionsBytes       = sizeOf(a.restPositionsBuffer);
         s.animatedPerFrameClasAllocBytes   = sizeOf(a.perFrameClasResultBuffer);
         s.animatedPerFrameClasScratchBytes = sizeOf(a.perFrameClasScratchBuffer);
         s.animatedBlasBytes                = sizeOf(a.blasStorage);
+        s.animatedBlasScratchBytes         = sizeOf(a.blasScratchBuffer);
         // Traditional-mode animated BLAS state.  Independent of cluster-
         // path fields above so the overlay can show both side-by-side on
         // a [T] toggle without one mode's values bleeding into the other.
@@ -3911,8 +3917,10 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     }
     else
     {
-        s.animatedTemplateBytes = s.animatedPerFrameClasAllocBytes =
-        s.animatedPerFrameClasScratchBytes = s.animatedBlasBytes =
+        s.animatedTemplateBytes = s.animatedTemplateScratchBytes =
+        s.animatedTemplateInputBytes = s.animatedRestPositionsBytes =
+        s.animatedPerFrameClasAllocBytes = s.animatedPerFrameClasScratchBytes =
+        s.animatedBlasBytes = s.animatedBlasScratchBytes =
         s.animatedPerFrameClasActualBytes = 0;
         s.animatedTradBlasBytes = s.animatedTradScratchBytes = s.animatedTradIbBytes = 0;
         s.animatedTradModeIsRefit = 0;
@@ -5188,22 +5196,24 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", avgKb), c, deltaColour(avgKb, prevAvgKb));
         drawSeg(L" KB/geom)", c, kSubtle);
         pos.y += kLineH;
-        c = pos;
-        drawSeg(L"  scratch ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
-        drawSeg(L" MB    inputs (vb+ib) ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
-        drawSeg(L" MB", c, kSubtle);
-        pos.y += kLineH;
         // Section subtotal (cross-mode delta vs m_overlayStatsPrev -- so a
         // [T] toggle paints this red/green with the cluster-vs-trad
         // comparison of total static resident memory).  Trad path = BLAS
-        // actual only.
+        // actual only.  Label suffix tells the user exactly which
+        // buffers contribute; scratch and inputs are below, outside the
+        // total since they're workspace + source-data, not BVH.
         const double tradTotalMb = sectionStaticTotalBytes(s) / (1024.0 * 1024.0);
         const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradTotalMb), c, deltaColour(tradTotalMb, prevTotalMb));
+        drawSeg(L" MB  (BLAS)", c, kSubtle);
+        pos.y += kLineH;
+        c = pos;
+        drawSeg(L"  scratch ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
+        drawSeg(L" MB    inputs (vb+ib) ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
     }
@@ -5226,14 +5236,16 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double prevAllocMb = p.staticClasAllocBytes   / (1024.0 * 1024.0);
         const double actualMb    = s.staticClasActualBytes  / (1024.0 * 1024.0);
         const double prevActMb   = p.staticClasActualBytes  / (1024.0 * 1024.0);
-        const double scratchMb   = s.staticClasScratchBytes / (1024.0 * 1024.0);
-        const double prevScrMb   = p.staticClasScratchBytes / (1024.0 * 1024.0);
+        const double scratchMb   = (s.staticClasScratchBytes + s.staticBlasScratchBytes) / (1024.0 * 1024.0);
+        const double prevScrMb   = (p.staticClasScratchBytes + p.staticBlasScratchBytes) / (1024.0 * 1024.0);
         const double avgKb       = (s.totalClusterCount > 0)
             ? (double)s.staticClasAllocBytes / (double)s.totalClusterCount / 1024.0 : 0.0;
         const double prevAvgKb   = (p.totalClusterCount > 0)
             ? (double)p.staticClasAllocBytes / (double)p.totalClusterCount / 1024.0 : 0.0;
         const double blasMb      = s.staticBlasTotalBytes   / (1024.0 * 1024.0);
         const double prevBlasMb  = p.staticBlasTotalBytes   / (1024.0 * 1024.0);
+        const double inputsMb    = s.staticClusterInputBytes / (1024.0 * 1024.0);
+        const double prevInpMb   = p.staticClusterInputBytes / (1024.0 * 1024.0);
 
         XMFLOAT2 c = pos;
         drawSeg(L"  CLAS ", c, kSubtle);
@@ -5255,20 +5267,28 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
 
-        c = pos;
-        drawSeg(L"  scratch ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
-        drawSeg(L" MB", c, kSubtle);
-        pos.y += kLineH;
         // Section subtotal (cross-mode delta vs m_overlayStatsPrev -- so a
         // [T] toggle paints this red/green with the cluster-vs-trad
         // comparison of total static resident memory).  Cluster path =
-        // CLAS alloc + BLAS.
+        // CLAS alloc + BLAS.  Label suffix tells the user exactly which
+        // buffers contribute -- scratch and inputs are below, outside
+        // the total since they're workspace + source-data, not BVH.
         const double clTotalMb   = sectionStaticTotalBytes(s) / (1024.0 * 1024.0);
         const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clTotalMb), c, deltaColour(clTotalMb, prevTotalMb));
+        drawSeg(L" MB  (CLAS + BLAS)", c, kSubtle);
+        pos.y += kLineH;
+        // Scratch + inputs: outside the BVH total above (scratch is
+        // workspace the driver re-uses across builds; inputs are the
+        // source vertex+index data the build reads from).  Same line
+        // because they're conceptually the "supporting" memory.
+        c = pos;
+        drawSeg(L"  scratch ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
+        drawSeg(L" MB    inputs ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
     }
@@ -5310,33 +5330,39 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
         if (isTradMode)
         {
-            // Traditional-mode animated stats: just BLAS + scratch + IB.
-            // (No templates, no per-frame CLAS in this mode.)
+            // Traditional-mode animated stats: BLAS (resident BVH) plus
+            // total + scratch/inputs breakout below.  No templates / no
+            // per-frame CLAS in this mode.  perFrameVertexBuffer is
+            // both written by AnimateBall.cs AND read by the BLAS
+            // build, so it's a working buffer not a pure input -- the
+            // "input" line here counts the flat IB + the rest-positions
+            // buffer (the immutable input that AnimateBall.cs reads).
             const double aBlasMb   = s.animatedTradBlasBytes    / (1024.0 * 1024.0);
             const double prevABlas = p.animatedTradBlasBytes    / (1024.0 * 1024.0);
             const double aScrMb    = s.animatedTradScratchBytes / (1024.0 * 1024.0);
             const double prevAScr  = p.animatedTradScratchBytes / (1024.0 * 1024.0);
-            const double aIbMb     = s.animatedTradIbBytes      / (1024.0 * 1024.0);
+            const double aInputsMb = (s.animatedTradIbBytes + s.animatedRestPositionsBytes) / (1024.0 * 1024.0);
+            const double prevAInp  = (p.animatedTradIbBytes + p.animatedRestPositionsBytes) / (1024.0 * 1024.0);
 
             XMFLOAT2 c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-            drawSeg(L" MB   + scratch ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb), c, deltaColour(aScrMb, prevAScr));
-            drawSeg(L" MB   inputs (IB) ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aIbMb), c, kSubtle);
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
-            // Cross-mode section subtotal: trad path's resident animated
-            // memory = the per-frame BLAS only.  Comparison vs the prev
-            // snapshot (which on [T] toggle is the cluster path's
-            // templates+CLAS+BLAS sum) gives the user an at-a-glance
-            // "how much animated memory does each mode cost".
+            // Cross-mode section subtotal + label.  Trad's resident
+            // animated memory is just the per-frame-rebuilt BLAS.
             const double tradAnimTotalMb = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradAnimTotalMb), c, deltaColour(tradAnimTotalMb, prevAnimTotalMb));
+            drawSeg(L" MB  (BLAS)", c, kSubtle);
+            pos.y += kLineH;
+            c = pos;
+            drawSeg(L"  scratch ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb), c, deltaColour(aScrMb, prevAScr));
+            drawSeg(L" MB    inputs (ib + rest) ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aInputsMb), c, deltaColour(aInputsMb, prevAInp));
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
             pos.y += kSectionGap;
@@ -5349,10 +5375,24 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevPfMb  = p.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
             const double pfActMb   = s.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
             const double prevPfAct = p.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
-            const double pfScrMb   = s.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
-            const double prevPfScr = p.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
             const double aBlasMb   = s.animatedBlasBytes                / (1024.0 * 1024.0);
             const double prevABlas = p.animatedBlasBytes                / (1024.0 * 1024.0);
+            // Scratch = template build + per-frame CLAS + BLAS-from-CLAS
+            // scratch summed (all three are workspace re-used across
+            // builds, all three are resident).
+            const double scrMb     = (s.animatedTemplateScratchBytes
+                                    + s.animatedPerFrameClasScratchBytes
+                                    + s.animatedBlasScratchBytes) / (1024.0 * 1024.0);
+            const double prevScrMb = (p.animatedTemplateScratchBytes
+                                    + p.animatedPerFrameClasScratchBytes
+                                    + p.animatedBlasScratchBytes) / (1024.0 * 1024.0);
+            // Inputs = templateInputBuffer (hint vertex+index source for
+            // BUILD_CLUSTER_TEMPLATES) + restPositionsBuffer (read every
+            // frame by AnimateBall.cs).  Both immutable post-init.
+            const double inputsMb  = (s.animatedTemplateInputBytes
+                                    + s.animatedRestPositionsBytes) / (1024.0 * 1024.0);
+            const double prevInpMb = (p.animatedTemplateInputBytes
+                                    + p.animatedRestPositionsBytes) / (1024.0 * 1024.0);
 
             XMFLOAT2 c = pos;
             drawSeg(L"  templates ", c, kSubtle);
@@ -5365,9 +5405,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
             drawSeg(L" MB alloc  (", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
-            drawSeg(L" MB actual)  + scratch ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfScrMb), c, deltaColour(pfScrMb, prevPfScr));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(L" MB actual)", c, kSubtle);
             pos.y += kLineH;
 
             c = pos;
@@ -5375,16 +5413,21 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
-            // Cross-mode section subtotal: cluster path's resident animated
-            // memory = templates + per-frame CLAS alloc + BLAS-from-CLAS.
-            // Comparison vs the prev snapshot (which on [T] toggle is the
-            // trad path's single per-frame DXR1 BLAS) gives the user an
-            // at-a-glance "how much animated memory does each mode cost".
+            // Cross-mode section subtotal + label.  Cluster path's
+            // resident animated memory = templates + per-frame CLAS
+            // alloc + BLAS-from-CLAS.  Scratch/inputs broken out below.
             const double clAnimTotalMb   = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
+            drawSeg(L" MB  (templates + CLAS + BLAS)", c, kSubtle);
+            pos.y += kLineH;
+            c = pos;
+            drawSeg(L"  scratch ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scrMb), c, deltaColour(scrMb, prevScrMb));
+            drawSeg(L" MB    inputs (hint+rest) ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
             pos.y += kSectionGap;
@@ -5511,11 +5554,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(L")", c, kSubtle);
             pos.y += kLineH;
 
-            // Per-frame STATIC-AS rebuild line, only when the [R] mode is
-            // active.  Shows the cost of forcing per-frame rebuilds even
-            // though the inputs don't change -- a stand-in for an LOD
-            // pipeline that legitimately needs to rebuild every frame.
-            if (m_staticRebuildMode != StaticRebuildMode::None)
+            // Per-frame STATIC-AS rebuild line.  CLUSTER-MODE-ONLY: the [R]
+            // toggle is gated on cluster mode (see OnKeyDown), and the
+            // per-frame static rebuild path itself is gated on cluster
+            // mode in OnRender.  m_staticRebuildMode is sticky across [T]
+            // toggles though, so without an explicit mode-check here the
+            // line (including the "[CLAS rebuild requires Implicit alloc;
+            // press [A]]" hint) would still render in trad mode -- both
+            // misleading (the rebuild isn't actually running) and stale
+            // (the [A] hint refers to CLAS, which doesn't exist in trad).
+            if (m_staticRebuildMode != StaticRebuildMode::None &&
+                m_geometryMode == GeometryMode::Clusters)
             {
                 const bool clasActive =
                     (m_staticRebuildMode == StaticRebuildMode::ClasAndBlas) &&

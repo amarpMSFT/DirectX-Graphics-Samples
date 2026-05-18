@@ -5130,6 +5130,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     pos.y += kLineH + kSectionGap;
 
     // ----- STATIC section ----- (cluster path: CLAS+BLAS; traditional path: BLAS only)
+    // Helper: per-mode total resident bytes for the static path -- so the
+    // section subtotal at the bottom of each STATIC arm can show an
+    // apples-to-apples comparison against the OTHER mode's last value
+    // (cluster: CLAS+BLAS vs trad: BLAS).
+    auto sectionStaticTotalBytes = [](const OverlayStats& x) -> UINT64 {
+        return (x.geometryMode == (int)GeometryMode::Clusters)
+            ? (x.staticClasAllocBytes + x.staticBlasTotalBytes)
+            : x.traditionalBlasActualBytes;
+    };
     draw(L"STATIC:", pos, kAccent);
     pos.y += kLineH;
     if (isTraditional)
@@ -5175,6 +5184,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
+        // Section subtotal (cross-mode delta vs m_overlayStatsPrev -- so a
+        // [T] toggle paints this red/green with the cluster-vs-trad
+        // comparison of total static resident memory).  Trad path = BLAS
+        // actual only.
+        const double tradTotalMb = sectionStaticTotalBytes(s) / (1024.0 * 1024.0);
+        const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
+        c = pos;
+        drawSeg(L"  total ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradTotalMb), c, deltaColour(tradTotalMb, prevTotalMb));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
     }
     else
     {
@@ -5201,6 +5221,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             ? (double)s.staticClasAllocBytes / (double)s.totalClusterCount / 1024.0 : 0.0;
         const double prevAvgKb   = (p.totalClusterCount > 0)
             ? (double)p.staticClasAllocBytes / (double)p.totalClusterCount / 1024.0 : 0.0;
+        const double blasMb      = s.staticBlasTotalBytes   / (1024.0 * 1024.0);
+        const double prevBlasMb  = p.staticBlasTotalBytes   / (1024.0 * 1024.0);
 
         XMFLOAT2 c = pos;
         drawSeg(L"  CLAS ", c, kSubtle);
@@ -5212,15 +5234,41 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(L" KB/cl)", c, kSubtle);
         pos.y += kLineH;
 
+        // BLAS line: cluster path's per-object BLAS storage (sum over all
+        // static objects).  The cluster path holds BOTH a CLAS pool AND
+        // per-object BLAS-from-CLAS so the static-memory comparison vs
+        // trad (which has just BLAS) needs both lines visible.
+        c = pos;
+        drawSeg(L"  BLAS ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", blasMb), c, deltaColour(blasMb, prevBlasMb));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+
         c = pos;
         drawSeg(L"  scratch ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
+        drawSeg(L" MB", c, kSubtle);
+        pos.y += kLineH;
+        // Section subtotal (cross-mode delta vs m_overlayStatsPrev -- so a
+        // [T] toggle paints this red/green with the cluster-vs-trad
+        // comparison of total static resident memory).  Cluster path =
+        // CLAS alloc + BLAS.
+        const double clTotalMb   = sectionStaticTotalBytes(s) / (1024.0 * 1024.0);
+        const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
+        c = pos;
+        drawSeg(L"  total ", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clTotalMb), c, deltaColour(clTotalMb, prevTotalMb));
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
     }
     pos.y += kSectionGap;
 
     // ----- ANIMATED section -----
+    auto sectionAnimatedTotalBytes = [](const OverlayStats& x) -> UINT64 {
+        return (x.geometryMode == (int)GeometryMode::Clusters)
+            ? (x.animatedTemplateBytes + x.animatedPerFrameClasAllocBytes + x.animatedBlasBytes)
+            : x.animatedTradBlasBytes;
+    };
     if (m_animatedObjectEnabled)
     {
         const auto& a = m_animatedObject;
@@ -5268,6 +5316,18 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aIbMb), c, kSubtle);
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
+            // Cross-mode section subtotal: trad path's resident animated
+            // memory = the per-frame BLAS only.  Comparison vs the prev
+            // snapshot (which on [T] toggle is the cluster path's
+            // templates+CLAS+BLAS sum) gives the user an at-a-glance
+            // "how much animated memory does each mode cost".
+            const double tradAnimTotalMb = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
+            const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
+            c = pos;
+            drawSeg(L"  total ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradAnimTotalMb), c, deltaColour(tradAnimTotalMb, prevAnimTotalMb));
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
             pos.y += kSectionGap;
         }
         else
@@ -5302,6 +5362,18 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
+            // Cross-mode section subtotal: cluster path's resident animated
+            // memory = templates + per-frame CLAS alloc + BLAS-from-CLAS.
+            // Comparison vs the prev snapshot (which on [T] toggle is the
+            // trad path's single per-frame DXR1 BLAS) gives the user an
+            // at-a-glance "how much animated memory does each mode cost".
+            const double clAnimTotalMb   = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
+            const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
+            c = pos;
+            drawSeg(L"  total ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
             drawSeg(L" MB", c, kSubtle);
             pos.y += kLineH;
             pos.y += kSectionGap;

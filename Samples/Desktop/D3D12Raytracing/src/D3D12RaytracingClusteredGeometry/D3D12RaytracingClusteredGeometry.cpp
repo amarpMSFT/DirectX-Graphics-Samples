@@ -5140,10 +5140,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     draw(L"SCENE:", pos, kAccent);
     pos.y += kLineH;
     if (isTraditional)
-        swprintf_s(buf, L"  %u BLAS  /  %s tris   (traditional BLAS)",
+        swprintf_s(buf, L"  %u BLASes  /  %s tris   (traditional BLAS)",
                    sceneBlasCount, trisBuf);
     else
-        swprintf_s(buf, L"  %u BLAS  /  %u CLAS  /  %s tris   (clustered BLAS)",
+        swprintf_s(buf, L"  %u BLASes  /  %u CLASes  /  %s tris   (clustered BLAS)",
                    sceneBlasCount, sceneClusterCount, trisBuf);
     draw(buf, pos, kSubtle);
     pos.y += kLineH + kSectionGap;
@@ -5188,7 +5188,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             ? (double)p.traditionalBlasActualBytes / (double)p.totalClusterCount / 1024.0 : 0.0;
 
         XMFLOAT2 c = pos;
-        drawSeg(L"  BLAS ", c, kSubtle);
+        drawSeg(L"  BLASes ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
         drawSeg(L" MB alloc  (", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
@@ -5207,7 +5207,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradTotalMb), c, deltaColour(tradTotalMb, prevTotalMb));
-        drawSeg(L" MB  (BLAS)", c, kSubtle);
+        drawSeg(L" MB  (BLASes)", c, kSubtle);
         pos.y += kLineH;
         c = pos;
         drawSeg(L"  scratch ", c, kSubtle);
@@ -5248,7 +5248,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double prevInpMb   = p.staticClusterInputBytes / (1024.0 * 1024.0);
 
         XMFLOAT2 c = pos;
-        drawSeg(L"  CLAS ", c, kSubtle);
+        drawSeg(L"  CLASes ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
         drawSeg(L" MB alloc  (", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
@@ -5262,7 +5262,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         // per-object BLAS-from-CLAS so the static-memory comparison vs
         // trad (which has just BLAS) needs both lines visible.
         c = pos;
-        drawSeg(L"  BLAS ", c, kSubtle);
+        drawSeg(L"  BLASes ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", blasMb), c, deltaColour(blasMb, prevBlasMb));
         drawSeg(L" MB", c, kSubtle);
         pos.y += kLineH;
@@ -5278,7 +5278,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clTotalMb), c, deltaColour(clTotalMb, prevTotalMb));
-        drawSeg(L" MB  (CLAS + BLAS)", c, kSubtle);
+        drawSeg(L" MB  (CLASes + BLASes)", c, kSubtle);
         pos.y += kLineH;
         // Scratch + inputs: outside the BVH total above (scratch is
         // workspace the driver re-uses across builds; inputs are the
@@ -5401,7 +5401,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             pos.y += kLineH;
 
             c = pos;
-            drawSeg(L"  per-frame CLAS ", c, kSubtle);
+            drawSeg(L"  per-frame CLASes ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
             drawSeg(L" MB alloc  (", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
@@ -5421,7 +5421,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
-            drawSeg(L" MB  (templates + CLAS + BLAS)", c, kSubtle);
+            drawSeg(L" MB  (templates + CLASes + BLAS)", c, kSubtle);
             pos.y += kLineH;
             c = pos;
             drawSeg(L"  scratch ", c, kSubtle);
@@ -5580,12 +5580,12 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
                 drawSeg(L"   (", c2, kSubtle);
                 if (clasActive)
                 {
-                    drawSeg(L"CLAS ", c2, kSubtle);
+                    drawSeg(L"CLASes ", c2, kSubtle);
                     drawSeg(fmtTime(fnum, _countof(fnum), s.pfStaticClasMs), c2,
                             pfPick(s.pfStaticClasMs, p.pfStaticClasMs));
                     drawSeg(L"  +  ", c2, kSubtle);
                 }
-                drawSeg(L"BLAS ", c2, kSubtle);
+                drawSeg(L"BLASes ", c2, kSubtle);
                 drawSeg(fmtTime(fnum, _countof(fnum), s.pfStaticBlasMs), c2,
                         pfPick(s.pfStaticBlasMs, p.pfStaticBlasMs));
                 drawSeg(L")", c2, kSubtle);

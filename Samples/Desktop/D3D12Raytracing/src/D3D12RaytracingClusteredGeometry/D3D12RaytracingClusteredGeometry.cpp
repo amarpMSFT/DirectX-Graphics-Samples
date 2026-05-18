@@ -4695,6 +4695,13 @@ void D3D12RaytracingClusteredGeometry::CreateUIFont()
                                   m_deviceResources->GetDepthBufferFormat());
         SpriteBatchPipelineStateDescription pd(rtState);
         m_spriteBatch = std::make_unique<SpriteBatch>(device, resourceUpload, pd);
+        // Second batch identical except for blendDesc -- CommonStates::Additive
+        // so glyph pixels add to the dark backing rect underneath (text reads
+        // brighter than the standard alpha-blend mix would produce).  See the
+        // long comment in the header on m_spriteBatchText.
+        SpriteBatchPipelineStateDescription pdAdd(rtState);
+        pdAdd.blendDesc = CommonStates::Additive;
+        m_spriteBatchText = std::make_unique<SpriteBatch>(device, resourceUpload, pdAdd);
     }
     auto uploadFinished = resourceUpload.End(m_deviceResources->GetCommandQueue());
     uploadFinished.wait();
@@ -5096,21 +5103,24 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const XMVECTOR kRed    = XMVectorSet(1.00f, 0.45f, 0.45f, 1);   // bright red delta
 
     // Local helpers -- draw a dark backing rect under each text segment,
-    // then the bright text on top.  The backing rect is sized to the
-    // segment's exact bounding box (cursor.x..cursor.x+measureX(text),
-    // pos.y..pos.y+kLineH).
+    // then the bright text on top via a SECOND SpriteBatch with additive
+    // blend (so AA edges of the glyphs add to, rather than mix with,
+    // the dark rect underneath -- prevents the "dim text" look that the
+    // standard alpha-blend mix produces against a dark backing).
     //
-    // Padding strategy: line ENDS get kLinePad of horizontal padding
-    // (so the rect doesn't terminate flush against the glyph edge),
-    // but interior segment boundaries get ZERO padding -- otherwise
-    // overlapping kLinePad-padded rects double-darken into visible
-    // vertical bars at every "label X.XX value" join.  To know whether
-    // a segment is the LAST of its line (and needs right-pad), we
-    // defer each segment's rect into a `pending` slot and only flush
-    // it when we see the NEXT segment: if next.y != pending.y or there
-    // is no next, the pending one was the line's last and gets the
-    // right-pad applied.  First segment of a line (detected by
-    // pending.y != cursor.y on entry) gets the left-pad applied.
+    // Two-batch strategy:
+    //   1. m_spriteBatch (alpha blend, currently active) emits backing
+    //      rects immediately during the overlay walk.
+    //   2. Text draws are DEFERRED into `textOps` -- captured as
+    //      (wstring, pos, color, scale) tuples since the format buffers
+    //      on the stack go out of scope.
+    //   3. After the overlay walk: m_spriteBatch->End(), then
+    //      m_spriteBatchText->Begin() (additive), replay textOps, End.
+    //
+    // Padding strategy unchanged: line ENDS get kLinePad horizontal pad
+    // via the deferred-`pending` rect slot; interior segment joins get
+    // zero pad so they don't double-darken.  See the same-line-aware
+    // logic in `draw` and `drawSeg` below.
     constexpr float kLinePad = 4.0f;
     const XMVECTOR  kBacking = XMVectorSet(0.0f, 0.0f, 0.0f, 0.30f);
 
@@ -5119,6 +5129,9 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     };
 
     struct PendingRect { float x, y, w, h; bool valid; } pending = {0, 0, 0, 0, false};
+    struct TextOp { std::wstring s; XMFLOAT2 pos; XMVECTOR color; float scale; };
+    std::vector<TextOp> textOps;
+    textOps.reserve(80);   // ~30 stat lines + ~10 key lines, each ~1-7 segments
 
     auto emitBacking = [&](float x, float y, float w, float h) {
         if (w <= 0.0f || h <= 0.0f) return;
@@ -5131,10 +5144,6 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         m_spriteBatch->Draw(m_overlayPanelTextureGpu, XMUINT2(1, 1), r, kBacking);
     };
 
-    // Flush the pending rect.  When `addRightPad` is true the rect's
-    // right edge is extended by kLinePad -- pass true when we know
-    // this is the last segment of its line (i.e. the next draw is on
-    // a different y, or render is ending).
     auto flushPending = [&](bool addRightPad) {
         if (!pending.valid) return;
         float w = pending.w + (addRightPad ? kLinePad : 0.0f);
@@ -5143,47 +5152,29 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     };
 
     // Local helper -- DrawString with the global scale factor baked in.
-    // Same-line-aware: if a pending drawSeg shares this draw's y, the
-    // pending one is flushed WITHOUT right-pad (this draw continues
-    // the line), and our own rect gets NO left-pad.  Otherwise the
-    // pending is flushed WITH right-pad and our rect gets BOTH pads.
-    // We then queue OURSELVES into pending so a follow-on draw or
-    // drawSeg on the same line gets the same continuation treatment.
+    // Same-line-aware (see commentary above flushPending).  Rect goes to
+    // the alpha-blend batch immediately via flushPending; the TEXT itself
+    // is queued into textOps for replay in the additive batch.
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
         const float w = measureX(s) * relScale;
         const float h = kLineH * relScale;
         const bool continuesLine = pending.valid && pending.y == p.y;
         if (pending.valid) flushPending(/*addRightPad*/!continuesLine);
         const float lpad = continuesLine ? 0.0f : kLinePad;
-        // Queue rather than emit, so a follow-on call on the same y
-        // can decide to suppress our right-pad.
         pending = { p.x - lpad, p.y, w + lpad, h, true };
-        m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
-                             /*rotation*/0.0f, kOrigin, kScale * relScale);
+        textOps.push_back({ std::wstring(s), p, colour, kScale * relScale });
     };
 
     // Segment draw: writes `text` at the cursor and advances cursor.x.
-    // Defers its rect into `pending` so the NEXT call (segment or
-    // draw or render-end) can decide whether to add right-pad.
-    // First segment of a new line (pending.y != cursor.y or
-    // !pending.valid) gets left-pad here.
-    // ignoreWhitespace=false on measureX is CRITICAL: trailing spaces
-    // in a label segment must contribute to advance, else "CLAS " +
-    // "0.66" composes as "CLAS0.66".
+    // Defers its rect into `pending` so the NEXT call decides right-pad.
+    // Text deferred into textOps like `draw`.
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
         const float w        = measureX(text);
         const bool  newLine  = !pending.valid || pending.y != cursor.y;
-        // If we're continuing on the same line, the previous pending
-        // segment is an interior one -- flush WITHOUT right-pad.
-        // If we're on a new line, flush WITH right-pad as it's the
-        // previous line's last segment.
         if (pending.valid) flushPending(/*addRightPad*/newLine);
-        // Queue this segment; pad left if it's the first of a new line.
         const float lpad = newLine ? kLinePad : 0.0f;
         pending = { cursor.x - lpad, cursor.y, w + lpad, kLineH, true };
-
-        m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
-                             /*rotation*/0.0f, kOrigin, kScale);
+        textOps.push_back({ std::wstring(text), cursor, colour, kScale });
         cursor.x += w;
     };
     // Delta-colour pickers.  Return green/red/subtle based on cur vs prev.
@@ -5810,6 +5801,18 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // the last segment of the overlay, so it gets the right-pad.
     flushPending(/*addRightPad*/true);
     m_spriteBatch->End();
+
+    // Replay all deferred text draws into the additive-blend batch so
+    // glyph AA edges brighten (rather than dim) against the dark rects
+    // we just emitted.  Same viewport/RT bound; only blend state differs.
+    m_spriteBatchText->SetViewport(viewport);
+    m_spriteBatchText->Begin(commandList);
+    for (const auto& t : textOps)
+    {
+        m_uiFont->DrawString(m_spriteBatchText.get(), t.s.c_str(), t.pos, t.color,
+                             /*rotation*/0.0f, kOrigin, t.scale);
+    }
+    m_spriteBatchText->End();
 }
 
 
@@ -6426,6 +6429,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     // owns their backing GPU resources is released).
     m_uiFont.reset();
     m_spriteBatch.reset();
+    m_spriteBatchText.reset();
     m_overlayPanelTexture.Reset();
     m_graphicsMemory.reset();
     m_dxr2CommandList.Reset();

@@ -54,6 +54,7 @@
 // packages.config; the .vcxproj imports the package's .targets file.
 #include "SpriteBatch.h"
 #include "SpriteFont.h"
+#include "CommonStates.h"
 #include "GraphicsMemory.h"
 #include "ResourceUploadBatch.h"
 

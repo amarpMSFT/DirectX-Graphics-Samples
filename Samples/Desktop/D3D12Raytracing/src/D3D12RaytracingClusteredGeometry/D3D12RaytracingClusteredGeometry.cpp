@@ -3957,6 +3957,17 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     m_pfSnapSkipFramesLeft   = (INT)kPerFrameRingSlots;
     m_pfSnapSamplesCollected = 0;
     m_pfSnapAccum            = PfSnapAccum{};
+    // Mark per-frame timings as settling (skipped on init -- no settle to
+    // wait for on the first capture, just display whatever the first
+    // post-init snap window produces).  The per-frame snap-window-complete
+    // branch in DoRender clears this once the first post-toggle window
+    // averages settle into m_overlayStats.  While set, the overlay's
+    // PER-FRAME section prints "recalculating..." in place of the timing
+    // numbers (which would otherwise show the OLD mode's stale numbers
+    // for the ~1 s the rolling window takes to refill, leaving the user
+    // wondering "did the toggle do anything?").
+    if (!isInit)
+        m_pfTimingSettlingAfterToggle = true;
 
     // Refresh the delta-colour fade window: 5 seconds from NOW.  Each toggle
     // installs a fresh window (and a fresh prev above), so the user sees
@@ -5443,7 +5454,18 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const auto& p = m_overlayStatsPrev;
         draw(L"PER-FRAME:", pos, kAccent);
         pos.y += kLineH;
-        if (s.pfTimingValid)
+        // During the post-toggle settle (~kPerFrameRingSlots + kSnapshotSampleCount
+        // frames = ~1.1 s), the rolling EMA window is still refilling with
+        // new-mode samples, and m_overlayStats.pf* still holds the OLD
+        // mode's averages.  Showing those would mislead the user into
+        // thinking the toggle had no effect on per-frame cost; print
+        // "recalculating..." instead so the lag is explicit.
+        if (m_pfTimingSettlingAfterToggle)
+        {
+            draw(L"  recalculating...", pos, kSubtle);
+            pos.y += kLineH;
+        }
+        else if (s.pfTimingValid)
         {
             const double totalMs     = s.pfInstantiateMs + s.pfBlasRebuildMs + s.pfTlasRebuildMs;
             const double prevTotalMs = p.pfInstantiateMs + p.pfBlasRebuildMs + p.pfTlasRebuildMs;
@@ -5842,8 +5864,13 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     // Wait a few frames for swap chain warm-up before time-based capture too.
     // Need at least kPerFrameRingSlots * 2 + 5 frames to also get stable
     // per-frame timestamp EMA reads in the log on shutdown (otherwise the
-    // ring buffer hasn't filled yet).
-    if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 15 && !m_screenshotTaken)
+    // ring buffer hasn't filled yet).  Pump up to kSnapshotSampleCount + a
+    // bit so the rolling per-frame snap window has actually completed when
+    // we capture -- so screenshots after a config-change toggle show real
+    // post-toggle numbers, not the "recalculating..." placeholder we
+    // display during the ~1 s settle.  Old behaviour was a hardcoded
+    // frame 15 which exited too early on toggle-tests.
+    if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 80 && !m_screenshotTaken)
         capture = true;
 
     if (capture)
@@ -5950,6 +5977,10 @@ void D3D12RaytracingClusteredGeometry::DoRender()
                         m_overlayStats.pfStaticBlasMs  = m_pfSnapAccum.staticBlasMs * inv;
                         m_overlayStats.pfStaticClasMs  = m_pfSnapAccum.staticClasMs * inv;
                         m_overlayStats.pfTimingValid   = true;
+                        // First post-toggle window completed -- live timings
+                        // now reflect the new mode, drop the "recalculating..."
+                        // placeholder.
+                        m_pfTimingSettlingAfterToggle  = false;
                         m_pfSnapAccum            = PfSnapAccum{};
                         m_pfSnapSamplesCollected = 0;
                     }

@@ -890,6 +890,14 @@ private:
         double staticClasMs = 0.0;
     };
     PfSnapAccum                          m_pfSnapAccum;
+    // True from the moment a config-change toggle fires (CaptureOverlayStatsSnapshot)
+    // until the first post-toggle per-frame snap window completes (~kPerFrameRingSlots
+    // + kSnapshotSampleCount frames = ~1.1 s at 60 FPS).  The overlay uses this to
+    // print "recalculating..." in place of the per-frame timing numbers during the
+    // settle, so the user isn't staring at the OLD mode's millisecond figures and
+    // wondering "did the toggle do anything?".  Set in CaptureOverlayStatsSnapshot
+    // (skipped on init), cleared in the snap-window-completes branch.
+    bool                                 m_pfTimingSettlingAfterToggle = false;
 
     // ---------- App state ----------
     StepTimer m_timer;

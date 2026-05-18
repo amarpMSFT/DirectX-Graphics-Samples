@@ -5111,7 +5111,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // adjacent rects tile exactly (left edge of seg N+1 == right edge
     // of seg N, both rounded the same way via the floor-then-ceil
     // pattern below) and the union looks like one continuous strip.
-    const XMVECTOR  kBacking     = XMVectorSet(0.0f, 0.0f, 0.0f, 0.20f);
+    const XMVECTOR  kBacking     = XMVectorSet(0.0f, 0.0f, 0.0f, 0.30f);
     // Forward-declare measureX so drawBacking can use it (the
     // existing definition is below).
     auto measureX = [&](const wchar_t* s) {

@@ -678,6 +678,12 @@ private:
     // lives in the shared descriptor heap.
     Microsoft::WRL::ComPtr<ID3D12Resource>   m_overlayPanelTexture;
     D3D12_GPU_DESCRIPTOR_HANDLE              m_overlayPanelTextureGpu = {};
+    // Right edge of column 1 from the previous frame -- used to anchor
+    // the keys column 2 so it doesn't jump as numbers grow/shrink each
+    // snapshot.  Monotonic (only grows during a session) so the keys
+    // column position is stable; on first frame defaults to a generous
+    // fallback so it doesn't overlap col1.
+    float                                    m_overlayCol1MaxRight = 760.0f;
 
     // ---------- Scene constant buffer ----------
     ComPtr<ID3D12Resource>               m_sceneCB;

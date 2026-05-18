@@ -5070,13 +5070,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     m_spriteBatch->SetViewport(viewport);
     m_spriteBatch->Begin(commandList);
 
-    // Render at exactly 0.5x of the 24 pt atlas -- the only fractional kScale
-    // bilinear filtering downsamples cleanly (each destination pixel = perfect
-    // 2x2 average of source texels).  Any other ratio drops source data and
-    // aliases on thin glyph strokes; we tried 48 pt + 0.265x and the moire on
-    // small digits was visible.  If you change the visual size, regen the
-    // spritefont at exactly 2x the new target pt and KEEP kScale = 0.5.
-    const float    kScale  = 0.5f;
+    // Render at 0.625x of the 24 pt atlas -- 25% bigger than the prior
+    // 0.5x for legibility.  At 0.625x bilinear filtering no longer
+    // achieves perfect 2x2 downsample (was the magic of 0.5x), but the
+    // dark backing rect + faux-bold body pass below mask the AA softness
+    // sufficiently for the larger text.  If we later want crispness back,
+    // regenerate SegoeUI as 30 pt and use kScale = 0.5 for an exact 2x
+    // downsample at this same on-screen size.
+    const float    kScale  = 0.625f;
     const float    kLineH  = m_uiFont->GetLineSpacing() * kScale;
     XMFLOAT2       pos{ 24.0f, 18.0f };
     const XMFLOAT2 kOrigin { 0.0f, 0.0f };
@@ -5122,8 +5123,21 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     struct PendingRect { float x, y, w, h; bool valid; } pending = {0, 0, 0, 0, false};
 
+    // Track the right-most extent of every backing rect, but only
+    // while `trackCol1` is true.  After the FPS section we flip it
+    // to false so the keys column (col 2) doesn't feed back into the
+    // col1 width.  The final value is stashed into m_overlayCol1MaxRight
+    // for NEXT frame's col2 anchor -- using a frame-late value keeps
+    // col 2 from jumping around as col 1's numbers change width
+    // within a frame (and we take max() so col 2 only ever drifts
+    // right, never left, which avoids the keys re-flowing).
+    float thisFrameCol1Right = 0.0f;
+    bool  trackCol1          = true;
+
     auto emitBacking = [&](float x, float y, float w, float h) {
         if (w <= 0.0f || h <= 0.0f) return;
+        if (trackCol1)
+            thisFrameCol1Right = std::max(thisFrameCol1Right, x + w);
         RECT r = {
             (LONG)std::floor(x),
             (LONG)std::floor(y),
@@ -5252,6 +5266,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const UINT sceneClusterCount = s.totalClusterCount + animClusters;
     const bool isTraditional = (s.geometryMode != (int)GeometryMode::Clusters);
     draw(L"SCENE:", pos, kAccent);
+    // Column 2 (keys section) will start at this same Y, anchored at
+    // m_overlayCol1MaxRight (from last frame) + a small gap.  Captured
+    // here -- right before we draw the first column's first section --
+    // so col 2 visually aligns with the top of the stats.
+    const float col2StartY = pos.y;
     pos.y += kLineH;
     if (isTraditional)
         swprintf_s(buf, L"  %u BLASes  /  %s tris   (traditional BLAS)",
@@ -5735,6 +5754,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // hunt up the screen for "what is it set to right now?".  The "(-/+)"
     // hint is omitted because ',' and '.' / '[' and ']' are visually paired
     // keys -- you can tell from the prefix which way each one moves.
+    //
+    // Column 2: anchored at m_overlayCol1MaxRight (frame-late, monotonic
+    // so the keys never jump leftward as stat numbers grow/shrink) +
+    // kCol2Gap.  Aligned with the top of column 1 (the SCENE row) so the
+    // vertical space the keys used to take below FPS is now free for the
+    // scene.  Tracking flipped off so the keys' own backing rects don't
+    // contribute to the col 1 width tracker for next frame.
+    constexpr float kCol2Gap = 24.0f;
+    flushPending(/*addRightPad*/true);   // close out any pending col1 rect
+    trackCol1 = false;
+    pos = XMFLOAT2(m_overlayCol1MaxRight + kCol2Gap, col2StartY);
     auto drawKeyLine = [&](const wchar_t* keyPrefix, const wchar_t* tail) {
         XMFLOAT2 p = pos;
         draw(keyPrefix, p, kHotkey);
@@ -5798,6 +5828,9 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.
     flushPending(/*addRightPad*/true);
+    // Save this frame's col 1 width for next frame's col 2 anchor.
+    // max() keeps the column monotonic so it never drifts leftward.
+    m_overlayCol1MaxRight = std::max(m_overlayCol1MaxRight, thisFrameCol1Right);
     m_spriteBatch->End();
 }
 

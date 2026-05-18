@@ -669,15 +669,6 @@ private:
     // truncate around ~280 visible chars regardless of available pixel width).
     std::unique_ptr<DirectX::GraphicsMemory> m_graphicsMemory;
     std::unique_ptr<DirectX::SpriteBatch>    m_spriteBatch;
-    // Second SpriteBatch instance with CommonStates::Additive blend so
-    // overlay TEXT renders as add-on-top-of-the-dark-rect (the rects are
-    // still drawn via m_spriteBatch with standard alpha blend).  Without
-    // the split, glyph AA edges would blend with the now-dark backing
-    // and read as "dim text".  Additive sidesteps that: AA-edge alpha
-    // contributes its colour ADDITIVELY to the dark rect underneath,
-    // so the edges brighten instead of darken.  Constructed in
-    // CreateUIFont alongside the alpha-blend batch.
-    std::unique_ptr<DirectX::SpriteBatch>    m_spriteBatchText;
     std::unique_ptr<DirectX::SpriteFont>     m_uiFont;
     // 1x1 white texture used by the overlay's per-segment dark backing.
     // SpriteBatch stretches it to each text segment's exact bounding box

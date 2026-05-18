@@ -5096,28 +5096,25 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const XMVECTOR kRed    = XMVectorSet(1.00f, 0.45f, 0.45f, 1);   // bright red delta
 
     // Local helpers -- under each text segment, draw a dark backing
-    // rect first (alpha-blended), then a dark drop-shadow copy of the
-    // text offset +1.5px down-right, then the bright body text on top.
-    // Three passes per segment:
-    //   1. backing rect (kBacking, alpha-blended): darkens the scene
-    //      under the text so the body colour reads.
-    //   2. shadow text (kShadow, alpha-blended, offset): adds a halo
-    //      of dark pixels on the body's lower-right glyph edges --
-    //      gives the bright text some pop without the harsh look of
-    //      additive blend (which we tried and the user disliked --
-    //      it brightened the colours too much for the kAccent purple
-    //      and kHotkey yellow to read as their picked hues).
-    //   3. body text (the picked colour): rendered on top.
+    // rect first (alpha-blended), then the body text "faux-bold" -- two
+    // DrawString passes at the same position offset by +1 px horizontally,
+    // so glyph strokes appear 1 px wider on their right edge.  That
+    // simulates a bold weight without needing a separate Bold spritefont
+    // asset, which would require running MakeSpriteFont and shipping
+    // a second .spritefont file.  Net visual: each stroke is 1 pixel
+    // heavier -> noticeably easier to read against the rect's AA dim.
+    //
+    // No drop shadow -- it stamped extra dark pixels around each glyph
+    // edge which compounded the AA-dim problem the rect already had.
+    // Faux-bold thickens the BODY which is rendered at full alpha, so
+    // there's no AA mixing penalty for the heavier weight.
     //
     // Padding strategy: line ENDS get kLinePad horizontal pad via the
     // deferred-`pending` rect slot; interior segment joins get zero
-    // pad so they don't double-darken.  See same-line-aware logic
-    // below.  Backing + shadow + body all use m_spriteBatch (single
-    // alpha-blend batch), so colours composite predictably.
-    constexpr float kLinePad      = 4.0f;
-    constexpr float kShadowOffset = 1.5f;
-    const XMVECTOR  kBacking      = XMVectorSet(0.0f, 0.0f, 0.0f, 0.20f);
-    const XMVECTOR  kShadow       = XMVectorSet(0.0f, 0.0f, 0.0f, 0.70f);
+    // pad so they don't double-darken.  See same-line-aware logic below.
+    constexpr float kLinePad = 4.0f;
+    constexpr float kBoldOff = 1.0f;   // faux-bold horizontal stroke widening
+    const XMVECTOR  kBacking = XMVectorSet(0.0f, 0.0f, 0.0f, 0.20f);
 
     auto measureX = [&](const wchar_t* s) {
         return XMVectorGetX(m_uiFont->MeasureString(s, /*ignoreWhitespace*/false)) * kScale;
@@ -5144,38 +5141,37 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     };
 
     // Local helper -- DrawString with the global scale factor baked in.
-    // Same-line-aware (see commentary above flushPending).  Emits both
-    // the shadow pass and the body pass for this string.
+    // Same-line-aware (see commentary above flushPending).  Two body
+    // passes for faux-bold: same string, same colour, +1px horizontal
+    // offset on the second pass.
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
         const float w = measureX(s) * relScale;
         const float h = kLineH * relScale;
         const bool continuesLine = pending.valid && pending.y == p.y;
         if (pending.valid) flushPending(/*addRightPad*/!continuesLine);
         const float lpad = continuesLine ? 0.0f : kLinePad;
-        pending = { p.x - lpad, p.y, w + lpad, h, true };
-        // Drop shadow then body, both via the alpha-blend batch.
-        XMFLOAT2 shadowPos{ p.x + kShadowOffset, p.y + kShadowOffset };
-        m_uiFont->DrawString(m_spriteBatch.get(), s, shadowPos, kShadow,
-                             /*rotation*/0.0f, kOrigin, kScale * relScale);
+        // Account for the +1px bold pass so the rect's right edge
+        // includes the bolded stroke extension.
+        pending = { p.x - lpad, p.y, w + lpad + kBoldOff, h, true };
         m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
+                             /*rotation*/0.0f, kOrigin, kScale * relScale);
+        XMFLOAT2 boldPos{ p.x + kBoldOff, p.y };
+        m_uiFont->DrawString(m_spriteBatch.get(), s, boldPos, colour,
                              /*rotation*/0.0f, kOrigin, kScale * relScale);
     };
 
     // Segment draw: writes `text` at the cursor and advances cursor.x.
-    // Defers its rect into `pending`; emits both shadow and body for
-    // the text segment.  ignoreWhitespace=false on measureX is
-    // CRITICAL: trailing spaces in a label segment must contribute to
-    // advance, else "CLAS " + "0.66" composes as "CLAS0.66".
+    // Defers its rect into `pending`; faux-bold body pass like `draw`.
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
         const float w        = measureX(text);
         const bool  newLine  = !pending.valid || pending.y != cursor.y;
         if (pending.valid) flushPending(/*addRightPad*/newLine);
         const float lpad = newLine ? kLinePad : 0.0f;
-        pending = { cursor.x - lpad, cursor.y, w + lpad, kLineH, true };
-        XMFLOAT2 shadowPos{ cursor.x + kShadowOffset, cursor.y + kShadowOffset };
-        m_uiFont->DrawString(m_spriteBatch.get(), text, shadowPos, kShadow,
-                             /*rotation*/0.0f, kOrigin, kScale);
+        pending = { cursor.x - lpad, cursor.y, w + lpad + kBoldOff, kLineH, true };
         m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
+                             /*rotation*/0.0f, kOrigin, kScale);
+        XMFLOAT2 boldPos{ cursor.x + kBoldOff, cursor.y };
+        m_uiFont->DrawString(m_spriteBatch.get(), text, boldPos, colour,
                              /*rotation*/0.0f, kOrigin, kScale);
         cursor.x += w;
     };

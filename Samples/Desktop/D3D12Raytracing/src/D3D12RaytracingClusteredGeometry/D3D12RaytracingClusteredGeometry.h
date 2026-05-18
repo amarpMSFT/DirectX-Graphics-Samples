@@ -580,6 +580,35 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> blasArgsMeta;
         Microsoft::WRL::ComPtr<ID3D12Resource> blasResultAddrBuffer;        // upload, 1 entry = blasStorage VA
         D3D12_GPU_VIRTUAL_ADDRESS              blasGPUVA = 0;
+
+        // -------- TRADITIONAL (DXR1) MODE per-frame path --------
+        // Built once at init when m_geometryMode == Traditional; reused
+        // every frame.  The traditional path does NOT use templates or
+        // CLAS -- AnimateBall.cs still writes perFrameVertexBuffer above
+        // (shared), then we BuildRaytracingAccelerationStructure on a
+        // single per-object D3D12_RAYTRACING_GEOMETRY_DESC built from
+        // (perFrameVertexBuffer, tradIndexBuffer).  Per-frame cost:
+        // either a full rebuild (PREFER_FAST_TRACE) or an UPDATE (using
+        // ALLOW_UPDATE source), selected at runtime via [F]
+        // (m_traditionalAnimMode).
+        // Flat IB in cluster-major order, with per-cluster local indices
+        // biased by each cluster's vertex offset so a single geom desc
+        // can address the whole ball.  Built once at init from the mesh,
+        // never rewritten (only positions change per frame, not topology).
+        Microsoft::WRL::ComPtr<ID3D12Resource> tradIndexBuffer;
+        UINT                                   tradTriangleCount = 0;
+        // Per-frame-rebuilt traditional BLAS.  Allocated to
+        // prebuild.ResultDataMaxSizeInBytes once; the GVA is stable.
+        Microsoft::WRL::ComPtr<ID3D12Resource> tradBlasStorage;
+        Microsoft::WRL::ComPtr<ID3D12Resource> tradBlasScratchBuffer;
+        UINT64                                 tradBlasResultBytes  = 0;
+        UINT64                                 tradBlasScratchBytes = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS              tradBlasGPUVA        = 0;
+        // True when we've done at least one rebuild on tradBlasStorage,
+        // so PERFORM_UPDATE has a valid source to refit from.  Flipped
+        // on by the rebuild path; cleared by [V] / [T] / mode toggles
+        // that drop the BLAS contents (e.g. when going cluster->trad).
+        bool                                   tradBlasInitialized  = false;
     };
     AnimatedObject                          m_animatedObject;
     bool                                    m_animatedObjectEnabled = false;
@@ -777,6 +806,16 @@ private:
         UINT64 animatedPerFrameClasActualBytes = 0;    // sumActual from one-shot INSTANTIATE size readback
         UINT64 animatedPerFrameClasScratchBytes = 0;
         UINT64 animatedBlasBytes         = 0;
+        // Traditional-mode animated BLAS (DXR1 per-frame rebuild/refit).
+        // Populated when geometryMode==Traditional; zero otherwise.  The
+        // resident-memory value is the BLAS storage (tradBlasResultBytes);
+        // tradScratch is the scratch buffer the per-frame build reuses.
+        UINT64 animatedTradBlasBytes     = 0;
+        UINT64 animatedTradScratchBytes  = 0;
+        UINT64 animatedTradIbBytes       = 0;    // flat IB (cluster-major) -- input data, not BVH
+        // Last selected trad-mode anim update strategy (0=rebuild, 1=refit).
+        // Snapshotted so the overlay's "[F]" line tracks the live state.
+        int    animatedTradModeIsRefit   = 0;
         // TLAS
         UINT64 tlasBytes                 = 0;
         // Per-frame timing (snapped a few frames after the rebuild completes,
@@ -888,6 +927,24 @@ private:
     void RebuildStaticBlasPerFrame();
     void RebuildStaticClasPerFrame();
     void BuildAnimatedObjectSetup();          // generates mesh, builds templates ONCE
+    // Traditional-mode addendum to BuildAnimatedObjectSetup.  Runs after
+    // the shared mesh + perFrameVertexBuffer setup (which both modes need
+    // because AnimateBall.cs writes the same per-vertex animation buffer
+    // in either case).  Builds the flat per-object index buffer and
+    // allocates the per-frame-rebuilt traditional BLAS storage + scratch.
+    // No GPU work is issued here -- the actual BuildRaytracingAccelerationStructure
+    // for the trad BLAS runs every frame in UpdateAnimatedTradPerFrame
+    // (rebuild or refit per m_traditionalAnimMode).
+    void BuildAnimatedTraditionalAS();
+    // Per-frame trad-mode update: AnimateBall.cs writes
+    // perFrameVertexBuffer (UAV) just like in cluster mode, then we
+    // BuildRaytracingAccelerationStructure on tradBlasStorage with
+    // either PREFER_FAST_TRACE (full rebuild) or PERFORM_UPDATE
+    // (refit), driven by m_traditionalAnimMode + the [F] key.  Emits
+    // per-frame timestamps at (pfTimestampBase+0..1) bracketing
+    // AnimateBall.cs and (pfTimestampBase+2..3) bracketing the BLAS
+    // build for the overlay, mirroring the cluster path's split.
+    void UpdateAnimatedTradPerFrame(UINT pfTimestampBase = UINT_MAX);
     // Per-frame animated rebuild.  When pfTimestampBase != UINT_MAX the
     // function emits two timestamp pairs against m_pfQueryHeap at
     // (base+0,base+1) bracketing INSTANTIATE and (base+2,base+3) bracketing

@@ -797,17 +797,23 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
     }
     else
     {
-        // Traditional (DXR1) per-object BLAS path.  Animated ball disabled
-        // in this MVP -- the per-frame DXR1 rebuild/refit path is wired up
-        // in a follow-up.  Slots 0/1 (CLAS) are stamped with a no-op pair
-        // so the ResolveQueryData below has a complete range to resolve;
-        // overlay shows them as 0 build time which is the truth.  Slot 2/3
-        // bracket the traditional BLAS build for the wall-clock readout.
+        // Traditional (DXR1) per-object BLAS path.  Slots 0/1 (CLAS) are
+        // stamped with a no-op pair so the ResolveQueryData below has a
+        // complete range to resolve; overlay shows them as 0 build time
+        // (the truth -- trad mode has no CLAS).  Slot 2/3 bracket the
+        // traditional BLAS build for the wall-clock readout.
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
         BuildTraditionalStaticAS();
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+        // Traditional path's animated ball: build the mesh + per-frame VB +
+        // restPos + flat IB + BLAS storage.  Subsequent frames just rebuild/
+        // refit tradBlasStorage in UpdateAnimatedTradPerFrame -- this init
+        // pass also kicks one rebuild so the BLAS contents are valid before
+        // the TLAS build below references it.
+        BuildAnimatedObjectSetup();
+        UpdateAnimatedTradPerFrame();
     }
 
     // Stamp slot 4 (before TLAS build).
@@ -930,10 +936,18 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     }
     else
     {
-        // Traditional path: per-object DXR1 BLAS.  Animated ball is
-        // currently disabled in this mode (per-frame DXR1 rebuild/refit
-        // is wired up separately in a follow-up step).
+        // Traditional path: per-object DXR1 BLAS + per-frame animated
+        // ball (DXR1 rebuild/refit via [F]).
         BuildTraditionalStaticAS();
+        if (m_animatedObjectEnabled)
+        {
+            BuildAnimatedObjectSetup();
+            UpdateAnimatedTradPerFrame();
+            // Refresh the tri->cid table now that the animated mesh is
+            // part of the trad scene -- BuildTraditionalStaticAS already
+            // ran it for static-only, this picks up the animated tris.
+            BuildTradCidLookup();
+        }
     }
     // Per-(InstIdx, GeomIdx) material table must track the animated-
     // enabled state (which flips between modes).
@@ -2619,7 +2633,12 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
     // cascades into a TDR-hang).  So we precompute the per-cluster
     // local prim alongside the cid and the shader uses BOTH values.
     std::vector<XMUINT2> triToCidLocal;   // .x = cid, .y = localPrimIdxWithinCluster
-    std::vector<UINT>    geomTriBase(m_objects.size() * kMaxGeomsPerInstance, 0);
+    // Size for static instances + the animated instance (if enabled).  The
+    // animated ball lives at TLAS instance index N_static and contributes
+    // one geom desc with a tri-base entry at [N_static*MaxGeoms + 0].
+    const UINT animSlots = m_animatedObjectEnabled ? 1u : 0u;
+    const UINT instCount = (UINT)m_objects.size() + animSlots;
+    std::vector<UINT>    geomTriBase(instCount * kMaxGeomsPerInstance, 0);
     triToCidLocal.reserve(m_totalTriangleCount);
 
     for (size_t oi = 0; oi < m_objects.size(); ++oi)
@@ -2658,6 +2677,25 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
             const UINT triCount = (UINT)(cl.indices.size() / 3);
             for (UINT t = 0; t < triCount; ++t)
                 triToCidLocal.push_back(XMUINT2(cl.clusterID, t));
+        }
+    }
+
+    // Animated ball: single region (geom 0) at TLAS instance index N_static.
+    // Cluster order matches the order BuildAnimatedTraditionalAS walks them
+    // in (linear over m_animatedObject.mesh.clusters), so the per-tri lookup
+    // stays in lock-step with the flat IB the trad BLAS sees.  cid is
+    // offset by kAnimatedClusterIdOffset to match BuildClusterMetadata's
+    // layout, so g_clusterMeta lookups for the animated ball's per-cluster
+    // checker overrides hit the right slots.
+    if (m_animatedObjectEnabled)
+    {
+        constexpr UINT kAnimatedClusterIdOffset = 800;
+        geomTriBase[m_objects.size() * kMaxGeomsPerInstance + 0] = (UINT)triToCidLocal.size();
+        for (const auto& cl : m_animatedObject.mesh.clusters)
+        {
+            const UINT triCount = (UINT)(cl.indices.size() / 3);
+            for (UINT t = 0; t < triCount; ++t)
+                triToCidLocal.push_back(XMUINT2(cl.clusterID + kAnimatedClusterIdOffset, t));
         }
     }
 
@@ -2957,15 +2995,47 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     for (const auto& o : m_objects)
         m_totalTriangleCount += o.mesh.totalTriangles;
 
+    // Shared sizing helper used by both the cluster-template input layout
+    // (below) and the trad-mode flat IB build (in BuildAnimatedTraditionalAS).
+    constexpr size_t kAlign = 16;
+    auto alignTo = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };
+    // Shared upload heap.  Step 2 (cluster-only, below) uses it for the
+    // template-input buffer; step 4 (shared) uses it again for the rest-
+    // positions staging upload.
+    auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    CD3DX12_RANGE noRead(0, 0);
+
+    // Cluster limits used by BOTH the BUILD_CLUSTER_TEMPLATES op and the
+    // per-frame INSTANTIATE_CLUSTER_TEMPLATES prebuild later in this
+    // function -- hoisted to shared scope so the second cluster-only
+    // block can see it.  Harmless to compute always (just copies of
+    // obj.* counts from the shared mesh-gen step).
+    D3D12_RTAS_CLUSTER_LIMITS limits = {};
+    limits.MaxArgCount                                   = obj.clusterCount;
+    limits.MaxGeometryIndexValue                         = 0;
+    limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
+    limits.MaxTriangleCountPerCluster                    = obj.maxTrisPerCluster;
+    limits.MaxVertexCountPerCluster                      = obj.maxVertsPerCluster;
+    limits.MaxTotalTriangleCount                         = obj.mesh.totalTriangles;
+    limits.MaxTotalVertexCount                           = obj.totalVertexCount;
+
+    // ==================================================================
+    // CLUSTER-MODE-ONLY: template build + per-frame CLAS/BLAS storage
+    // ==================================================================
+    // Skipped entirely in traditional mode -- the trad path builds a single
+    // per-object DXR1 BLAS each frame from perFrameVertexBuffer + a flat
+    // IB (allocated below in the shared block + later in
+    // BuildAnimatedTraditionalAS), so it doesn't need templates, INSTANTIATE
+    // args, or per-cluster CLAS results.
+    const bool kClusterPath = (m_geometryMode == GeometryMode::Clusters);
+    if (kClusterPath)
+    {
     // ------------------------------------------------------------------
     // 2) Upload buffer: hint vertex data + index data + template build args.
     //    Layout (all aligned to 16):
     //        [cluster 0 hint vertices][cluster 0 indices] ... [cluster N-1 ...]
     //        [per-cluster D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS]
     // ------------------------------------------------------------------
-    constexpr size_t kAlign = 16;
-    auto alignTo = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };
-
     struct Slot { size_t vbOffset, vbSize, ibOffset, ibSize; };
     std::vector<Slot> slots(obj.clusterCount);
     size_t cursor = 0;
@@ -2991,15 +3061,14 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     // mirrors the static-CLAS-args refactor.
     const size_t totalDataSize = alignTo(cursor, 256);
 
-    auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
     auto bufDesc    = CD3DX12_RESOURCE_DESC::Buffer(totalDataSize);
     ThrowIfFailed(device->CreateCommittedResource(
         &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&obj.templateInputBuffer)));
     obj.templateInputBuffer->SetName(L"Animated: cluster-template input buffer (vert+idx)");
 
+
     uint8_t* mapped = nullptr;
-    CD3DX12_RANGE noRead(0, 0);
     ThrowIfFailed(obj.templateInputBuffer->Map(0, &noRead, reinterpret_cast<void**>(&mapped)));
     const D3D12_GPU_VIRTUAL_ADDRESS templateInputBaseGPUVA =
         obj.templateInputBuffer->GetGPUVirtualAddress();
@@ -3072,14 +3141,8 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     //    allocate the result+scratch+address buffers, fire one batched op for
     //    all N clusters in IMPLICIT_DESTINATIONS mode.
     // ------------------------------------------------------------------
-    D3D12_RTAS_CLUSTER_LIMITS limits = {};
-    limits.MaxArgCount                                   = obj.clusterCount;
-    limits.MaxGeometryIndexValue                         = 0;
-    limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
-    limits.MaxTriangleCountPerCluster                    = obj.maxTrisPerCluster;
-    limits.MaxVertexCountPerCluster                      = obj.maxVertsPerCluster;
-    limits.MaxTotalTriangleCount                         = obj.mesh.totalTriangles;
-    limits.MaxTotalVertexCount                           = obj.totalVertexCount;
+    // `limits` is hoisted to shared scope above so the cluster-only
+    // INSTANTIATE prebuild block below can also see it.
 
     D3D12_RTAS_CLUSTER_TEMPLATE_TRIANGLES_INPUTS_DESC tplDesc = {};
     tplDesc.ClusterLimits             = limits;
@@ -3131,6 +3194,16 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     };
     m_dxrCommandList->ResourceBarrier(_countof(tplBarriers), tplBarriers);
 
+    }   // end cluster-only template-build block
+
+    // ==================================================================
+    // SHARED: per-frame vertex buffer + rest-pose positions
+    // ==================================================================
+    // BOTH paths need these.  AnimateBall.cs writes perFrameVertexBuffer
+    // every frame regardless of mode -- the cluster path then feeds it to
+    // INSTANTIATE_CLUSTER_TEMPLATES, the traditional path feeds it
+    // straight into BuildRaytracingAccelerationStructure as a D3D12_RAYTRACING_GEOMETRY_DESC
+    // VertexBuffer.
     // ------------------------------------------------------------------
     // 4) Per-frame resources (allocated once, contents rewritten every frame).
     //    perFrameVertexBuffer  - GPU-only DEFAULT-heap UAV.  Written by
@@ -3208,6 +3281,12 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         ThrowIfFailed(cl->Reset(allocator, nullptr));
         // staging goes out of scope here -- safe, GPU has consumed it.
     }
+
+    // ==================================================================
+    // CLUSTER-MODE-ONLY: per-frame INSTANTIATE args + CLAS + BLAS storage
+    // ==================================================================
+    if (kClusterPath)
+    {
     // perFrameInstArgsBuffer: per-cluster INSTANTIATE_CLUSTER_TEMPLATES_ARGS.
     // GPU-written via FillInstantiateArgs CS below (no CPU mapping, no
     // CPU-side readback of template GVAs).  Stays in UNORDERED_ACCESS so
@@ -3387,15 +3466,25 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         AllocateUploadBuffer(device, &obj.blasGPUVA, sizeof(obj.blasGPUVA),
             &obj.blasResultAddrBuffer, L"Animated: BLAS dest addrs");
     }
-
-    m_animatedObjectEnabled = true;
-    SampleLog::LogF(L"[animated] setup complete: BLAS at GVA 0x%llx, %u clusters per frame\n",
+    SampleLog::LogF(L"[animated] cluster-path setup complete: BLAS at GVA 0x%llx, %u clusters per frame\n",
                     (unsigned long long)obj.blasGPUVA, obj.clusterCount);
 
     // One-shot per-cluster CLAS size readback - runs synchronously, populates
     // m_overlayStats.animatedPerFrameClasActualBytes.  Costs ~1ms of extra
     // setup work per config change; zero per-frame cost.
     MeasureAnimatedClasBytesOneShot();
+
+    }   // end cluster-only step 4b + 5 block
+
+    // ==================================================================
+    // TRADITIONAL-MODE-ONLY: per-frame DXR1 BLAS setup
+    // ==================================================================
+    if (!kClusterPath)
+    {
+        BuildAnimatedTraditionalAS();
+    }
+
+    m_animatedObjectEnabled = true;
 }
 
 // =====================================================================================
@@ -3406,6 +3495,215 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 // in UpdateAnimatedObjectPerFrame stays free of readback overhead.
 // Stalls the GPU briefly while it copies the size UAV into a readback buffer.
 // =====================================================================================
+// =====================================================================================
+// Traditional-mode addendum to BuildAnimatedObjectSetup: builds the flat
+// per-object IB (cluster-major, with each cluster's local indices biased
+// by its vertex offset in the per-frame VB so a single
+// D3D12_RAYTRACING_GEOMETRY_DESC covers the whole ball) and allocates
+// the per-frame-rebuilt BLAS storage + scratch.  Run ONCE per
+// m_animatedObjectEnabled transition; subsequent frames just call
+// UpdateAnimatedTradPerFrame to rebuild/refit into tradBlasStorage.
+//
+// Why a flat IB rather than per-cluster geom descs?  The animated ball
+// renders as a single material (the cluster path's checker pattern
+// comes from per-cluster ClusterMeta overrides, not from per-geom-desc
+// material slots), so we don't need per-region geom-desc routing here.
+// ONE geom desc keeps the BLAS build scratch small and the BVH topology
+// compact.  If the animated ball ever grows multi-material regions,
+// mirror the static-trad path: split clusters by matRegionIdx, emit one
+// geom desc per region, populate matching tri-to-cid lookup entries.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildAnimatedTraditionalAS()
+{
+    auto device = m_deviceResources->GetD3DDevice();
+    auto& obj   = m_animatedObject;
+
+    // ------------------------------------------------------------------
+    // 1) Flat IB: walk clusters in order, append each cluster's local
+    //    indices biased by the cluster's running vertex offset in the
+    //    per-frame VB so a single geom desc sees a contiguous IB.
+    //    perFrameVertexBuffer's layout is cluster-major float3 (same
+    //    layout AnimateBall.cs writes), so the bias is just the prefix
+    //    sum of per-cluster vertex counts.
+    // ------------------------------------------------------------------
+    std::vector<UINT32> indices;
+    indices.reserve((size_t)obj.mesh.totalTriangles * 3);
+    UINT vbBase = 0;
+    for (UINT c = 0; c < obj.clusterCount; ++c)
+    {
+        const auto& src = obj.mesh.clusters[c];
+        for (auto i : src.indices)
+            indices.push_back((UINT32)i + vbBase);
+        vbBase += (UINT)src.positions.size();
+    }
+    obj.tradTriangleCount = (UINT)(indices.size() / 3);
+
+    AllocateUploadBuffer(device, indices.data(),
+                         indices.size() * sizeof(UINT32),
+                         &obj.tradIndexBuffer,
+                         L"Animated: traditional flat IB (cluster-major, biased)");
+
+    // ------------------------------------------------------------------
+    // 2) Prebuild + allocate BLAS storage + scratch.
+    //    PREFER_FAST_TRACE for ray-hit perf, ALLOW_UPDATE so the [F]
+    //    toggle can switch to PERFORM_UPDATE refits without reallocating.
+    //    Single geom desc covering perFrameVertexBuffer + tradIndexBuffer.
+    // ------------------------------------------------------------------
+    D3D12_RAYTRACING_GEOMETRY_DESC geomDesc = {};
+    geomDesc.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geomDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;  // glass material -> any-hit must run
+    geomDesc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geomDesc.Triangles.IndexCount                 = obj.tradTriangleCount * 3;
+    geomDesc.Triangles.IndexBuffer                = obj.tradIndexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geomDesc.Triangles.VertexCount                = obj.totalVertexCount;
+    geomDesc.Triangles.VertexBuffer.StartAddress  = obj.perFrameVertexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(XMFLOAT3);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geomDesc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+                          | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
+    m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
+
+    AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
+                      &obj.tradBlasStorage,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"Animated: traditional BLAS storage");
+    const UINT64 scratchBytes = std::max<UINT64>(
+        prebuild.ScratchDataSizeInBytes,
+        prebuild.UpdateScratchDataSizeInBytes);
+    AllocateUAVBuffer(device, std::max<UINT64>(scratchBytes, 256ull),
+                      &obj.tradBlasScratchBuffer,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"Animated: traditional BLAS scratch");
+
+    obj.tradBlasResultBytes  = prebuild.ResultDataMaxSizeInBytes;
+    obj.tradBlasScratchBytes = scratchBytes;
+    obj.tradBlasGPUVA        = obj.tradBlasStorage->GetGPUVirtualAddress();
+    obj.tradBlasInitialized  = false;  // first per-frame build must be a fresh rebuild
+
+    SampleLog::LogF(L"[animated trad] %u tris, result=%llu  scratch=%llu (build=%llu, update=%llu) bytes\n",
+                    obj.tradTriangleCount,
+                    (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
+                    (unsigned long long)scratchBytes,
+                    (unsigned long long)prebuild.ScratchDataSizeInBytes,
+                    (unsigned long long)prebuild.UpdateScratchDataSizeInBytes);
+}
+
+// =====================================================================================
+// Per-frame trad-mode animated update.  Mirrors UpdateAnimatedObjectPerFrame's
+// shape but builds a DXR1 BLAS from perFrameVertexBuffer + tradIndexBuffer
+// instead of going through INSTANTIATE_CLUSTER_TEMPLATES + BLAS_FROM_CLAS.
+//
+// Two operating modes selected by m_traditionalAnimMode (toggled by [F]):
+//   Rebuild: full BuildRaytracingAccelerationStructure each frame with
+//            PREFER_FAST_TRACE.  Slower but produces the highest-quality
+//            BVH each frame.
+//   Refit:   BuildRaytracingAccelerationStructure with PERFORM_UPDATE flag,
+//            reusing the existing BVH topology.  ~4-10x cheaper but BVH
+//            quality drifts as vertices wobble away from the topology
+//            cached on the source build -- works because the animation
+//            stays within the rest-pose envelope (kEnvelopeScale).
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimestampBase)
+{
+    if (!m_animatedObjectEnabled) return;
+    if (m_geometryMode != GeometryMode::Traditional) return;
+
+    auto& obj  = m_animatedObject;
+    auto cl4_ts = m_dxrCommandList.Get();  // ID3D12GraphicsCommandList4 (has EndQuery)
+    auto cl    = m_deviceResources->GetCommandList();
+
+    // ------------------------------------------------------------------
+    // 1) Compute pass: AnimateBall.cs deforms restPositionsBuffer -> perFrameVertexBuffer
+    //    Shared with the cluster path -- same CS, same root sig, same
+    //    state-cycle convention (UAV before dispatch, transition to
+    //    NON_PIXEL_SHADER_RESOURCE for the BLAS build's vertex read).
+    // ------------------------------------------------------------------
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 0);
+    cl->SetComputeRootSignature(m_animComputeRS.Get());
+    cl->SetPipelineState(m_animComputePSO.Get());
+    struct { float t; UINT vertexCount; } params = {
+        (float)m_animSeconds, obj.totalVertexCount,
+    };
+    cl->SetComputeRoot32BitConstants(0, 2, &params, 0);
+    cl->SetComputeRootShaderResourceView (1, obj.restPositionsBuffer ->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(2, obj.perFrameVertexBuffer->GetGPUVirtualAddress());
+    const UINT groups = (obj.totalVertexCount + 63u) / 64u;
+    cl->Dispatch(groups, 1, 1);
+
+    {
+        D3D12_RESOURCE_BARRIER bars[] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(obj.perFrameVertexBuffer.Get()),
+            CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(_countof(bars), bars);
+    }
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 1);
+
+    // ------------------------------------------------------------------
+    // 2) BLAS build: rebuild or refit per m_traditionalAnimMode.
+    // ------------------------------------------------------------------
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 2);
+    D3D12_RAYTRACING_GEOMETRY_DESC geomDesc = {};
+    geomDesc.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geomDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    geomDesc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geomDesc.Triangles.IndexCount                 = obj.tradTriangleCount * 3;
+    geomDesc.Triangles.IndexBuffer                = obj.tradIndexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geomDesc.Triangles.VertexCount                = obj.totalVertexCount;
+    geomDesc.Triangles.VertexBuffer.StartAddress  = obj.perFrameVertexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(XMFLOAT3);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geomDesc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+                          | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    const bool wantRefit = (m_traditionalAnimMode == TraditionalAnimMode::Refit)
+                            && obj.tradBlasInitialized;
+    if (wantRefit)
+        inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
+    buildDesc.Inputs                             = inputs;
+    buildDesc.DestAccelerationStructureData      = obj.tradBlasGPUVA;
+    buildDesc.SourceAccelerationStructureData    = wantRefit ? obj.tradBlasGPUVA : 0;
+    buildDesc.ScratchAccelerationStructureData   = obj.tradBlasScratchBuffer->GetGPUVirtualAddress();
+
+    m_dxrCommandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
+    obj.tradBlasInitialized = true;
+
+    {
+        auto bar = CD3DX12_RESOURCE_BARRIER::UAV(obj.tradBlasStorage.Get());
+        cl->ResourceBarrier(1, &bar);
+    }
+    if (pfTimestampBase != UINT_MAX)
+        cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 3);
+
+    // 3) Restore perFrameVertexBuffer to UAV for next frame's compute.
+    {
+        auto bar = CD3DX12_RESOURCE_BARRIER::Transition(obj.perFrameVertexBuffer.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cl->ResourceBarrier(1, &bar);
+    }
+}
+
 void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
 {
     if (!m_animatedObjectEnabled) return;
@@ -3571,12 +3869,21 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
         s.animatedPerFrameClasAllocBytes   = sizeOf(a.perFrameClasResultBuffer);
         s.animatedPerFrameClasScratchBytes = sizeOf(a.perFrameClasScratchBuffer);
         s.animatedBlasBytes                = sizeOf(a.blasStorage);
+        // Traditional-mode animated BLAS state.  Independent of cluster-
+        // path fields above so the overlay can show both side-by-side on
+        // a [T] toggle without one mode's values bleeding into the other.
+        s.animatedTradBlasBytes            = a.tradBlasResultBytes;
+        s.animatedTradScratchBytes         = a.tradBlasScratchBytes;
+        s.animatedTradIbBytes              = sizeOf(a.tradIndexBuffer);
+        s.animatedTradModeIsRefit          = (m_traditionalAnimMode == TraditionalAnimMode::Refit) ? 1 : 0;
     }
     else
     {
         s.animatedTemplateBytes = s.animatedPerFrameClasAllocBytes =
         s.animatedPerFrameClasScratchBytes = s.animatedBlasBytes =
         s.animatedPerFrameClasActualBytes = 0;
+        s.animatedTradBlasBytes = s.animatedTradScratchBytes = s.animatedTradIbBytes = 0;
+        s.animatedTradModeIsRefit = 0;
     }
 
     s.tlasBytes            = sizeOf(m_tlasBuffer);
@@ -3783,7 +4090,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 {
     auto device = m_deviceResources->GetD3DDevice();
     const UINT N_static = (UINT)m_objects.size();
-    const UINT N_anim   = (m_animatedObjectEnabled && (m_geometryMode == GeometryMode::Clusters)) ? 1u : 0u;
+    const UINT N_anim   = m_animatedObjectEnabled ? 1u : 0u;
     const UINT N_total  = N_static + N_anim;
 
     // Build the full instance-desc array. The animated object's BLAS lives at
@@ -3882,12 +4189,11 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             (m_geometryMode == GeometryMode::Clusters) ? obj.blasGPUVA : obj.tradBlasGPUVA;
         (isGlass ? nGlass : nOpaque)++;
     }
-    // Animated ball is currently cluster-mode-only.  When in traditional
-    // mode the per-frame DXR1 rebuild/refit path for the animated ball
-    // hasn't been wired up yet (follow-up step), so we just skip the
-    // animated instance entirely -- the scene renders the 8 static
-    // objects only.
-    const bool hasAnimInst = m_animatedObjectEnabled && (m_geometryMode == GeometryMode::Clusters);
+    // Animated ball is included in both modes -- the cluster path
+    // references obj.blasGPUVA (BLAS-from-CLAS) while the traditional
+    // path references obj.tradBlasGPUVA (DXR1 BLAS rebuilt/refitted
+    // per frame from perFrameVertexBuffer + tradIndexBuffer).
+    const bool hasAnimInst = m_animatedObjectEnabled;
     if (hasAnimInst)
     {
         const auto& a = m_animatedObject;
@@ -3904,7 +4210,9 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
         instances[N_static].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
                                             : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
-        instances[N_static].AccelerationStructure = a.blasGPUVA;
+        // Per-mode BLAS GVA for the animated instance.
+        instances[N_static].AccelerationStructure =
+            (m_geometryMode == GeometryMode::Clusters) ? a.blasGPUVA : a.tradBlasGPUVA;
         (isGlass ? nGlass : nOpaque)++;
     }
     SampleLog::LogF(L"[hitgroups] %u opaque-instance(s) -> OpaqueHitGroup (no any-hit), "
@@ -3951,7 +4259,7 @@ void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
 {
     if (!m_tlasBuffer || !m_tlasScratchBuffer || !m_tlasInstanceDescs) return;
     const UINT N_total = (UINT)m_objects.size()
-        + ((m_animatedObjectEnabled && (m_geometryMode == GeometryMode::Clusters)) ? 1u : 0u);
+        + (m_animatedObjectEnabled ? 1u : 0u);
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
     tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -4874,56 +5182,97 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     {
         const auto& a = m_animatedObject;
         const auto& p = m_overlayStatsPrev;
+        const bool isTradMode = (s.geometryMode != (int)GeometryMode::Clusters);
+
         draw(L"ANIMATED:", pos, kAccent);
         pos.y += kLineH;
-        swprintf_s(buf, L"  %u clusters / %u verts / %u tris   (template + per-frame template instantiate path)",
-                   a.clusterCount, a.totalVertexCount, a.mesh.totalTriangles);
+        if (isTradMode)
+        {
+            swprintf_s(buf, L"  %u clusters / %u verts / %u tris   (per-frame DXR1 %s)",
+                       a.clusterCount, a.totalVertexCount, a.mesh.totalTriangles,
+                       s.animatedTradModeIsRefit ? L"refit" : L"rebuild");
+        }
+        else
+        {
+            swprintf_s(buf, L"  %u clusters / %u verts / %u tris   (template + per-frame template instantiate path)",
+                       a.clusterCount, a.totalVertexCount, a.mesh.totalTriangles);
+        }
         draw(buf, pos, kSubtle); pos.y += kLineH;
 
-        const double tplMb     = s.animatedTemplateBytes            / (1024.0 * 1024.0);
-        const double prevTplMb = p.animatedTemplateBytes            / (1024.0 * 1024.0);
-        const double pfMb      = s.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
-        const double prevPfMb  = p.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
-        const double pfActMb   = s.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
-        const double prevPfAct = p.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
-        const double pfScrMb   = s.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
-        const double prevPfScr = p.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
-        const double aBlasMb   = s.animatedBlasBytes                / (1024.0 * 1024.0);
-        const double prevABlas = p.animatedBlasBytes                / (1024.0 * 1024.0);
+        if (isTradMode)
+        {
+            // Traditional-mode animated stats: just BLAS + scratch + IB.
+            // (No templates, no per-frame CLAS in this mode.)
+            const double aBlasMb   = s.animatedTradBlasBytes    / (1024.0 * 1024.0);
+            const double prevABlas = p.animatedTradBlasBytes    / (1024.0 * 1024.0);
+            const double aScrMb    = s.animatedTradScratchBytes / (1024.0 * 1024.0);
+            const double prevAScr  = p.animatedTradScratchBytes / (1024.0 * 1024.0);
+            const double aIbMb     = s.animatedTradIbBytes      / (1024.0 * 1024.0);
 
-        XMFLOAT2 c = pos;
-        drawSeg(L"  templates ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tplMb), c, deltaColour(tplMb, prevTplMb));
-        drawSeg(L" MB", c, kSubtle);
-        pos.y += kLineH;
+            XMFLOAT2 c = pos;
+            drawSeg(L"  BLAS ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
+            drawSeg(L" MB   + scratch ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb), c, deltaColour(aScrMb, prevAScr));
+            drawSeg(L" MB   inputs (IB) ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aIbMb), c, kSubtle);
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
+            pos.y += kSectionGap;
+        }
+        else
+        {
+            const double tplMb     = s.animatedTemplateBytes            / (1024.0 * 1024.0);
+            const double prevTplMb = p.animatedTemplateBytes            / (1024.0 * 1024.0);
+            const double pfMb      = s.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
+            const double prevPfMb  = p.animatedPerFrameClasAllocBytes   / (1024.0 * 1024.0);
+            const double pfActMb   = s.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
+            const double prevPfAct = p.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
+            const double pfScrMb   = s.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
+            const double prevPfScr = p.animatedPerFrameClasScratchBytes / (1024.0 * 1024.0);
+            const double aBlasMb   = s.animatedBlasBytes                / (1024.0 * 1024.0);
+            const double prevABlas = p.animatedBlasBytes                / (1024.0 * 1024.0);
 
-        c = pos;
-        drawSeg(L"  per-frame CLAS ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
-        drawSeg(L" MB alloc  (", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
-        drawSeg(L" MB actual)  + scratch ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfScrMb), c, deltaColour(pfScrMb, prevPfScr));
-        drawSeg(L" MB", c, kSubtle);
-        pos.y += kLineH;
+            XMFLOAT2 c = pos;
+            drawSeg(L"  templates ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tplMb), c, deltaColour(tplMb, prevTplMb));
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
 
-        c = pos;
-        drawSeg(L"  BLAS ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-        drawSeg(L" MB", c, kSubtle);
-        pos.y += kLineH;
-        pos.y += kSectionGap;
+            c = pos;
+            drawSeg(L"  per-frame CLAS ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
+            drawSeg(L" MB alloc  (", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
+            drawSeg(L" MB actual)  + scratch ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfScrMb), c, deltaColour(pfScrMb, prevPfScr));
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
+
+            c = pos;
+            drawSeg(L"  BLAS ", c, kSubtle);
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
+            drawSeg(L" MB", c, kSubtle);
+            pos.y += kLineH;
+            pos.y += kSectionGap;
+        }
     }
 
     // ----- TOTAL section -----
     {
         const auto& p = m_overlayStatsPrev;
+        // animatedTotal = cluster-path templates + per-frame CLAS + BLAS
+        //                 OR trad-path animated BLAS (the single per-
+        //                 frame-rebuilt DXR1 BLAS) -- they're mutually
+        //                 exclusive since only one mode is active.
         const UINT64 animatedTotal     = s.animatedTemplateBytes
                                        + s.animatedPerFrameClasAllocBytes
-                                       + s.animatedBlasBytes;
+                                       + s.animatedBlasBytes
+                                       + s.animatedTradBlasBytes;
         const UINT64 prevAnimatedTotal = p.animatedTemplateBytes
                                        + p.animatedPerFrameClasAllocBytes
-                                       + p.animatedBlasBytes;
+                                       + p.animatedBlasBytes
+                                       + p.animatedTradBlasBytes;
         // TOTAL line shows the bytes currently RESIDENT in GPU memory.
         // For Compact traditional, the worst-case temp buffer is freed
         // after the build, so the resident total uses the compacted
@@ -5499,11 +5848,17 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         // mode says no work, the begin/end pair brackets nothing and the
         // delta is ~0 (just GPU query overhead).
         const UINT base = m_pfWriteSlot * kPerFrameTsPerSlot;
-        // Animated cluster path: only runs in clustered geometry mode.
-        // The traditional per-frame animated rebuild/refit gets its own
-        // call site (see UpdateTraditionalAnimatedAS in follow-up step).
+        // Per-frame animated update: cluster path uses the
+        // INSTANTIATE_CLUSTER_TEMPLATES + BLAS_FROM_CLAS pipeline; trad
+        // path uses BuildRaytracingAccelerationStructure (rebuild or
+        // refit per [F]).  Both emit the same 4-timestamp layout
+        // (base+0..1 = AnimateBall.cs, base+2..3 = AS build) so the
+        // overlay split between "anim CS" and "anim build" works for
+        // both modes uniformly.
         if (m_geometryMode == GeometryMode::Clusters)
             UpdateAnimatedObjectPerFrame(base);
+        else
+            UpdateAnimatedTradPerFrame(base);
 
         cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 8);
         if (m_staticRebuildMode == StaticRebuildMode::ClasAndBlas &&

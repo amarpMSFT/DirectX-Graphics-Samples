@@ -699,8 +699,18 @@ private:
     // renders at <= kTargetScale (won't flash overflow before the
     // measurement catches up); on 4K they're way under the available
     // width so kScale snaps to kTargetScale immediately.
-    float                                    m_overlayContentUnscaledWidth = 2100.0f;
-    float                                    m_overlayCol1MaxRightUnscaled = 1180.0f;
+    float                                    m_overlayContentUnscaledWidth  = 2100.0f;
+    float                                    m_overlayCol1MaxRightUnscaled  = 1180.0f;
+    // Height counterpart -- max bottom edge of any text emitted this
+    // frame, max-monotonic in unscaled atlas units, used to clamp
+    // kScale to fit the back buffer HEIGHT as well as width.  Handles
+    // wide-but-short windows (e.g. 2560x400) where there's plenty of
+    // horizontal slack but the keys column would overflow the bottom.
+    // Initial value is calibrated for ~the smallest reasonable height
+    // (720) -- on bigger heights it's irrelevant (the width constraint
+    // dominates), on smaller heights it kicks in immediately so we
+    // don't flash overflow.
+    float                                    m_overlayContentUnscaledHeight = 1080.0f;
 
     // ---------- Scene constant buffer ----------
     ComPtr<ID3D12Resource>               m_sceneCB;

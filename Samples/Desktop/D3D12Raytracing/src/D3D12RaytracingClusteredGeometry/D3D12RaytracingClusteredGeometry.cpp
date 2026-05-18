@@ -5071,34 +5071,52 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     m_spriteBatch->Begin(commandList);
 
     // Adaptive scale: target 0.625x (looks great at 4K) but if that
-    // would overflow the back buffer (typically on 1280x720) drop just
-    // enough to fit.  Math:
-    //   available_px = bb_width - leftMargin - rightMargin - kCol2Gap
-    //   fit_scale    = available_px / m_overlayContentUnscaledWidth
-    //   kScale       = min(target, fit_scale)
-    // m_overlayContentUnscaledWidth comes from the PREVIOUS frame's
-    // measurement (max-monotonic), so it converges in 1 frame and
-    // auto-handles window-resize / mode-toggle width changes.  Initial
-    // value is calibrated in the header so the first frame on 1280x720
-    // doesn't overflow before the measurement-feedback loop kicks in.
+    // would overflow the back buffer (typically on small windows like
+    // 1280x720, or wide-but-short ones like 2560x400) drop just enough
+    // to fit.  Math: pick the most restrictive constraint of width
+    // and height, clamp to the target.
+    //   availPxW   = bb_width  - leftMargin - rightMargin - kCol2Gap
+    //   availPxH   = bb_height - topMargin  - bottomMargin
+    //   fitScaleW  = availPxW / m_overlayContentUnscaledWidth
+    //   fitScaleH  = availPxH / m_overlayContentUnscaledHeight
+    //   kScale     = min(target, fitScaleW, fitScaleH)
+    // Both Content*Unscaled* members come from the PREVIOUS frame's
+    // measurement (max-monotonic), so they converge in 1 frame and
+    // auto-handle window-resize / mode-toggle changes.  Initial
+    // values are calibrated in the header so the first frame on
+    // common small windows (1280x720, 1024x768) doesn't flash overflow
+    // before the measurement-feedback loop catches up.
     //
     // Why not pre-measure THIS frame's strings: would require
     // refactoring all ~700 lines of overlay formatting into a
     // build-strings-then-draw-strings split.  Frame-late approach is
-    // ~20 lines of bookkeeping and visually indistinguishable except
-    // on the FIRST frame after a state change that widens content.
-    constexpr float kTargetScale = 0.625f;
-    constexpr float kLeftMargin  = 24.0f;
-    constexpr float kRightMargin = 8.0f;
-    constexpr float kCol2Gap     = 24.0f;
-    const float     bbWidth      = (float)m_deviceResources->GetScreenViewport().Width;
-    const float     availPx      = bbWidth - kLeftMargin - kRightMargin - kCol2Gap;
-    const float     fitScale     = (availPx > 0.0f && m_overlayContentUnscaledWidth > 0.0f)
-                                       ? availPx / m_overlayContentUnscaledWidth
-                                       : kTargetScale;
-    const float    kScale  = std::min(kTargetScale, fitScale);
+    // ~30 lines of bookkeeping and visually indistinguishable except
+    // on the FIRST frame after a state change that widens/lengthens
+    // content.
+    constexpr float kTargetScale  = 0.625f;
+    constexpr float kLeftMargin   = 24.0f;
+    constexpr float kRightMargin  = 8.0f;
+    constexpr float kTopMargin    = 18.0f;
+    constexpr float kBottomMargin = 8.0f;
+    constexpr float kCol2Gap      = 24.0f;
+    const float     bbWidth       = (float)m_deviceResources->GetScreenViewport().Width;
+    const float     bbHeight      = (float)m_deviceResources->GetScreenViewport().Height;
+    const float     availPxW      = bbWidth  - kLeftMargin - kRightMargin  - kCol2Gap;
+    const float     availPxH      = bbHeight - kTopMargin  - kBottomMargin;
+    // Independent width- and height-fit constraints; whichever bites
+    // first wins.  Width-fit covers narrow windows (small bbWidth /
+    // long key descriptions); height-fit covers wide-but-short
+    // windows (e.g. 2560x400) where the keys column would otherwise
+    // run off the bottom of the back buffer.
+    const float     fitScaleW     = (availPxW > 0.0f && m_overlayContentUnscaledWidth  > 0.0f)
+                                        ? availPxW / m_overlayContentUnscaledWidth
+                                        : kTargetScale;
+    const float     fitScaleH     = (availPxH > 0.0f && m_overlayContentUnscaledHeight > 0.0f)
+                                        ? availPxH / m_overlayContentUnscaledHeight
+                                        : kTargetScale;
+    const float    kScale  = std::min({kTargetScale, fitScaleW, fitScaleH});
     const float    kLineH  = m_uiFont->GetLineSpacing() * kScale;
-    XMFLOAT2       pos{ kLeftMargin, 18.0f };
+    XMFLOAT2       pos{ kLeftMargin, kTopMargin };
     const XMFLOAT2 kOrigin { 0.0f, 0.0f };
     // Body text colours.  White on this scene's sky/hex/floor palette --
     // kSubtle is the "no change" colour for stat rows (delta-coloured numbers
@@ -5143,22 +5161,26 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     struct PendingRect { float x, y, w, h; bool valid; } pending = {0, 0, 0, 0, false};
 
     // Frame-local tracking for the next-frame fit-scale calculation.
-    // Both values are accumulated in PIXELS (this frame's scale), then
-    // converted to unscaled atlas units at end of RenderUI before being
-    // max()'d into the persistent members.
-    //  - thisFrameCol1RightPx: max right edge of any rect emitted while
-    //    trackCol1==true (i.e. col 1 only).  Drives col 2's x-anchor
-    //    for NEXT frame, and feeds the col1 width portion of the total.
-    //  - thisFrameAnyRightPx: max right edge of ANY rect emitted this
-    //    frame (cols 1 AND 2).  Combined with col2's x-anchor, gives
-    //    col 2's content width.
-    float thisFrameCol1RightPx = 0.0f;
-    float thisFrameAnyRightPx  = 0.0f;
-    bool  trackCol1            = true;
+    // Both right- and bottom-edge tracking; converted to unscaled
+    // atlas units at end of RenderUI before being max()'d into the
+    // persistent members.
+    //  - thisFrameCol1RightPx: max right edge while trackCol1==true.
+    //    Drives col 2's x-anchor for NEXT frame, and feeds the col1
+    //    width portion of the total.
+    //  - thisFrameAnyRightPx: max right edge of ANY rect this frame
+    //    (cols 1 AND 2).  Combined with col2's x-anchor, gives col 2's
+    //    content width.
+    //  - thisFrameAnyBottomPx: max bottom edge of ANY rect this frame.
+    //    Drives the height-fit clamp for NEXT frame.
+    float thisFrameCol1RightPx  = 0.0f;
+    float thisFrameAnyRightPx   = 0.0f;
+    float thisFrameAnyBottomPx  = 0.0f;
+    bool  trackCol1             = true;
 
     auto emitBacking = [&](float x, float y, float w, float h) {
         if (w <= 0.0f || h <= 0.0f) return;
-        thisFrameAnyRightPx = std::max(thisFrameAnyRightPx, x + w);
+        thisFrameAnyRightPx  = std::max(thisFrameAnyRightPx,  x + w);
+        thisFrameAnyBottomPx = std::max(thisFrameAnyBottomPx, y + h);
         if (trackCol1)
             thisFrameCol1RightPx = std::max(thisFrameCol1RightPx, x + w);
         RECT r = {
@@ -5875,10 +5897,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
                                           + kCol2Gap;
         const float col2UnscaledThisFrame = std::max(0.0f,
             (thisFrameAnyRightPx - col2StartXPx) / kScale);
-        m_overlayCol1MaxRightUnscaled = std::max(m_overlayCol1MaxRightUnscaled,
-                                                 col1UnscaledThisFrame);
-        m_overlayContentUnscaledWidth = std::max(m_overlayContentUnscaledWidth,
-                                                 col1UnscaledThisFrame + col2UnscaledThisFrame);
+        // Height counterpart: any rect's bottom minus topMargin gives
+        // the overlay's content height in pixels at current scale;
+        // divide by kScale for atlas units.
+        const float heightUnscaledThisFrame = std::max(0.0f,
+            (thisFrameAnyBottomPx - kTopMargin) / kScale);
+        m_overlayCol1MaxRightUnscaled  = std::max(m_overlayCol1MaxRightUnscaled,
+                                                  col1UnscaledThisFrame);
+        m_overlayContentUnscaledWidth  = std::max(m_overlayContentUnscaledWidth,
+                                                  col1UnscaledThisFrame + col2UnscaledThisFrame);
+        m_overlayContentUnscaledHeight = std::max(m_overlayContentUnscaledHeight,
+                                                  heightUnscaledThisFrame);
     }
     m_spriteBatch->End();
 }

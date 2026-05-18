@@ -5098,31 +5098,29 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // Local helpers -- draw a dark backing rect under each text segment,
     // then the bright text on top.  The backing rect is sized to the
     // segment's exact bounding box (cursor.x..cursor.x+measureX(text),
-    // pos.y..pos.y+kLineH), so adjacent drawSeg calls produce abutting
-    // rects that form a continuous dark backing under each line --
-    // exactly the width of the actual text, no overhang.  Cheap: one
-    // extra SpriteBatch::Draw call per text segment (the 1x1 white
-    // overlay texture stretched + tinted).  Without the backing, bright
-    // numbers wash out against the sky / chrome / floor reflections.
+    // pos.y..pos.y+kLineH).
     //
-    // No horizontal padding -- with padding, the floor/ceil rounding on
-    // adjacent segments overlaps by a couple pixels and double-darkens
-    // the boundary into a visible vertical bar.  Without padding,
-    // adjacent rects tile exactly (left edge of seg N+1 == right edge
-    // of seg N, both rounded the same way via the floor-then-ceil
-    // pattern below) and the union looks like one continuous strip.
-    const XMVECTOR  kBacking     = XMVectorSet(0.0f, 0.0f, 0.0f, 0.30f);
-    // Forward-declare measureX so drawBacking can use it (the
-    // existing definition is below).
+    // Padding strategy: line ENDS get kLinePad of horizontal padding
+    // (so the rect doesn't terminate flush against the glyph edge),
+    // but interior segment boundaries get ZERO padding -- otherwise
+    // overlapping kLinePad-padded rects double-darken into visible
+    // vertical bars at every "label X.XX value" join.  To know whether
+    // a segment is the LAST of its line (and needs right-pad), we
+    // defer each segment's rect into a `pending` slot and only flush
+    // it when we see the NEXT segment: if next.y != pending.y or there
+    // is no next, the pending one was the line's last and gets the
+    // right-pad applied.  First segment of a line (detected by
+    // pending.y != cursor.y on entry) gets the left-pad applied.
+    constexpr float kLinePad = 4.0f;
+    const XMVECTOR  kBacking = XMVectorSet(0.0f, 0.0f, 0.0f, 0.30f);
+
     auto measureX = [&](const wchar_t* s) {
         return XMVectorGetX(m_uiFont->MeasureString(s, /*ignoreWhitespace*/false)) * kScale;
     };
-    // Draw a dark rect spanning the given pixel-space bbox.  Tinted via
-    // SpriteBatch::Draw using the 1x1 white overlay texture.  Both edges
-    // floor()'d (rather than left=floor, right=ceil) so adjacent
-    // segments meet at the SAME integer column without one column of
-    // overlap.
-    auto drawBacking = [&](float x, float y, float w, float h) {
+
+    struct PendingRect { float x, y, w, h; bool valid; } pending = {0, 0, 0, 0, false};
+
+    auto emitBacking = [&](float x, float y, float w, float h) {
         if (w <= 0.0f || h <= 0.0f) return;
         RECT r = {
             (LONG)std::floor(x),
@@ -5130,35 +5128,53 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             (LONG)std::floor(x + w),
             (LONG)std::floor(y + h)
         };
-        m_spriteBatch->Draw(m_overlayPanelTextureGpu,
-                            XMUINT2(1, 1),
-                            r,
-                            kBacking);
+        m_spriteBatch->Draw(m_overlayPanelTextureGpu, XMUINT2(1, 1), r, kBacking);
     };
+
+    // Flush the pending rect.  When `addRightPad` is true the rect's
+    // right edge is extended by kLinePad -- pass true when we know
+    // this is the last segment of its line (i.e. the next draw is on
+    // a different y, or render is ending).
+    auto flushPending = [&](bool addRightPad) {
+        if (!pending.valid) return;
+        float w = pending.w + (addRightPad ? kLinePad : 0.0f);
+        emitBacking(pending.x, pending.y, w, pending.h);
+        pending.valid = false;
+    };
+
     // Local helper -- DrawString with the global scale factor baked in.
-    // Backing rect drawn FIRST (SpriteBatch deferred mode preserves
-    // submission order), then text on top so the text composites
-    // over the dark backing.
+    // A `draw` call is self-contained (full string passed at once) so
+    // we can emit its padded backing rect immediately.  Flushes any
+    // pending segment from a preceding drawSeg sequence as line-end.
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
+        flushPending(/*addRightPad*/true);
         const float w = measureX(s) * relScale;
         const float h = kLineH * relScale;
-        drawBacking(p.x, p.y, w, h);
+        emitBacking(p.x - kLinePad, p.y, w + 2 * kLinePad, h);
         m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
                              /*rotation*/0.0f, kOrigin, kScale * relScale);
     };
-    // Segment draw: writes `text` at the cursor and advances the cursor's X.
-    // Used to compose a stat line out of subtle-prefix / coloured-number /
-    // subtle-suffix pieces without needing a fully tagged-text renderer.
-    // `cursor` is mutated in place (x advances, y untouched).  Backing
-    // rect drawn FIRST so adjacent segments' rects form a continuous
-    // strip under the line; kBackingPadX overlap covers seams between
-    // them.  ignoreWhitespace=false on the measure is CRITICAL: trailing
-    // spaces in a label segment must contribute to the advance, else
-    // "CLAS " + "0.66" composes as "CLAS0.66" with the label and value
-    // glued together.
+
+    // Segment draw: writes `text` at the cursor and advances cursor.x.
+    // Defers its rect into `pending` so the NEXT call (segment or
+    // draw or render-end) can decide whether to add right-pad.
+    // First segment of a new line (pending.y != cursor.y or
+    // !pending.valid) gets left-pad here.
+    // ignoreWhitespace=false on measureX is CRITICAL: trailing spaces
+    // in a label segment must contribute to advance, else "CLAS " +
+    // "0.66" composes as "CLAS0.66".
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
-        const float w = measureX(text);
-        drawBacking(cursor.x, cursor.y, w, kLineH);
+        const float w        = measureX(text);
+        const bool  newLine  = !pending.valid || pending.y != cursor.y;
+        // If we're continuing on the same line, the previous pending
+        // segment is an interior one -- flush WITHOUT right-pad.
+        // If we're on a new line, flush WITH right-pad as it's the
+        // previous line's last segment.
+        if (pending.valid) flushPending(/*addRightPad*/newLine);
+        // Queue this segment; pad left if it's the first of a new line.
+        const float lpad = newLine ? kLinePad : 0.0f;
+        pending = { cursor.x - lpad, cursor.y, w + lpad, kLineH, true };
+
         m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
                              /*rotation*/0.0f, kOrigin, kScale);
         cursor.x += w;
@@ -5783,6 +5799,9 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
     drawKeyLine(L"[P]", kbuf);
 
+    // Flush any drawSeg whose right-pad we haven't decided yet -- it's
+    // the last segment of the overlay, so it gets the right-pad.
+    flushPending(/*addRightPad*/true);
     m_spriteBatch->End();
 }
 

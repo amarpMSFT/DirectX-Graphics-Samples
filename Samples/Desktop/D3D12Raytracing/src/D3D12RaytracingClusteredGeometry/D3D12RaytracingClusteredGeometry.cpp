@@ -3849,6 +3849,22 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     {
         m_overlayStatsPrev    = s;
         m_overlayStatsHasPrev = true;
+        // Also stash by mode so mode-specific stats get a within-mode
+        // delta on a future [T] toggle (instead of comparing trad
+        // numbers to stale cluster numbers, which produces garbage).
+        // s.geometryMode here = the mode the snapshot CURRENT s came
+        // from, which is the mode active at the END of the previous
+        // capture -- i.e. the mode whose values we just stashed.
+        if (s.geometryMode == (int)GeometryMode::Clusters)
+        {
+            m_overlayStatsLastInCluster    = s;
+            m_overlayStatsHasLastInCluster = true;
+        }
+        else
+        {
+            m_overlayStatsLastInTrad       = s;
+            m_overlayStatsHasLastInTrad    = true;
+        }
     }
 
     // Static
@@ -5102,7 +5118,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     pos.y += kLineH;
     if (isTraditional)
     {
-        const auto& p = m_overlayStatsPrev;
+        // Same-mode prev: a [T] cluster->trad toggle leaves
+        // m_overlayStatsPrev holding cluster numbers, but trad stats
+        // (BLAS bytes, scratch, etc.) don't exist in cluster mode.
+        // Use the last-seen-IN-TRAD snapshot for deltas so colours
+        // mean "what changed within trad path" -- not "what changed
+        // because the unrelated cluster path was the previous mode".
+        const auto& p = m_overlayStatsHasLastInTrad ? m_overlayStatsLastInTrad
+                                                    : m_overlayStatsPrev;
         const double allocMb    = s.traditionalBlasTotalBytes     / (1024.0 * 1024.0);
         const double prevAllocMb= p.traditionalBlasTotalBytes     / (1024.0 * 1024.0);
         const double actualMb   = s.traditionalBlasActualBytes    / (1024.0 * 1024.0);
@@ -5147,7 +5170,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // buffer is sized after a GetSizes probe returns per-cluster actual
     // sizes, so the slider visibly shrinks/grows it.  Either way we show
     // staticClasActualBytes alongside so the precision effect is visible.
-        const auto& p = m_overlayStatsPrev;
+        // Same-mode prev: CLAS bytes are cluster-mode-only -- use the
+        // last cluster-mode snapshot so a [T] toggle's delta reflects
+        // intra-cluster changes, not garbage vs trad.
+        const auto& p = m_overlayStatsHasLastInCluster ? m_overlayStatsLastInCluster
+                                                       : m_overlayStatsPrev;
         const double allocMb     = s.staticClasAllocBytes   / (1024.0 * 1024.0);
         const double prevAllocMb = p.staticClasAllocBytes   / (1024.0 * 1024.0);
         const double actualMb    = s.staticClasActualBytes  / (1024.0 * 1024.0);
@@ -5181,8 +5208,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     if (m_animatedObjectEnabled)
     {
         const auto& a = m_animatedObject;
-        const auto& p = m_overlayStatsPrev;
         const bool isTradMode = (s.geometryMode != (int)GeometryMode::Clusters);
+        // Same-mode prev: animated stats are mode-specific (cluster
+        // uses templates+CLAS+BLAS, trad uses one DXR1 BLAS), so a
+        // [T] cross-mode toggle's delta should compare against the
+        // last snapshot taken in the SAME mode, not the immediate prev
+        // (which is the other mode).  See m_overlayStatsLastIn*.
+        const auto& p = isTradMode
+            ? (m_overlayStatsHasLastInTrad    ? m_overlayStatsLastInTrad    : m_overlayStatsPrev)
+            : (m_overlayStatsHasLastInCluster ? m_overlayStatsLastInCluster : m_overlayStatsPrev);
 
         draw(L"ANIMATED:", pos, kAccent);
         pos.y += kLineH;

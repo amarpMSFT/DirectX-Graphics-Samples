@@ -841,6 +841,19 @@ private:
     // off for the very first capture (no previous to compare against).
     OverlayStats m_overlayStatsPrev;
     bool         m_overlayStatsHasPrev = false;
+    // Per-mode "last snapshot taken while in this mode".  These exist so
+    // mode-specific stats (cluster-only CLAS bytes, trad-only BLAS bytes,
+    // etc.) get an intra-mode delta on a [T] cross-mode toggle instead of
+    // a garbage delta against the other mode's stale value.  Shared
+    // stats (TOTAL AS memory, TLAS, per-frame timing) deliberately keep
+    // using m_overlayStatsPrev so a [T] toggle paints those red/green
+    // with the cross-mode comparison the user wants ("how much memory
+    // does trad cost vs cluster, side-by-side") -- see deltaColourMatch
+    // / deltaColourCross usage in the overlay renderer.
+    OverlayStats m_overlayStatsLastInCluster;
+    OverlayStats m_overlayStatsLastInTrad;
+    bool         m_overlayStatsHasLastInCluster = false;
+    bool         m_overlayStatsHasLastInTrad    = false;
     // Delta-colour expiry timestamp.  CaptureOverlayStatsSnapshot resets this
     // to (now + 5s) so the red/green tinting auto-fades back to subtle after
     // a quiet period -- prevents the screen permanently glowing red/green

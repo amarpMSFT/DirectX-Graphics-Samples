@@ -5040,7 +5040,19 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const XMVECTOR kRed    = XMVectorSet(1.00f, 0.45f, 0.45f, 1);   // bright red delta
 
     // Local helper -- DrawString with the global scale factor baked in.
+    // Two-pass shadow + body: a dark, slightly-translucent copy is drawn
+    // first at a small offset down-right (+1.5 px on each axis) so the
+    // bright body colour above renders with a halo of dark pixels around
+    // every glyph edge.  That halo is what gives the text legibility
+    // against bright scene patches (sky, the floor's painted reflections,
+    // the chrome highlights).  Cheap -- one extra DrawString per text
+    // segment; the spritefont atlas binding is already cached.
+    constexpr float kShadowOffset = 1.5f;
+    const XMVECTOR  kShadow       = XMVectorSet(0.0f, 0.0f, 0.0f, 0.70f);
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
+        XMFLOAT2 shadowPos{ p.x + kShadowOffset, p.y + kShadowOffset };
+        m_uiFont->DrawString(m_spriteBatch.get(), s, shadowPos, kShadow,
+                             /*rotation*/0.0f, kOrigin, kScale * relScale);
         m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
                              /*rotation*/0.0f, kOrigin, kScale * relScale);
     };
@@ -5055,8 +5067,12 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // Segment draw: writes `text` at the cursor and advances the cursor's X.
     // Used to compose a stat line out of subtle-prefix / coloured-number /
     // subtle-suffix pieces without needing a fully tagged-text renderer.
-    // `cursor` is mutated in place (x advances, y untouched).
+    // `cursor` is mutated in place (x advances, y untouched).  Same
+    // shadow+body two-pass as `draw` above for legibility.
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
+        XMFLOAT2 shadowPos{ cursor.x + kShadowOffset, cursor.y + kShadowOffset };
+        m_uiFont->DrawString(m_spriteBatch.get(), text, shadowPos, kShadow,
+                             /*rotation*/0.0f, kOrigin, kScale);
         m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
                              /*rotation*/0.0f, kOrigin, kScale);
         cursor.x += measureX(text);

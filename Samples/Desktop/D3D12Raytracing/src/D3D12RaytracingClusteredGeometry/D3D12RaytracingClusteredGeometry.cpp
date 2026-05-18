@@ -5070,16 +5070,35 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     m_spriteBatch->SetViewport(viewport);
     m_spriteBatch->Begin(commandList);
 
-    // Render at 0.625x of the 24 pt atlas -- 25% bigger than the prior
-    // 0.5x for legibility.  At 0.625x bilinear filtering no longer
-    // achieves perfect 2x2 downsample (was the magic of 0.5x), but the
-    // dark backing rect + faux-bold body pass below mask the AA softness
-    // sufficiently for the larger text.  If we later want crispness back,
-    // regenerate SegoeUI as 30 pt and use kScale = 0.5 for an exact 2x
-    // downsample at this same on-screen size.
-    const float    kScale  = 0.625f;
+    // Adaptive scale: target 0.625x (looks great at 4K) but if that
+    // would overflow the back buffer (typically on 1280x720) drop just
+    // enough to fit.  Math:
+    //   available_px = bb_width - leftMargin - rightMargin - kCol2Gap
+    //   fit_scale    = available_px / m_overlayContentUnscaledWidth
+    //   kScale       = min(target, fit_scale)
+    // m_overlayContentUnscaledWidth comes from the PREVIOUS frame's
+    // measurement (max-monotonic), so it converges in 1 frame and
+    // auto-handles window-resize / mode-toggle width changes.  Initial
+    // value is calibrated in the header so the first frame on 1280x720
+    // doesn't overflow before the measurement-feedback loop kicks in.
+    //
+    // Why not pre-measure THIS frame's strings: would require
+    // refactoring all ~700 lines of overlay formatting into a
+    // build-strings-then-draw-strings split.  Frame-late approach is
+    // ~20 lines of bookkeeping and visually indistinguishable except
+    // on the FIRST frame after a state change that widens content.
+    constexpr float kTargetScale = 0.625f;
+    constexpr float kLeftMargin  = 24.0f;
+    constexpr float kRightMargin = 8.0f;
+    constexpr float kCol2Gap     = 24.0f;
+    const float     bbWidth      = (float)m_deviceResources->GetScreenViewport().Width;
+    const float     availPx      = bbWidth - kLeftMargin - kRightMargin - kCol2Gap;
+    const float     fitScale     = (availPx > 0.0f && m_overlayContentUnscaledWidth > 0.0f)
+                                       ? availPx / m_overlayContentUnscaledWidth
+                                       : kTargetScale;
+    const float    kScale  = std::min(kTargetScale, fitScale);
     const float    kLineH  = m_uiFont->GetLineSpacing() * kScale;
-    XMFLOAT2       pos{ 24.0f, 18.0f };
+    XMFLOAT2       pos{ kLeftMargin, 18.0f };
     const XMFLOAT2 kOrigin { 0.0f, 0.0f };
     // Body text colours.  White on this scene's sky/hex/floor palette --
     // kSubtle is the "no change" colour for stat rows (delta-coloured numbers
@@ -5123,21 +5142,25 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     struct PendingRect { float x, y, w, h; bool valid; } pending = {0, 0, 0, 0, false};
 
-    // Track the right-most extent of every backing rect, but only
-    // while `trackCol1` is true.  After the FPS section we flip it
-    // to false so the keys column (col 2) doesn't feed back into the
-    // col1 width.  The final value is stashed into m_overlayCol1MaxRight
-    // for NEXT frame's col2 anchor -- using a frame-late value keeps
-    // col 2 from jumping around as col 1's numbers change width
-    // within a frame (and we take max() so col 2 only ever drifts
-    // right, never left, which avoids the keys re-flowing).
-    float thisFrameCol1Right = 0.0f;
-    bool  trackCol1          = true;
+    // Frame-local tracking for the next-frame fit-scale calculation.
+    // Both values are accumulated in PIXELS (this frame's scale), then
+    // converted to unscaled atlas units at end of RenderUI before being
+    // max()'d into the persistent members.
+    //  - thisFrameCol1RightPx: max right edge of any rect emitted while
+    //    trackCol1==true (i.e. col 1 only).  Drives col 2's x-anchor
+    //    for NEXT frame, and feeds the col1 width portion of the total.
+    //  - thisFrameAnyRightPx: max right edge of ANY rect emitted this
+    //    frame (cols 1 AND 2).  Combined with col2's x-anchor, gives
+    //    col 2's content width.
+    float thisFrameCol1RightPx = 0.0f;
+    float thisFrameAnyRightPx  = 0.0f;
+    bool  trackCol1            = true;
 
     auto emitBacking = [&](float x, float y, float w, float h) {
         if (w <= 0.0f || h <= 0.0f) return;
+        thisFrameAnyRightPx = std::max(thisFrameAnyRightPx, x + w);
         if (trackCol1)
-            thisFrameCol1Right = std::max(thisFrameCol1Right, x + w);
+            thisFrameCol1RightPx = std::max(thisFrameCol1RightPx, x + w);
         RECT r = {
             (LONG)std::floor(x),
             (LONG)std::floor(y),
@@ -5755,16 +5778,19 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // hint is omitted because ',' and '.' / '[' and ']' are visually paired
     // keys -- you can tell from the prefix which way each one moves.
     //
-    // Column 2: anchored at m_overlayCol1MaxRight (frame-late, monotonic
-    // so the keys never jump leftward as stat numbers grow/shrink) +
-    // kCol2Gap.  Aligned with the top of column 1 (the SCENE row) so the
-    // vertical space the keys used to take below FPS is now free for the
-    // scene.  Tracking flipped off so the keys' own backing rects don't
+    // Column 2: anchored at (m_overlayCol1MaxRightUnscaled * kScale +
+    // leftMargin + kCol2Gap).  Using the UNSCALED last-frame value
+    // means col 2 reflows correctly when kScale changes (e.g. on
+    // window resize), while still being monotonic-max (in atlas units)
+    // so the keys don't jump leftward as numbers shrink.  Aligned with
+    // the top of column 1 (the SCENE row) so the vertical space the
+    // keys used to take below FPS is now free for the scene.
+    // Tracking flipped off so the keys' own backing rects don't
     // contribute to the col 1 width tracker for next frame.
-    constexpr float kCol2Gap = 24.0f;
     flushPending(/*addRightPad*/true);   // close out any pending col1 rect
     trackCol1 = false;
-    pos = XMFLOAT2(m_overlayCol1MaxRight + kCol2Gap, col2StartY);
+    pos = XMFLOAT2(kLeftMargin + m_overlayCol1MaxRightUnscaled * kScale + kCol2Gap,
+                   col2StartY);
     auto drawKeyLine = [&](const wchar_t* keyPrefix, const wchar_t* tail) {
         XMFLOAT2 p = pos;
         draw(keyPrefix, p, kHotkey);
@@ -5828,9 +5854,32 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.
     flushPending(/*addRightPad*/true);
-    // Save this frame's col 1 width for next frame's col 2 anchor.
-    // max() keeps the column monotonic so it never drifts leftward.
-    m_overlayCol1MaxRight = std::max(m_overlayCol1MaxRight, thisFrameCol1Right);
+
+    // Convert this frame's max right edges (pixels) back to unscaled
+    // atlas units, then max() into the persistent members for next
+    // frame's fit-scale + col2 anchor computation.
+    //   col1 content width (unscaled) = (col1_right_px - leftMargin) / kScale
+    //   col2 starts at: leftMargin + col1_unscaled_last_frame * kScale + gap
+    //                 = pos_x_we_used_for_col2_start
+    //   col2 content width (unscaled) = (any_right_px - col2_start_x) / kScale
+    //   total content width (unscaled) = col1_unscaled + col2_unscaled
+    // Both members are MAX-monotonic during the session so kScale only
+    // ever decreases (overflow protection) -- if a wider line appears,
+    // we shrink to fit and stay shrunk.  Resetting requires app restart
+    // (acceptable -- the alternative is oscillation between scales).
+    if (kScale > 0.0f) {
+        const float col1UnscaledThisFrame = std::max(0.0f,
+            (thisFrameCol1RightPx - kLeftMargin) / kScale);
+        const float col2StartXPx          = kLeftMargin
+                                          + m_overlayCol1MaxRightUnscaled * kScale
+                                          + kCol2Gap;
+        const float col2UnscaledThisFrame = std::max(0.0f,
+            (thisFrameAnyRightPx - col2StartXPx) / kScale);
+        m_overlayCol1MaxRightUnscaled = std::max(m_overlayCol1MaxRightUnscaled,
+                                                 col1UnscaledThisFrame);
+        m_overlayContentUnscaledWidth = std::max(m_overlayContentUnscaledWidth,
+                                                 col1UnscaledThisFrame + col2UnscaledThisFrame);
+    }
     m_spriteBatch->End();
 }
 

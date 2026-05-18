@@ -678,12 +678,29 @@ private:
     // lives in the shared descriptor heap.
     Microsoft::WRL::ComPtr<ID3D12Resource>   m_overlayPanelTexture;
     D3D12_GPU_DESCRIPTOR_HANDLE              m_overlayPanelTextureGpu = {};
-    // Right edge of column 1 from the previous frame -- used to anchor
-    // the keys column 2 so it doesn't jump as numbers grow/shrink each
-    // snapshot.  Monotonic (only grows during a session) so the keys
-    // column position is stable; on first frame defaults to a generous
-    // fallback so it doesn't overlap col1.
-    float                                    m_overlayCol1MaxRight = 760.0f;
+    // Adaptive overlay sizing -- the overlay TARGETS kScale=0.625 (the
+    // size you see at 4K) but if that scale would overflow the back
+    // buffer width (typically on 1280x720), kScale is dropped just
+    // enough to fit.  Both values below are in UNSCALED atlas pixels
+    // (i.e. as if rendered at kScale=1.0) so they're independent of
+    // whatever scale the previous frame used.
+    //  - m_overlayContentUnscaledWidth: total width of col1 text +
+    //    col2 text (NOT including margins or the col1->col2 gap, both
+    //    of which are fixed-pixel and don't scale).  This frame's
+    //    fit-scale = (bb_width - margins - gap) / this_value, clamped
+    //    to kTargetScale.  Monotonic-max so the chosen scale converges
+    //    upward as we observe wider lines (e.g. after a mode toggle
+    //    that lengthens a number).
+    //  - m_overlayCol1MaxRightUnscaled: max right-edge of col1's text
+    //    in unscaled units, used to anchor col2.x at any kScale.
+    //    Also monotonic-max so col2 only drifts right, never reflows
+    //    leftward when col1's numbers shrink between frames.
+    // Initial values are calibrated so the first frame on 1280x720
+    // renders at <= kTargetScale (won't flash overflow before the
+    // measurement catches up); on 4K they're way under the available
+    // width so kScale snaps to kTargetScale immediately.
+    float                                    m_overlayContentUnscaledWidth = 2100.0f;
+    float                                    m_overlayCol1MaxRightUnscaled = 1180.0f;
 
     // ---------- Scene constant buffer ----------
     ComPtr<ID3D12Resource>               m_sceneCB;

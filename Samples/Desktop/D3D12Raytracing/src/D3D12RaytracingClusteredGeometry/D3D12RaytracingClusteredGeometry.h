@@ -670,6 +670,14 @@ private:
     std::unique_ptr<DirectX::GraphicsMemory> m_graphicsMemory;
     std::unique_ptr<DirectX::SpriteBatch>    m_spriteBatch;
     std::unique_ptr<DirectX::SpriteFont>     m_uiFont;
+    // 1x1 white texture used by the overlay's per-segment dark backing.
+    // SpriteBatch stretches it to each text segment's exact bounding box
+    // (cursor.x..cursor.x+measureX, pos.y..pos.y+kLineH) and tints it
+    // with a semi-transparent dark colour, so the bright body text reads
+    // against any scene colour underneath.  Allocated in CreateUIFont,
+    // lives in the shared descriptor heap.
+    Microsoft::WRL::ComPtr<ID3D12Resource>   m_overlayPanelTexture;
+    D3D12_GPU_DESCRIPTOR_HANDLE              m_overlayPanelTextureGpu = {};
 
     // ---------- Scene constant buffer ----------
     ComPtr<ID3D12Resource>               m_sceneCB;

@@ -4725,6 +4725,62 @@ void D3D12RaytracingClusteredGeometry::CreateUIFont()
     SampleLog::LogF(L"[ui] SpriteFont loaded (descriptor heap slot %u); "
                     L"line spacing = %.1f px\n",
                     fontSlot, m_uiFont->GetLineSpacing());
+
+    // 1x1 white texture used by the overlay backing-rect pass below
+    // (see RenderUI's drawSeg/draw lambdas).  Created via the same
+    // ResourceUploadBatch pattern as the spritefont, dropped into the
+    // next descriptor heap slot, GPU handle stashed for SpriteBatch::Draw.
+    {
+        ResourceUploadBatch upload(device);
+        upload.Begin();
+
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width              = 1;
+        texDesc.Height             = 1;
+        texDesc.DepthOrArraySize   = 1;
+        texDesc.MipLevels          = 1;
+        texDesc.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.SampleDesc.Count   = 1;
+        texDesc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+        auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        ThrowIfFailed(device->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&m_overlayPanelTexture)));
+        m_overlayPanelTexture->SetName(L"Overlay 1x1 white (per-line dark backing source)");
+
+        // One white pixel: R=255 G=255 B=255 A=255.  SpriteBatch tints
+        // it with the dark+alpha colour we want when drawing the rect.
+        const uint8_t whitePixel[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+        D3D12_SUBRESOURCE_DATA sub = {};
+        sub.pData      = whitePixel;
+        sub.RowPitch   = sizeof(whitePixel);
+        sub.SlicePitch = sizeof(whitePixel);
+
+        upload.Upload(m_overlayPanelTexture.Get(), 0, &sub, 1);
+        upload.Transition(m_overlayPanelTexture.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        auto done = upload.End(m_deviceResources->GetCommandQueue());
+        done.wait();
+
+        // SRV in the next free heap slot; SpriteBatch::Draw consumes a
+        // GPU handle.
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        UINT slot = AllocateDescriptor(&cpu);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels     = 1;
+        device->CreateShaderResourceView(m_overlayPanelTexture.Get(), &srvDesc, cpu);
+        m_overlayPanelTextureGpu = CD3DX12_GPU_DESCRIPTOR_HANDLE(
+            m_descriptorHeap->GetGPUDescriptorHandleForHeapStart(), slot, m_descriptorSize);
+        SampleLog::LogF(L"[ui] overlay-panel 1x1 texture (descriptor slot %u)\n", slot);
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -5039,43 +5095,73 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const XMVECTOR kGreen  = XMVectorSet(0.40f, 1.00f, 0.40f, 1);   // bright green delta
     const XMVECTOR kRed    = XMVectorSet(1.00f, 0.45f, 0.45f, 1);   // bright red delta
 
-    // Local helper -- DrawString with the global scale factor baked in.
-    // Two-pass shadow + body: a dark, slightly-translucent copy is drawn
-    // first at a small offset down-right (+1.5 px on each axis) so the
-    // bright body colour above renders with a halo of dark pixels around
-    // every glyph edge.  That halo is what gives the text legibility
-    // against bright scene patches (sky, the floor's painted reflections,
-    // the chrome highlights).  Cheap -- one extra DrawString per text
-    // segment; the spritefont atlas binding is already cached.
-    constexpr float kShadowOffset = 1.5f;
-    const XMVECTOR  kShadow       = XMVectorSet(0.0f, 0.0f, 0.0f, 0.70f);
-    auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
-        XMFLOAT2 shadowPos{ p.x + kShadowOffset, p.y + kShadowOffset };
-        m_uiFont->DrawString(m_spriteBatch.get(), s, shadowPos, kShadow,
-                             /*rotation*/0.0f, kOrigin, kScale * relScale);
-        m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
-                             /*rotation*/0.0f, kOrigin, kScale * relScale);
-    };
-    // MeasureString returns the size at scale 1; cursor advances need scaling
-    // by kScale to land glyphs flush with each other.
-    // ignoreWhitespace=false is CRITICAL for drawSeg below: trailing spaces in
-    // a label segment must contribute to the advance, else "CLAS " + "0.66"
-    // composes as "CLAS0.66" with the label and value glued together.
+    // Local helpers -- draw a dark backing rect under each text segment,
+    // then the bright text on top.  The backing rect is sized to the
+    // segment's exact bounding box (cursor.x..cursor.x+measureX(text),
+    // pos.y..pos.y+kLineH), so adjacent drawSeg calls produce abutting
+    // rects that form a continuous dark backing under each line --
+    // exactly the width of the actual text, no overhang.  Cheap: one
+    // extra SpriteBatch::Draw call per text segment (the 1x1 white
+    // overlay texture stretched + tinted).  Without the backing, bright
+    // numbers wash out against the sky / chrome / floor reflections.
+    //
+    // No horizontal padding -- with padding, the floor/ceil rounding on
+    // adjacent segments overlaps by a couple pixels and double-darkens
+    // the boundary into a visible vertical bar.  Without padding,
+    // adjacent rects tile exactly (left edge of seg N+1 == right edge
+    // of seg N, both rounded the same way via the floor-then-ceil
+    // pattern below) and the union looks like one continuous strip.
+    const XMVECTOR  kBacking     = XMVectorSet(0.0f, 0.0f, 0.0f, 0.20f);
+    // Forward-declare measureX so drawBacking can use it (the
+    // existing definition is below).
     auto measureX = [&](const wchar_t* s) {
         return XMVectorGetX(m_uiFont->MeasureString(s, /*ignoreWhitespace*/false)) * kScale;
+    };
+    // Draw a dark rect spanning the given pixel-space bbox.  Tinted via
+    // SpriteBatch::Draw using the 1x1 white overlay texture.  Both edges
+    // floor()'d (rather than left=floor, right=ceil) so adjacent
+    // segments meet at the SAME integer column without one column of
+    // overlap.
+    auto drawBacking = [&](float x, float y, float w, float h) {
+        if (w <= 0.0f || h <= 0.0f) return;
+        RECT r = {
+            (LONG)std::floor(x),
+            (LONG)std::floor(y),
+            (LONG)std::floor(x + w),
+            (LONG)std::floor(y + h)
+        };
+        m_spriteBatch->Draw(m_overlayPanelTextureGpu,
+                            XMUINT2(1, 1),
+                            r,
+                            kBacking);
+    };
+    // Local helper -- DrawString with the global scale factor baked in.
+    // Backing rect drawn FIRST (SpriteBatch deferred mode preserves
+    // submission order), then text on top so the text composites
+    // over the dark backing.
+    auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
+        const float w = measureX(s) * relScale;
+        const float h = kLineH * relScale;
+        drawBacking(p.x, p.y, w, h);
+        m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
+                             /*rotation*/0.0f, kOrigin, kScale * relScale);
     };
     // Segment draw: writes `text` at the cursor and advances the cursor's X.
     // Used to compose a stat line out of subtle-prefix / coloured-number /
     // subtle-suffix pieces without needing a fully tagged-text renderer.
-    // `cursor` is mutated in place (x advances, y untouched).  Same
-    // shadow+body two-pass as `draw` above for legibility.
+    // `cursor` is mutated in place (x advances, y untouched).  Backing
+    // rect drawn FIRST so adjacent segments' rects form a continuous
+    // strip under the line; kBackingPadX overlap covers seams between
+    // them.  ignoreWhitespace=false on the measure is CRITICAL: trailing
+    // spaces in a label segment must contribute to the advance, else
+    // "CLAS " + "0.66" composes as "CLAS0.66" with the label and value
+    // glued together.
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
-        XMFLOAT2 shadowPos{ cursor.x + kShadowOffset, cursor.y + kShadowOffset };
-        m_uiFont->DrawString(m_spriteBatch.get(), text, shadowPos, kShadow,
-                             /*rotation*/0.0f, kOrigin, kScale);
+        const float w = measureX(text);
+        drawBacking(cursor.x, cursor.y, w, kLineH);
         m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
                              /*rotation*/0.0f, kOrigin, kScale);
-        cursor.x += measureX(text);
+        cursor.x += w;
     };
     // Delta-colour pickers.  Return green/red/subtle based on cur vs prev.
     // Two gates:
@@ -6314,6 +6400,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     // owns their backing GPU resources is released).
     m_uiFont.reset();
     m_spriteBatch.reset();
+    m_overlayPanelTexture.Reset();
     m_graphicsMemory.reset();
     m_dxr2CommandList.Reset();
     m_dxr2Device.Reset();

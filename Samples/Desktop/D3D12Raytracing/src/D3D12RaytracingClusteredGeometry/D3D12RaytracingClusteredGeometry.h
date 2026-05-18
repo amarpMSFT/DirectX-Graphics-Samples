@@ -1035,6 +1035,16 @@ private:
     // NOT captured here - they're snapped a few frames later by Tick() once
     // the ring buffer has refilled with post-rebuild samples.
     void CaptureOverlayStatsSnapshot();
+    // Two halves of CaptureOverlayStatsSnapshot, exposed so callers whose
+    // code path mutates m_overlayStats mid-rebuild (specifically
+    // RebuildStaticAccelerationStructures, via MeasureAnimatedClasBytesOneShot
+    // inside BuildAnimatedObjectSetup) can stash prev BEFORE the build and
+    // refresh AFTER.  Without this split, the rebuild path stashes an
+    // already-half-mutated prev -> delta colouring stops working for the
+    // per-frame-CLAS-actual field.  See StashOverlayStatsAsPrev definition
+    // comment for the full mechanism.
+    void StashOverlayStatsAsPrev();
+    void RefreshOverlayStatsCurrent();
     void DumpClusterStatsAsync();
     void ReadBuildTimestamps();
     void CreateUIFont();

@@ -867,6 +867,14 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     //    ID3D12Resource - if the GPU is still touching it the runtime errors out.
     m_deviceResources->WaitForGpu();
 
+    // 2) Stash the PRE-rebuild overlay snapshot as the delta-colour baseline.
+    //    Must happen BEFORE the build code below -- specifically before
+    //    BuildAnimatedObjectSetup -> MeasureAnimatedClasBytesOneShot writes
+    //    s.animatedPerFrameClasActualBytes.  If we stash AFTER, prev gets
+    //    the new actual-CLAS value and the per-frame-CLAS-actual field
+    //    silently stops lighting up green/red on precision changes.
+    StashOverlayStatsAsPrev();
+
     // 2) Drop all CLAS-related GPU resources.  Each mode's BuildClas* will
     //    reallocate these via ComPtr assignment (which releases stale slots).
     //    Explicitly clearing here makes the tear-down explicit and is the
@@ -970,7 +978,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     // m_overlayStats so the overlay reads from a cached struct instead of
     // poking GetDesc().Width every frame.  Per-frame timing gets snapped
     // a few frames later, once the ring buffer refills - see Tick().
-    CaptureOverlayStatsSnapshot();
+    // RefreshOverlayStatsCurrent (NOT CaptureOverlayStatsSnapshot) -- the
+    // prev-stash already happened at the top of this function before
+    // BuildAnimatedObjectSetup wrote the new actual-CLAS value into s.
+    RefreshOverlayStatsCurrent();
 }
 
 // ---------------------------------------------------------------------------------
@@ -3831,57 +3842,59 @@ void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
 // have finished).  Per-frame timing values are *not* captured here - they're
 // snapped by Tick() a few frames later once the ring buffer has refilled.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
+// =====================================================================================
+// Stash the CURRENT overlay snapshot into m_overlayStatsPrev (the delta-colour
+// baseline).  Must be called BEFORE any of the build code mutates m_overlayStats
+// for a config-change rebuild -- otherwise the rebuild path would stash an
+// already-half-updated snapshot as prev, killing the delta colouring.
+//
+// Specifically: MeasureAnimatedClasBytesOneShot runs INSIDE BuildAnimatedObjectSetup
+// and writes s.animatedPerFrameClasActualBytes mid-rebuild.  If we stash s -> prev
+// AFTER that write (the old combined-Capture* behaviour), prev gets the NEW
+// actual-CLAS value and the delta is always zero -> the per-frame-CLAS-actual
+// number never lights up green/red even though it changed visibly on screen.
+// Splitting stash + refresh fixes this: the rebuild path stashes prev at the
+// top (s is still the OLD state at that point) and the refresh runs at the
+// bottom (s gets the NEW state to display).
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::StashOverlayStatsAsPrev()
+{
+    // 'First call' is detected via m_overlayStatsHasPrev rather than any
+    // sentinel field value -- see CaptureOverlayStatsSnapshot's call-site
+    // comment for why a field-based heuristic is wrong across mode toggles.
+    if (!m_overlayStatsHasPrev) return;
+    const auto& s = m_overlayStats;
+    m_overlayStatsPrev = s;
+    if (s.geometryMode == (int)GeometryMode::Clusters)
+    {
+        m_overlayStatsLastInCluster    = s;
+        m_overlayStatsHasLastInCluster = true;
+    }
+    else
+    {
+        m_overlayStatsLastInTrad       = s;
+        m_overlayStatsHasLastInTrad    = true;
+    }
+}
+
+// =====================================================================================
+// Snapshot m_overlayStats from the current live GPU resource state.  Re-reads
+// every displayed value EXCEPT animatedPerFrameClasActualBytes (which is set by
+// MeasureAnimatedClasBytesOneShot at end-of-build and persists across calls).
+// Also arms the 5s delta-colour fade and the "recalculating..." per-frame
+// settle flag.  Does NOT stash prev -- that must already have been done by
+// either CaptureOverlayStatsSnapshot (one-shot callers) or by an earlier
+// StashOverlayStatsAsPrev (rebuild callers).
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
 {
     auto sizeOf = [](const Microsoft::WRL::ComPtr<ID3D12Resource>& r) -> UINT64 {
         return r ? r->GetDesc().Width : 0ull;
     };
     auto& s = m_overlayStats;
-
-    // Stash the previous snapshot so the overlay can colour numbers red/green
-    // when this toggle changes them.  Every capture EXCEPT the very first
-    // (init) saves current as prev -- so colours always reflect "what
-    // changed vs the immediately previous toggle".  The 5 s timer below
-    // applies to the fade-out only, not to which values we compare against.
-    //
-    // 'First call' must come from the explicit m_overlayStatsHasPrev flag
-    // (set the FIRST time we stash), NOT from a sentinel field value.
-    // A previous version used (s.staticClasAllocBytes == 0) as a "looks
-    // uninitialised" check -- but trad mode legitimately leaves that field
-    // at zero, so the SECOND time we returned to cluster after a stop in
-    // trad, the heuristic mis-classified the snapshot as first-init and
-    // skipped the stash entirely.  Net effect: m_overlayStatsPrev stayed
-    // pinned to the cluster baseline from two toggles ago, and the
-    // trad->cluster delta lost its green colouring (cur cluster == prev
-    // cluster -> no delta).  The flag-based check is correct in every
-    // mode transition order.  The flag itself is set unconditionally at
-    // the end of this function so the second call onward correctly hits
-    // the !isInit branch (the previous version set it inside !isInit,
-    // which created a chicken-and-egg: first call skips the set, second
-    // call sees flag still false, also skips the stash).
     const auto now    = std::chrono::steady_clock::now();
     const bool isInit = !m_overlayStatsHasPrev;
-    if (!isInit)
-    {
-        m_overlayStatsPrev    = s;
-        // Also stash by mode so mode-specific stats get a within-mode
-        // delta on a future [T] toggle (instead of comparing trad
-        // numbers to stale cluster numbers, which produces garbage).
-        // s.geometryMode here = the mode the snapshot CURRENT s came
-        // from, which is the mode active at the END of the previous
-        // capture -- i.e. the mode whose values we just stashed.
-        if (s.geometryMode == (int)GeometryMode::Clusters)
-        {
-            m_overlayStatsLastInCluster    = s;
-            m_overlayStatsHasLastInCluster = true;
-        }
-        else
-        {
-            m_overlayStatsLastInTrad       = s;
-            m_overlayStatsHasLastInTrad    = true;
-        }
-    }
-    m_overlayStatsHasPrev = true;  // sticky after first call
+    m_overlayStatsHasPrev = true;  // sticky after first refresh
 
     // Static
     s.staticClasAllocBytes   = m_totalClasBytes;
@@ -3986,6 +3999,20 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     // window to drain.
     if (!isInit)
         m_overlayStatsDeltaUntil = now + std::chrono::seconds(5);
+}
+
+// =====================================================================================
+// Convenience wrapper: stash prev, then refresh current.  Use this from any
+// caller whose code path does NOT mutate m_overlayStats between the prev-stash
+// and the refresh.  Rebuild paths (RebuildStaticAccelerationStructures) MUST
+// instead bracket the build with StashOverlayStatsAsPrev() at the top and
+// RefreshOverlayStatsCurrent() at the bottom -- otherwise the
+// MeasureAnimatedClasBytesOneShot write inside the build steals prev.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
+{
+    StashOverlayStatsAsPrev();
+    RefreshOverlayStatsCurrent();
 }
 
 // =====================================================================================
@@ -5822,9 +5849,26 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     //       snapshot it because the whole point of FPS is the instantaneous
     //       value the user can watch fluctuate.  Section header in blue +
     //       indented value in white, matching the convention above.
+    //       ms/frame added alongside FPS because at sub-1 FPS (WARP,
+    //       heavy debug-layer modes) the integer FPS rounds to 0 or 1
+    //       and stops being informative -- whereas the per-frame ms
+    //       smoothly reports the true frame cost.  At >= 1000 ms the
+    //       unit auto-switches to seconds so "3127 ms/frame" reads as
+    //       "3.13 s/frame" -- friendlier for the WARP case where a
+    //       single frame can take many seconds.  Uses
+    //       GetElapsedSeconds() (last-frame value) rather than
+    //       1000/GetFramesPerSecond() so we don't divide by a possibly-
+    //       zero averaged FPS at the slow end.
     draw(L"FPS:", pos, kAccent);
     pos.y += kLineH;
-    swprintf_s(buf, L"  %u", (unsigned)m_timer.GetFramesPerSecond());
+    const double secPerFrame = m_timer.GetElapsedSeconds();
+    const double msPerFrame  = secPerFrame * 1000.0;
+    if (msPerFrame >= 1000.0)
+        swprintf_s(buf, L"  %u   (%.2f s/frame)",
+                   (unsigned)m_timer.GetFramesPerSecond(), secPerFrame);
+    else
+        swprintf_s(buf, L"  %u   (%.1f ms/frame)",
+                   (unsigned)m_timer.GetFramesPerSecond(), msPerFrame);
     draw(buf, pos, kSubtle);
     pos.y += kLineH * 1.4f;
 

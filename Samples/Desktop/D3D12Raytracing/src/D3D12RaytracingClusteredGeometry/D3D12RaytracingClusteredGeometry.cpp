@@ -3843,12 +3843,27 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
     // (init) saves current as prev -- so colours always reflect "what
     // changed vs the immediately previous toggle".  The 5 s timer below
     // applies to the fade-out only, not to which values we compare against.
+    //
+    // 'First call' must come from the explicit m_overlayStatsHasPrev flag
+    // (set the FIRST time we stash), NOT from a sentinel field value.
+    // A previous version used (s.staticClasAllocBytes == 0) as a "looks
+    // uninitialised" check -- but trad mode legitimately leaves that field
+    // at zero, so the SECOND time we returned to cluster after a stop in
+    // trad, the heuristic mis-classified the snapshot as first-init and
+    // skipped the stash entirely.  Net effect: m_overlayStatsPrev stayed
+    // pinned to the cluster baseline from two toggles ago, and the
+    // trad->cluster delta lost its green colouring (cur cluster == prev
+    // cluster -> no delta).  The flag-based check is correct in every
+    // mode transition order.  The flag itself is set unconditionally at
+    // the end of this function so the second call onward correctly hits
+    // the !isInit branch (the previous version set it inside !isInit,
+    // which created a chicken-and-egg: first call skips the set, second
+    // call sees flag still false, also skips the stash).
     const auto now    = std::chrono::steady_clock::now();
-    const bool isInit = (s.staticClasAllocBytes == 0);   // m_overlayStats default-initialised
+    const bool isInit = !m_overlayStatsHasPrev;
     if (!isInit)
     {
         m_overlayStatsPrev    = s;
-        m_overlayStatsHasPrev = true;
         // Also stash by mode so mode-specific stats get a within-mode
         // delta on a future [T] toggle (instead of comparing trad
         // numbers to stale cluster numbers, which produces garbage).
@@ -3866,6 +3881,7 @@ void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
             m_overlayStatsHasLastInTrad    = true;
         }
     }
+    m_overlayStatsHasPrev = true;  // sticky after first call
 
     // Static
     s.staticClasAllocBytes   = m_totalClasBytes;

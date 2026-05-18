@@ -5192,26 +5192,55 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         m_spriteBatch->Draw(m_overlayPanelTextureGpu, XMUINT2(1, 1), r, kBacking);
     };
 
-    auto flushPending = [&](bool addRightPad) {
+    // Single-rect-per-row strategy:  `pending` accumulates the bounding
+    // rect of EVERY segment drawn on the current row.  Each call to
+    // addToPending(x,y,w,h) either (a) starts a new row by flushing the
+    // previous row's rect, or (b) GROWS the current row's rect to cover
+    // the new segment.  The row's rect is only emitted to the back
+    // buffer when we move to a new row OR at end-of-frame.
+    //
+    // Why this matters: emitting one rect per segment caused 1-pixel
+    // vertical dark seams at segment boundaries.  Each segment rect
+    // gets floor()'d at both ends so adjacent rects share a 1-pixel
+    // column where the alpha (0.20) composites twice -> visible dark
+    // bar at every "label | value | label" join along a row.  One
+    // single rect per row eliminates the issue entirely -- there's
+    // simply no boundary to double-darken.
+    auto flushPending = [&]() {
         if (!pending.valid) return;
-        float w = pending.w + (addRightPad ? kLinePad : 0.0f);
-        emitBacking(pending.x, pending.y, w, pending.h);
+        emitBacking(pending.x, pending.y, pending.w + kLinePad, pending.h);
         pending.valid = false;
     };
 
+    auto addToPending = [&](float x, float y, float w, float h) {
+        if (!pending.valid || pending.y != y)
+        {
+            // New row -- flush old row's rect, start a fresh one with
+            // the left-pad baked into x.  Width includes +kBoldOff so
+            // the +1 px faux-bold pass stays inside the rect.
+            if (pending.valid) flushPending();
+            pending = { x - kLinePad, y, w + kLinePad + kBoldOff, h, true };
+        }
+        else
+        {
+            // Same row -- extend pending right edge to cover this
+            // segment, keep height = max so a mixed-height row (e.g.
+            // the Adapter line uses 1.10x scale) draws a rect tall
+            // enough for the tallest glyph on it.
+            const float newRight = std::max(pending.x + pending.w,
+                                            x + w + kBoldOff);
+            pending.w = newRight - pending.x;
+            pending.h = std::max(pending.h, h);
+        }
+    };
+
     // Local helper -- DrawString with the global scale factor baked in.
-    // Same-line-aware (see commentary above flushPending).  Two body
-    // passes for faux-bold: same string, same colour, +1px horizontal
-    // offset on the second pass.
+    // Two body passes for faux-bold: same string, same colour, +1px
+    // horizontal offset on the second pass.
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
         const float w = measureX(s) * relScale;
         const float h = kLineH * relScale;
-        const bool continuesLine = pending.valid && pending.y == p.y;
-        if (pending.valid) flushPending(/*addRightPad*/!continuesLine);
-        const float lpad = continuesLine ? 0.0f : kLinePad;
-        // Account for the +1px bold pass so the rect's right edge
-        // includes the bolded stroke extension.
-        pending = { p.x - lpad, p.y, w + lpad + kBoldOff, h, true };
+        addToPending(p.x, p.y, w, h);
         m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
                              /*rotation*/0.0f, kOrigin, kScale * relScale);
         XMFLOAT2 boldPos{ p.x + kBoldOff, p.y };
@@ -5220,13 +5249,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     };
 
     // Segment draw: writes `text` at the cursor and advances cursor.x.
-    // Defers its rect into `pending`; faux-bold body pass like `draw`.
+    // Defers its rect into the row-level `pending`; faux-bold body pass
+    // like `draw`.
     auto drawSeg = [&](const wchar_t* text, XMFLOAT2& cursor, FXMVECTOR colour) {
-        const float w        = measureX(text);
-        const bool  newLine  = !pending.valid || pending.y != cursor.y;
-        if (pending.valid) flushPending(/*addRightPad*/newLine);
-        const float lpad = newLine ? kLinePad : 0.0f;
-        pending = { cursor.x - lpad, cursor.y, w + lpad + kBoldOff, kLineH, true };
+        const float w = measureX(text);
+        addToPending(cursor.x, cursor.y, w, kLineH);
         m_uiFont->DrawString(m_spriteBatch.get(), text, cursor, colour,
                              /*rotation*/0.0f, kOrigin, kScale);
         XMFLOAT2 boldPos{ cursor.x + kBoldOff, cursor.y };
@@ -5658,7 +5685,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", animMb), c, deltaColourU(animatedTotal, prevAnimatedTotal));
         }
         drawSeg(L" + TLAS ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tlasMb), c, deltaColourU(s.tlasBytes, p.tlasBytes));
+        // TLAS is tiny (~3.5 KB for our 9-instance scene; would reach
+        // ~64 KB at ~1000 instances) -- formatting in MB rounds to 0.00
+        // for any realistic scene.  Force KB so the number is readable.
+        // 1 decimal so 3.5 doesn't truncate to "3"; >= 1 MB would show
+        // as e.g. "1228.8 KB" which is fine.
+        wchar_t tlasBuf[32];
+        swprintf_s(tlasBuf, L"%.1f KB", s.tlasBytes / 1024.0);
+        drawSeg(tlasBuf, c, deltaColourU(s.tlasBytes, p.tlasBytes));
         drawSeg(L")", c, kSubtle);
         pos.y += kLineH;
         pos.y += kSectionGap;
@@ -5809,7 +5843,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // keys used to take below FPS is now free for the scene.
     // Tracking flipped off so the keys' own backing rects don't
     // contribute to the col 1 width tracker for next frame.
-    flushPending(/*addRightPad*/true);   // close out any pending col1 rect
+    flushPending();   // close out any pending col1 rect
     trackCol1 = false;
     pos = XMFLOAT2(kLeftMargin + m_overlayCol1MaxRightUnscaled * kScale + kCol2Gap,
                    col2StartY);
@@ -5875,7 +5909,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.
-    flushPending(/*addRightPad*/true);
+    flushPending();
 
     // Convert this frame's max right edges (pixels) back to unscaled
     // atlas units, then max() into the persistent members for next

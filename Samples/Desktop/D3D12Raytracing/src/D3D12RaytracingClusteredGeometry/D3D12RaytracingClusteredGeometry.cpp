@@ -5085,7 +5085,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // tint away from this to green/red when they move).
     const XMVECTOR kWhite  = XMVectorSet(1.00f, 1.00f, 1.00f, 1);
     const XMVECTOR kSubtle = XMVectorSet(0.92f, 0.94f, 0.97f, 1);
-    const XMVECTOR kAccent = XMVectorSet(0.40f, 0.15f, 0.65f, 1);   // dark purple for section headers
+    const XMVECTOR kAccent = XMVectorSet(0.85f, 0.55f, 1.00f, 1);   // bright lavender for section headers
     const XMVECTOR kHotkey = XMVectorSet(1.00f, 0.90f, 0.15f, 1);   // bright yellow for the hotkey char
     // Delta-colouring: every per-config-change number compares to its
     // previous-snapshot value and tints itself.

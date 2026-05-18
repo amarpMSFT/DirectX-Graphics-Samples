@@ -5143,14 +5143,21 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     };
 
     // Local helper -- DrawString with the global scale factor baked in.
-    // A `draw` call is self-contained (full string passed at once) so
-    // we can emit its padded backing rect immediately.  Flushes any
-    // pending segment from a preceding drawSeg sequence as line-end.
+    // Same-line-aware: if a pending drawSeg shares this draw's y, the
+    // pending one is flushed WITHOUT right-pad (this draw continues
+    // the line), and our own rect gets NO left-pad.  Otherwise the
+    // pending is flushed WITH right-pad and our rect gets BOTH pads.
+    // We then queue OURSELVES into pending so a follow-on draw or
+    // drawSeg on the same line gets the same continuation treatment.
     auto draw = [&](const wchar_t* s, XMFLOAT2 p, FXMVECTOR colour, float relScale = 1.0f) {
-        flushPending(/*addRightPad*/true);
         const float w = measureX(s) * relScale;
         const float h = kLineH * relScale;
-        emitBacking(p.x - kLinePad, p.y, w + 2 * kLinePad, h);
+        const bool continuesLine = pending.valid && pending.y == p.y;
+        if (pending.valid) flushPending(/*addRightPad*/!continuesLine);
+        const float lpad = continuesLine ? 0.0f : kLinePad;
+        // Queue rather than emit, so a follow-on call on the same y
+        // can decide to suppress our right-pad.
+        pending = { p.x - lpad, p.y, w + lpad, h, true };
         m_uiFont->DrawString(m_spriteBatch.get(), s, p, colour,
                              /*rotation*/0.0f, kOrigin, kScale * relScale);
     };

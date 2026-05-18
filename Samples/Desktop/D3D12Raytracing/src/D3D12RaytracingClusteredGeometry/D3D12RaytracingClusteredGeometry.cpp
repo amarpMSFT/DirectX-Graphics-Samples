@@ -5116,7 +5116,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // alpha-blend batch), so colours composite predictably.
     constexpr float kLinePad      = 4.0f;
     constexpr float kShadowOffset = 1.5f;
-    const XMVECTOR  kBacking      = XMVectorSet(0.0f, 0.0f, 0.0f, 0.30f);
+    const XMVECTOR  kBacking      = XMVectorSet(0.0f, 0.0f, 0.0f, 0.20f);
     const XMVECTOR  kShadow       = XMVectorSet(0.0f, 0.0f, 0.0f, 0.70f);
 
     auto measureX = [&](const wchar_t* s) {

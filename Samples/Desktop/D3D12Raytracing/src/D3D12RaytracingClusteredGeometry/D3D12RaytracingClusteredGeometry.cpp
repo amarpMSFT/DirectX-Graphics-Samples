@@ -4287,12 +4287,15 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     };
     // Matches the hit-group shader table layout in
     // CreateRaytracingPipelineAndShaderTables: opaque block at offset 0,
-    // glass block at offset 2 (2 records per block: primary + shadow).
-    constexpr UINT kHitGroupContribOpaque = 0;
-    constexpr UINT kHitGroupContribGlass  = 2;
+    // glass block at offset 2, mixed-glass (unified GlassHit for both
+    // regions) block at offset 4 (2 records per block: primary + shadow,
+    // mixed has TWO 2-record blocks back-to-back for region 0 & 1).
+    constexpr UINT kHitGroupContribOpaque     = 0;
+    constexpr UINT kHitGroupContribGlass      = 2;
+    constexpr UINT kHitGroupContribMixedGlass = 4;
 
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances(N_total);
-    UINT nOpaque = 0, nGlass = 0;
+    UINT nOpaque = 0, nGlass = 0, nMixed = 0;
     for (UINT i = 0; i < N_static; ++i)
     {
         const auto& obj = m_objects[i];
@@ -4305,29 +4308,42 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID  = obj.instanceID;
         instances[i].InstanceMask= 0xFF;
-        // Hit-group contribution.  For multi-region objects we route
-        // by the FIRST region's material kind (geometryIndex 0 lands
-        // there with MultiplierForGeometryContributionToHitGroupIndex=2),
-        // and subsequent regions add Multiplier*GeomIdx to pick their
-        // own hit group automatically -- so the mixed sphere's chrome
-        // region (region 0, slot 0) lands at OpaqueHitGroup and its
-        // glass region (region 1, slot 3) lands at GlassHitGroup with
-        // NO per-pixel shader branch.
+        // Hit-group contribution.  Three cases:
+        //   * SINGLE-region opaque-only        -> kHitGroupContribOpaque
+        //   * SINGLE-region glass OR ALL-glass -> kHitGroupContribGlass
+        //   * MULTI-region MIXED (some regions opaque, some glass)
+        //                                      -> kHitGroupContribMixedGlass
+        //
+        // The "mixed" routing binds GlassHit to BOTH region hit groups.
+        // GlassHit's Fresnel-Schlick degenerates cleanly on chrome
+        // material (refr=0 -> Tw=0 -> no refraction trace), so the
+        // chrome region still looks chrome and the glass region gets
+        // full refraction.  This avoids relying on a non-zero
+        // GeometryIndex() in the cluster path (forced to 0 by the
+        // NVIDIA BaseGeometryIndex driver workaround) and lets cluster
+        // mode match trad mode exactly for multi-material instances.
         UINT firstRegionMatSlot = obj.perRegionMaterialSlot.empty()
             ? obj.instanceID
             : obj.perRegionMaterialSlot[0];
         const bool firstIsGlass = needsGlass(m_materials[firstRegionMatSlot], obj);
-        // If this is a multi-region instance and ANY region is glass,
-        // we need any-hit (FORCE_OPAQUE would skip it).  Detect that
-        // separately from firstIsGlass for the FORCE_OPAQUE decision.
-        bool anyRegionIsGlass = firstIsGlass;
+        // Count glass regions to detect MIXED (some glass, some opaque).
+        UINT glassRegionCount = firstIsGlass ? 1u : 0u;
         for (UINT r = 1; r < (UINT)obj.perRegionMaterialSlot.size(); ++r)
         {
-            anyRegionIsGlass = anyRegionIsGlass ||
-                needsGlass(m_materials[obj.perRegionMaterialSlot[r]], obj);
+            if (needsGlass(m_materials[obj.perRegionMaterialSlot[r]], obj))
+                ++glassRegionCount;
         }
-        instances[i].InstanceContributionToHitGroupIndex =
-            firstIsGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
+        const UINT totalRegions = std::max<UINT>(1u, (UINT)obj.perRegionMaterialSlot.size());
+        const bool isMixed       = (glassRegionCount > 0 && glassRegionCount < totalRegions);
+        const bool anyRegionIsGlass = (glassRegionCount > 0);
+
+        if (isMixed)
+            instances[i].InstanceContributionToHitGroupIndex = kHitGroupContribMixedGlass;
+        else if (anyRegionIsGlass)
+            instances[i].InstanceContributionToHitGroupIndex = kHitGroupContribGlass;
+        else
+            instances[i].InstanceContributionToHitGroupIndex = kHitGroupContribOpaque;
+
         instances[i].Flags = anyRegionIsGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
                                               : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
         const bool isGlass = anyRegionIsGlass;  // for stats below
@@ -4346,7 +4362,9 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         // (built via classic BuildRaytracingAccelerationStructure).
         instances[i].AccelerationStructure =
             (m_geometryMode == GeometryMode::Clusters) ? obj.blasGPUVA : obj.tradBlasGPUVA;
-        (isGlass ? nGlass : nOpaque)++;
+        if (isMixed)        ++nMixed;
+        else if (isGlass)   ++nGlass;
+        else                ++nOpaque;
     }
     // Animated ball is included in both modes -- the cluster path
     // references obj.blasGPUVA (BLAS-from-CLAS) while the traditional
@@ -4375,7 +4393,9 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         (isGlass ? nGlass : nOpaque)++;
     }
     SampleLog::LogF(L"[hitgroups] %u opaque-instance(s) -> OpaqueHitGroup (no any-hit), "
-                    L"%u glass-instance(s) -> GlassHitGroup\n", nOpaque, nGlass);
+                    L"%u glass-instance(s) -> GlassHitGroup, "
+                    L"%u mixed-instance(s) -> GlassHitGroup (unified, both regions)\n",
+                    nOpaque, nGlass, nMixed);
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
                          &m_tlasInstanceDescs, L"TLAS instance descs");
 
@@ -4735,35 +4755,61 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
     // ---- HIT-GROUP shader table layout ----
-    // 4 records, 2 contiguous (primary + shadow) blocks per material kind:
+    // 8 records, 2 contiguous (primary + shadow) blocks per material kind:
     //
     //   [0] OpaqueHitGroup    <-- primary for OPAQUE instances (InstanceContrib=0)
     //   [1] ShadowHitGroup    <-- shadow  for OPAQUE instances (RayContrib=1)
     //   [2] GlassHitGroup     <-- primary for GLASS  instances (InstanceContrib=2)
     //   [3] ShadowHitGroup    <-- shadow  for GLASS  instances (RayContrib=1)
+    //   [4] GlassHitGroup     <-- primary for MIXED  instances, region 0
+    //                             (InstanceContrib=4 with Multiplier=2,
+    //                              gi=0 -> 4, gi=1 -> 6)
+    //   [5] ShadowHitGroup    <-- shadow  for MIXED  instances, region 0
+    //   [6] GlassHitGroup     <-- primary for MIXED  instances, region 1
+    //   [7] ShadowHitGroup    <-- shadow  for MIXED  instances, region 1
     //
     // Per-instance InstanceContributionToHitGroupIndex picks the block;
     // shadow rays add RayContributionToHitGroupIndex=1 within the block.
     // The shadow records share the same dummy hit-group identifier but
-    // physically live at two distinct table indices so the same RayContrib=1
-    // offset works from either block start.
-    auto makeTable4 = [&](void* r0, void* r1, void* r2, void* r3,
+    // physically live at distinct table indices so the same RayContrib=1
+    // offset works from any block start.
+    //
+    // The "mixed" block exists so MULTI-REGION instances with mixed
+    // material kinds (e.g. mixed sphere = chrome upper + glass lower)
+    // route both regions to GlassHit unconditionally.  GlassHit's
+    // Fresnel-Schlick degenerates cleanly on the chrome region (refr=0
+    // -> Tw=0, no refraction trace) so chrome still looks chrome, and
+    // the glass region gets full refraction.  This makes the cluster
+    // path (where GeometryIndex() is forced to 0 by the NVIDIA
+    // BaseGeometryIndex driver workaround) render identically to the
+    // traditional path (where GeometryIndex() works) for these
+    // instances -- the cost is one extra Fresnel calc per chrome hit,
+    // imperceptible on a 4090.  See DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
+    // and the discussion at perRegionMaterialSlot in the sphere 3 setup.
+    auto makeTable8 = [&](void* r0, void* r1, void* r2, void* r3,
+                          void* r4, void* r5, void* r6, void* r7,
                           ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
     {
-        std::vector<uint8_t> data(recordSize * 4, 0);
+        std::vector<uint8_t> data(recordSize * 8, 0);
         memcpy(data.data() + 0 * recordSize, r0, idSize);
         memcpy(data.data() + 1 * recordSize, r1, idSize);
         memcpy(data.data() + 2 * recordSize, r2, idSize);
         memcpy(data.data() + 3 * recordSize, r3, idSize);
+        memcpy(data.data() + 4 * recordSize, r4, idSize);
+        memcpy(data.data() + 5 * recordSize, r5, idSize);
+        memcpy(data.data() + 6 * recordSize, r6, idSize);
+        memcpy(data.data() + 7 * recordSize, r7, idSize);
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
 
     makeTable1(rgID,                    m_rayGenShaderTable,   L"raygen shader table");
     makeTable2(missID, shadowMissID,    m_missShaderTable,     L"miss shader table (primary + shadow)");
-    makeTable4(opaqueHgID, shadowHgID,
+    makeTable8(opaqueHgID, shadowHgID,
+               glassHgID,  shadowHgID,
+               glassHgID,  shadowHgID,
                glassHgID,  shadowHgID,
                m_hitGroupShaderTable,
-               L"hit-group shader table (opaque-primary, shadow, glass-primary, shadow)");
+               L"hit-group shader table (opaque, shadow, glass, shadow, mixed-r0, shadow, mixed-r1, shadow)");
 }
 // ---------------------------------------------------------------------------------
 // DirectXTK SpriteBatch + SpriteFont setup.  Creates the GraphicsMemory ring

@@ -1426,20 +1426,38 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         std::vector<ClasArgsMeta> meta(m_totalClusterCount);
         gIdx = 0;
         for (const auto& obj : m_objects)
-        for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++gIdx)
         {
-            const auto& src = obj.mesh.clusters[i];
-            const auto& mat = m_materials[obj.instanceID];
-            const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
-            meta[gIdx].clusterID    = src.clusterID;
-            meta[gIdx].triCount     = (UINT)(src.indices.size() / 3);
-            meta[gIdx].vertCount    = (UINT)src.positions.size();
-            meta[gIdx].vbOff        = (UINT)slots[gIdx].vbOffset;
-            meta[gIdx].ibOff        = (UINT)slots[gIdx].ibOffset;
-            meta[gIdx].opaqueFlag   = isOpaqueLike
-                ? (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
-                : 0u;
-            meta[gIdx].matRegionIdx = src.matRegionIdx;
+            // Per-cluster OPAQUE flag.  Must reflect the cluster's ACTUAL
+            // material -- look up via perRegionMaterialSlot[matRegionIdx]
+            // when the object has per-region material assignments (e.g.
+            // mixed sphere), otherwise fall back to obj.instanceID.  A
+            // per-cluster checker override that may introduce refr makes
+            // EVERY cluster of the object non-opaque (any cluster could
+            // land on the odd-parity tile and need any-hit).
+            const bool checkerCouldRefract = obj.checker.enabled &&
+                (obj.checker.evenParity.overrideRefr > 0.0f ||
+                 obj.checker.oddParity.overrideRefr  > 0.0f);
+
+            for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++gIdx)
+            {
+                const auto& src = obj.mesh.clusters[i];
+                const UINT clusterMatSlot = (src.matRegionIdx < (UINT)obj.perRegionMaterialSlot.size())
+                    ? obj.perRegionMaterialSlot[src.matRegionIdx]
+                    : obj.instanceID;
+                const auto& mat = m_materials[clusterMatSlot];
+                const bool isOpaqueLike =
+                    (mat.translucency == 0.0f) && (mat.refractivity == 0.0f) &&
+                    !checkerCouldRefract;
+                meta[gIdx].clusterID    = src.clusterID;
+                meta[gIdx].triCount     = (UINT)(src.indices.size() / 3);
+                meta[gIdx].vertCount    = (UINT)src.positions.size();
+                meta[gIdx].vbOff        = (UINT)slots[gIdx].vbOffset;
+                meta[gIdx].ibOff        = (UINT)slots[gIdx].ibOffset;
+                meta[gIdx].opaqueFlag   = isOpaqueLike
+                    ? (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
+                    : 0u;
+                meta[gIdx].matRegionIdx = src.matRegionIdx;
+            }
         }
         AllocateUploadBuffer(device, meta.data(),
                              meta.size() * sizeof(ClasArgsMeta),
@@ -2453,11 +2471,22 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         // material-region slot, which the fixed-function shader-table
         // indexing then routes to per-region hit groups (chrome -> Opaque,
         // glass -> Glass) via MultiplierForGeometryContributionToHitGroupIndex.
-        const auto& mat = m_materials[obj.instanceID];
-        const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
-        const auto geomFlag = isOpaqueLike
-            ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
-            : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        //
+        // Per-region geom flag.  OPAQUE skips the any-hit dispatch at
+        // traversal time, which is the cheap path -- but it MUST NOT be
+        // set on a region whose material can refract or translucently
+        // reject, or stochastic-translucency / refraction behaviour will
+        // silently break.  Compute the flag PER REGION from the region's
+        // own material slot (perRegionMaterialSlot[regionIdx] when set,
+        // otherwise the object-wide fallback obj.instanceID).  A per-
+        // cluster checker override that introduces refr applies to ANY
+        // cluster regardless of region (centroid-based), so when checker
+        // overrides may inject refraction we force NONE on every region.
+        // (CheckerOverride has no translucency knob today -- translucency
+        // is base-material-only -- so we only check overrideRefr.)
+        const bool checkerCouldRefract = obj.checker.enabled &&
+            (obj.checker.evenParity.overrideRefr > 0.0f ||
+             obj.checker.oddParity.overrideRefr  > 0.0f);
 
         std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs(regions.size());
         const auto vbGVA = obj.tradVertexBuffer->GetGPUVirtualAddress();
@@ -2465,6 +2494,18 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         for (size_t gi = 0; gi < regions.size(); ++gi)
         {
             const auto& rg = regions[gi];
+            // Look up the material slot for THIS region.
+            const UINT regionMatSlot = (rg.regionIdx < (UINT)obj.perRegionMaterialSlot.size())
+                ? obj.perRegionMaterialSlot[rg.regionIdx]
+                : obj.instanceID;
+            const auto& rgMat = m_materials[regionMatSlot];
+            const bool regionIsOpaqueLike =
+                (rgMat.translucency == 0.0f) && (rgMat.refractivity == 0.0f) &&
+                !checkerCouldRefract;
+            const auto geomFlag = regionIsOpaqueLike
+                ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+                : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+
             auto& gd = geomDescs[gi];
             gd.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             gd.Flags = geomFlag;

@@ -978,14 +978,23 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // Filter the source pool for cloning.  We DON'T clone the floor
     // (instanceID 6) -- it's a giant slab and cloning it would clutter
     // the spiral with overlapping floors that occlude everything else
-    // and intersect the camera path.  We also skip the spheres beyond
-    // sphere0 + the cube + sphere3 (mixed) to keep visual variety
-    // focused on the "iconic" shapes the user picked:
+    // and intersect the camera path.  Pool restricted to the three
+    // "iconic" static shapes the user picked PLUS the animated source:
     //   * sphere0 chrome (instanceID 0)
     //   * torus / "donut" (instanceID 4)
     //   * klein bottle    (instanceID 8)
-    // Plus the animated sphere (handled separately in a future commit
-    // -- animated clones aren't generated yet).
+    //   * animated sphere (m_animatedObject -- handled separately
+    //                      since it's not stored in m_objects)
+    // Cycle position 0..2 picks a static source by instanceID; cycle
+    // position 3 spawns an animated clone (every 4th clone is animated
+    // -> N=100 yields 25 anim clones, N=1K yields 250, N=10K yields 2500).
+    //
+    // CURRENT model for animated clones (phase 1): each anim clone is
+    // a TLAS instance pointing at the SOURCE's blasGPUVA -- they share
+    // the source's per-frame CLAS+BLAS result so per-frame work is
+    // O(1) regardless of clone count.  Phase 2 will give each anim
+    // clone its own per-frame CLAS+BLAS to actually stress those
+    // paths progressively.
     //
     // Match by instanceID rather than vector index so this stays
     // robust to scene-data reordering.
@@ -1009,7 +1018,17 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
                         L"in m_objects; clone pool is empty -- N=%u ignored\n", N_extra);
         return;
     }
-    const UINT srcPoolSize = (UINT)srcIndices.size();
+    // Source-pool size INCLUDES the animated source as a "slot".  Cycle
+    // index == srcIndices.size() means "spawn an animated clone instead
+    // of a static clone".  If animated isn't available (disabled at
+    // runtime), drop it from the pool.
+    const bool   animInPool   = m_animatedObjectEnabled;
+    const UINT   srcStaticN   = (UINT)srcIndices.size();
+    const UINT   srcPoolSize  = srcStaticN + (animInPool ? 1u : 0u);
+    const UINT   kAnimCycleSlot = srcStaticN;  // last slot in the cycle
+
+    // Reset the animated-clones list before refilling.
+    m_animatedClones.clear();
 
     // Compute the floor footprint so clones start just outside it.
     // Floor is the last source object (slab at instanceID=6) with
@@ -1030,10 +1049,40 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     std::uniform_real_distribution<float> rotDist(0.0f, 6.2831853f);
     std::uniform_real_distribution<float> scaleDist(0.6f, 1.4f);
 
-    m_objects.reserve(m_sourceObjectCount + N_extra);
+    m_objects.reserve(m_sourceObjectCount + N_extra);   // upper bound (anim clones go to m_animatedClones, not here)
     for (UINT i = 0; i < N_extra; ++i)
     {
-        const UINT srcIdx = srcIndices[i % srcPoolSize];
+        const UINT cycleSlot = i % srcPoolSize;
+
+        // Spiral placement: shared between static + anim clones.
+        const float angle  = (float)i * kGoldenAngleRad;
+        const float radius = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
+        const DirectX::XMFLOAT3 spiralPos = {
+            radius * cosf(angle),
+            kFloorY + (radius - kInnerRadius) * kHeightPerUnit,
+            radius * sinf(angle)
+        };
+        const DirectX::XMFLOAT3 randRot = { rotDist(rng), rotDist(rng), rotDist(rng) };
+        const float             randScale = scaleDist(rng);
+        const UINT              randMatSlot = matSlotDist(rng);
+
+        if (cycleSlot == kAnimCycleSlot)
+        {
+            // Animated clone: record a shadow TLAS instance pointing at
+            // m_animatedObject's shared per-frame BLAS.  No new build
+            // work needed -- the spiral entry "rides" the source's
+            // animated BLAS as it gets rebuilt every frame.
+            AnimatedCloneInstance ac;
+            ac.worldPos             = spiralPos;
+            ac.worldRotEuler        = randRot;
+            ac.worldScale           = randScale;
+            ac.materialOverrideSlot = randMatSlot;
+            m_animatedClones.push_back(ac);
+            continue;
+        }
+
+        // Static clone path: deep-copy a source ClusterObject.
+        const UINT srcIdx = srcIndices[cycleSlot];
         // Index-into-pre-clone vector is safe because reserve() above
         // prevents reallocation; capturing by value avoids dangling-ref
         // worries either way.
@@ -1050,20 +1099,12 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         clone.tradBlasResultBytes  = 0;
         clone.tradBlasScratchBytes = 0;
 
-        // Spiral placement: i=0 lands just outside the floor; later
-        // clones spiral outward + rise in y.
-        const float angle  = (float)i * kGoldenAngleRad;
-        const float radius = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
-        clone.worldPos = {
-            radius * cosf(angle),
-            kFloorY + (radius - kInnerRadius) * kHeightPerUnit,
-            radius * sinf(angle)
-        };
-        clone.worldRotEuler = { rotDist(rng), rotDist(rng), rotDist(rng) };
-        clone.worldScale    = scaleDist(rng);
+        clone.worldPos      = spiralPos;
+        clone.worldRotEuler = randRot;
+        clone.worldScale    = randScale;
         // Repurpose instanceID as the random material override slot;
         // BuildTlasClassic reads it for clones (index >= m_sourceObjectCount).
-        clone.instanceID    = matSlotDist(rng);
+        clone.instanceID    = randMatSlot;
 
         m_objects.push_back(std::move(clone));
     }
@@ -1082,9 +1123,12 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     for (const auto& obj : m_objects)
         m_totalTriangleCount += obj.mesh.totalTriangles;
 
-    SampleLog::LogF(L"[clones] N=%u extra clones generated; m_objects=%zu, "
-                    L"m_totalClusterCount=%u, m_totalTriangleCount=%u\n",
-                    N_extra, m_objects.size(),
+    SampleLog::LogF(L"[clones] N=%u extra; %zu static clones + %zu animated clones; "
+                    L"m_objects=%zu, m_totalClusterCount=%u, m_totalTriangleCount=%u\n",
+                    N_extra,
+                    m_objects.size() - m_sourceObjectCount,
+                    m_animatedClones.size(),
+                    m_objects.size(),
                     m_totalClusterCount, m_totalTriangleCount);
 }
 
@@ -4473,9 +4517,10 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
 void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 {
     auto device = m_deviceResources->GetD3DDevice();
-    const UINT N_static = (UINT)m_objects.size();
-    const UINT N_anim   = m_animatedObjectEnabled ? 1u : 0u;
-    const UINT N_total  = N_static + N_anim;
+    const UINT N_static    = (UINT)m_objects.size();
+    const UINT N_anim      = m_animatedObjectEnabled ? 1u : 0u;
+    const UINT N_animClone = (UINT)m_animatedClones.size();
+    const UINT N_total     = N_static + N_anim + N_animClone;
 
     // Build the full instance-desc array. The animated object's BLAS lives at
     // a fixed GVA (EXPLICIT_DESTINATIONS), so this array is good for the life
@@ -4617,6 +4662,42 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             (m_geometryMode == GeometryMode::Clusters) ? a.blasGPUVA : a.tradBlasGPUVA;
         (isGlass ? nGlass : nOpaque)++;
     }
+    // [N] animated clones: each is a TLAS instance pointing at the
+    // SAME shared animated BLAS GVA as the source instance above.
+    // Per-frame work is therefore O(1) regardless of clone count
+    // (phase 1; phase 2 will switch to per-clone CLAS+BLAS).
+    if (N_animClone > 0)
+    {
+        const auto& a = m_animatedObject;
+        const auto& aMat = m_materials[a.instanceID];
+        const bool isGlass = (aMat.refractivity > 0.0f) || (aMat.translucency > 0.0f);
+        const D3D12_GPU_VIRTUAL_ADDRESS animBlasGVA =
+            (m_geometryMode == GeometryMode::Clusters) ? a.blasGPUVA : a.tradBlasGPUVA;
+        const UINT contrib = isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
+        const D3D12_RAYTRACING_INSTANCE_FLAGS animFlags = isGlass
+            ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
+            : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        for (UINT k = 0; k < N_animClone; ++k)
+        {
+            const auto& ac = m_animatedClones[k];
+            const UINT row = N_static + N_anim + k;
+            XMMATRIX rot = XMMatrixRotationRollPitchYaw(ac.worldRotEuler.x,
+                                                        ac.worldRotEuler.y,
+                                                        ac.worldRotEuler.z);
+            XMMATRIX m = XMMatrixScaling(ac.worldScale, ac.worldScale, ac.worldScale)
+                       * rot
+                       * XMMatrixTranslation(ac.worldPos.x, ac.worldPos.y, ac.worldPos.z);
+            XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[row].Transform), m);
+            // InstanceID for anim clones doubles as the material-override
+            // index (matched in the override-buffer fill below).
+            instances[row].InstanceID  = ac.materialOverrideSlot;
+            instances[row].InstanceMask = 0xFF;
+            instances[row].InstanceContributionToHitGroupIndex = contrib;
+            instances[row].Flags = animFlags;
+            instances[row].AccelerationStructure = animBlasGVA;
+            (isGlass ? nGlass : nOpaque)++;
+        }
+    }
     SampleLog::LogF(L"[hitgroups] %u opaque-instance(s) -> OpaqueHitGroup (no any-hit), "
                     L"%u glass-instance(s) -> GlassHitGroup, "
                     L"%u mixed-instance(s) -> GlassHitGroup (unified, both regions)\n",
@@ -4628,10 +4709,11 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     // indexed by InstanceIndex() in the closesthit shader.  Sentinel
     // 0xFFFFFFFF = "no override -- use ctx.meta.materialSlot".
     // Source instances stay sentinel (per-cluster materials drive
-    // colour).  Clones (index >= m_sourceObjectCount in the static
-    // part of the TLAS) get the random material slot stashed in
-    // their clone.instanceID by RegenerateWorkloadCloneInstances.
-    // Animated source stays sentinel.
+    // colour).  Static clones (index >= m_sourceObjectCount in the
+    // static range) get the random material slot stashed in their
+    // clone.instanceID by RegenerateWorkloadCloneInstances; the
+    // animated source stays sentinel; animated clones get their
+    // materialOverrideSlot from m_animatedClones[k].
     //
     // Always allocated so the shader's
     // `g_instanceMatOverride[InstanceIndex()]` read is safe regardless
@@ -4640,10 +4722,13 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         std::vector<UINT> overrides(N_total, 0xFFFFFFFFu);
         for (UINT i = m_sourceObjectCount; i < N_static; ++i)
         {
-            // For clones the override slot lives in instanceID (see
-            // RegenerateWorkloadCloneInstances) -- TLAS InstanceID is
-            // also set from there so the lookup matches.
+            // For static clones the override slot lives in instanceID.
             overrides[i] = m_objects[i].instanceID;
+        }
+        // Animated clones come AFTER the source animated row.
+        for (UINT k = 0; k < N_animClone; ++k)
+        {
+            overrides[N_static + N_anim + k] = m_animatedClones[k].materialOverrideSlot;
         }
         AllocateUploadBuffer(device, overrides.data(),
                              overrides.size() * sizeof(UINT),
@@ -4660,8 +4745,8 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
     m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &prebuild);
-    SampleLog::LogF(L"[TLAS prebuild] %u instances (%u static + %u animated): result=%llu, scratch=%llu bytes\n",
-                    N_total, N_static, N_anim,
+    SampleLog::LogF(L"[TLAS prebuild] %u instances (%u static + %u animated + %u animClone): result=%llu, scratch=%llu bytes\n",
+                    N_total, N_static, N_anim, N_animClone,
                     (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
                     (unsigned long long)prebuild.ScratchDataSizeInBytes);
 

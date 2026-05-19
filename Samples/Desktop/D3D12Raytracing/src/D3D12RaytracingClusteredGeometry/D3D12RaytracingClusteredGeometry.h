@@ -702,6 +702,24 @@ private:
     AnimatedObject                          m_animatedObject;
     bool                                    m_animatedObjectEnabled = false;
 
+    // [N] workload-scaling animated clones.  Each entry is a "shadow"
+    // TLAS instance that points at m_animatedObject.blasGPUVA (cluster
+    // mode) or .tradBlasGPUVA (trad mode) -- i.e. clones SHARE the
+    // source animated object's per-frame CLAS+BLAS results.  This
+    // model adds visual copies in the spiral but does NOT yet stress
+    // the per-frame INSTANTIATE / BLAS-from-CLAS path -- each anim
+    // clone is "free" per-frame cost-wise (one extra TLAS row).
+    // Phase-2 enhancement: per-clone per-frame CLAS+BLAS work (real
+    // template/CLAS/BLAS stress).  Deferred to a separate commit.
+    struct AnimatedCloneInstance
+    {
+        DirectX::XMFLOAT3 worldPos      = {0, 0, 0};
+        DirectX::XMFLOAT3 worldRotEuler = {0, 0, 0};
+        float             worldScale    = 1.0f;
+        UINT              materialOverrideSlot = 0;  // for the per-instance override buffer
+    };
+    std::vector<AnimatedCloneInstance>      m_animatedClones;
+
     // ---------- Raytracing pipeline + shader tables ----------
     ComPtr<ID3D12StateObject>            m_dxrStateObject;
     ComPtr<ID3D12RootSignature>          m_globalRootSignature;

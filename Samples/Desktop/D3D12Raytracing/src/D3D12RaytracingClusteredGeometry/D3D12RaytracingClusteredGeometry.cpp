@@ -6514,6 +6514,22 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
     drawKeyLine(L"[P]", kbuf);
 
+    // Workload-scaling [N] toggle.  Always shown so the user knows the
+    // hotkey exists even when N=0.  Reports the count + breakdown
+    // (static clones + animated clones share-source-BLAS).
+    if (m_extraInstancesMode == ExtraInstancesMode::None)
+    {
+        swprintf_s(kbuf, L"   extra instances:  %s", ExtraInstancesModeName());
+    }
+    else
+    {
+        const UINT N_static_clones = (UINT)(m_objects.size() - m_sourceObjectCount);
+        const UINT N_anim_clones   = (UINT)m_animatedClones.size();
+        swprintf_s(kbuf, L"   extra instances:  %s   (%u static + %u animated)",
+                   ExtraInstancesModeName(), N_static_clones, N_anim_clones);
+    }
+    drawKeyLine(L"[N]", kbuf);
+
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.
     flushPending();

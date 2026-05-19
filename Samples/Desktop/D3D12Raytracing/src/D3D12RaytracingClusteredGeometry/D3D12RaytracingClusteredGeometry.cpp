@@ -898,6 +898,17 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
 {
     SampleLog::LogF(L"\n>>> RebuildStaticAccelerationStructures (%s)\n", reason ? reason : L"?");
 
+    // Thread-safety note: in async-display mode (WARP), this function MUST
+    // be invoked on the worker thread, not the UI thread.  Win32Application's
+    // WM_KEYDOWN handler enqueues OnKeyDown into the worker's pending-action
+    // queue (DeviceResources::EnqueueAsyncAction); the worker drains the
+    // queue at the top of each frame and calls OnKeyDown on its own thread,
+    // which then lands here.  Previous attempt: hold a mutex during the
+    // teardown so UI thread could safely call here -- caused UI freeze on
+    // WARP because the mutex blocked the message pump for the worker's
+    // multi-second frame.  See DeviceResources.h m_pendingAsyncActions
+    // comment for the full design rationale.
+
     auto commandList      = m_deviceResources->GetCommandList();
     auto commandAllocator = m_deviceResources->GetCommandAllocator();
 

@@ -234,14 +234,32 @@ LRESULT CALLBACK Win32Application::WindowProc(HWND hWnd, UINT message, WPARAM wP
     case WM_KEYDOWN:
         if (pSample)
         {
-            pSample->OnKeyDown(static_cast<UINT8>(wParam));
+            const UINT8 key = static_cast<UINT8>(wParam);
+            // In async-display mode (WARP), dispatch via the worker's
+            // pending-action queue so OnKeyDown runs on the worker thread.
+            // This keeps the UI message pump responsive (the worker can
+            // take seconds to process the resulting RebuildStatic on WARP;
+            // running OnKeyDown synchronously here would block WM_*
+            // dispatch for that duration, freezing the window).  In HW
+            // mode (no worker), call directly as before -- the queue is a
+            // no-op without an async worker.
+            auto* dr = pSample->GetDeviceResources();
+            if (dr && dr->IsAsyncDisplay())
+                dr->EnqueueAsyncAction([pSample, key]() { pSample->OnKeyDown(key); });
+            else
+                pSample->OnKeyDown(key);
         }
         return 0;
 
     case WM_KEYUP:
         if (pSample)
         {
-            pSample->OnKeyUp(static_cast<UINT8>(wParam));
+            const UINT8 key = static_cast<UINT8>(wParam);
+            auto* dr = pSample->GetDeviceResources();
+            if (dr && dr->IsAsyncDisplay())
+                dr->EnqueueAsyncAction([pSample, key]() { pSample->OnKeyUp(key); });
+            else
+                pSample->OnKeyUp(key);
         }
         return 0;
 

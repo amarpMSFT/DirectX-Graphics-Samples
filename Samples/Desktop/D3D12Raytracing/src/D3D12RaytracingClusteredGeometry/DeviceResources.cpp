@@ -676,7 +676,27 @@ void DeviceResources::AsyncWorkerThreadProc()
             catch (...) { break; }
         }
 
-        // 2. Run the sample's per-frame render (which calls Present on
+        // 2. Drain pending UI-thread actions (e.g. WM_KEYDOWN dispatches
+        //    from Win32Application).  Run them on THIS thread, before
+        //    rendering, so the closures (which typically call into
+        //    OnKeyDown -> RebuildStaticAccelerationStructures and tear
+        //    down/rebuild D3D12 resources) execute on the same thread
+        //    that owns all the per-frame D3D12 work -- no cross-thread
+        //    resource lifetime issues, no need for a mutex around CL
+        //    composition.  Swap the queue out under lock so we don't
+        //    hold the lock while running user code (could re-enqueue).
+        std::deque<std::function<void()>> actions;
+        {
+            std::lock_guard<std::mutex> lk(m_asyncActionsMutex);
+            actions.swap(m_pendingAsyncActions);
+        }
+        for (auto& a : actions)
+        {
+            try { a(); }
+            catch (...) { /* swallow per-action; next frame still runs */ }
+        }
+
+        // 3. Run the sample's per-frame render (which calls Present on
         //    this same thread -- the real swap-chain Present).
         try {
             if (m_asyncCallback) m_asyncCallback();

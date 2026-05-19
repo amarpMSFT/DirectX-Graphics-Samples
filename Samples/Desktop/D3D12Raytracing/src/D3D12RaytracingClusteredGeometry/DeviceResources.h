@@ -19,6 +19,7 @@
 #include <atomic>
 #include <mutex>
 #include <functional>
+#include <deque>
 
 namespace DX
 {
@@ -225,5 +226,52 @@ namespace DX
         UINT                                                m_asyncResizeWidth = 0;
         UINT                                                m_asyncResizeHeight = 0;
         bool                                                m_asyncResizeMinimized = false;
+
+        // Pending-action queue.  In async-display mode the UI-thread input
+        // handlers (currently only WM_KEYDOWN) push closures here instead
+        // of running the sample's OnKeyDown synchronously -- the worker
+        // drains the queue at the top of each iteration and runs the
+        // closures on its own thread.
+        //
+        // Why we don't just synchronize via a mutex around RebuildStatic:
+        // tried that first.  RebuildStaticAccelerationStructures runs on
+        // the UI thread when WM_KEYDOWN dispatches a T/A/V/[/] press;
+        // taking a "frame mutation" mutex held by the worker would block
+        // the UI thread for the duration of the worker's current frame
+        // (multi-SECOND on WARP).  During that block the UI thread's
+        // message pump is frozen -> window goes "(Not Responding)" -> the
+        // user assumes it crashed and Task-Manager-kills it.  Queueing
+        // the keypress instead means the UI thread NEVER does D3D12 work
+        // in async mode, so the pump stays responsive and the worker
+        // processes the input at its own pace.
+        //
+        // Coalescing: NOT done.  Five rapid T presses queue five
+        // rebuilds in order; the user sees the final state after a delay
+        // proportional to the number of presses.  Acceptable for a
+        // tech demo + WARP is already slow enough that rapid-fire input
+        // isn't expected.  If it became a problem we'd switch to "keep
+        // only the latest per-key" coalescing.
+        std::mutex                                          m_asyncActionsMutex;
+        std::deque<std::function<void()>>                   m_pendingAsyncActions;
+    public:
+        // True if EnableAsyncDisplay() was called -- used by Win32Application
+        // to decide whether to dispatch WM_KEYDOWN via EnqueueAsyncAction
+        // (worker thread) or call OnKeyDown directly (UI thread).
+        bool IsAsyncDisplay() const { return m_asyncDisplay; }
+
+        // Queue a closure for the async worker to run at the top of its
+        // next iteration, before rendering.  Caller must ensure `fn` only
+        // touches state that's safe to mutate on the worker thread (which
+        // is essentially everything in this sample, since the sample's
+        // own per-frame work also runs there in async mode).  No-op if
+        // not in async mode (caller should check IsAsyncDisplay first;
+        // we don't silently fall back to "run on calling thread" because
+        // that would be a footgun).
+        void EnqueueAsyncAction(std::function<void()> fn)
+        {
+            if (!m_asyncDisplay) return;
+            std::lock_guard<std::mutex> lk(m_asyncActionsMutex);
+            m_pendingAsyncActions.push_back(std::move(fn));
+        }
     };
 }

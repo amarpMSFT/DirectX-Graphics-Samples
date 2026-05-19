@@ -975,6 +975,42 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         return;
     }
 
+    // Filter the source pool for cloning.  We DON'T clone the floor
+    // (instanceID 6) -- it's a giant slab and cloning it would clutter
+    // the spiral with overlapping floors that occlude everything else
+    // and intersect the camera path.  We also skip the spheres beyond
+    // sphere0 + the cube + sphere3 (mixed) to keep visual variety
+    // focused on the "iconic" shapes the user picked:
+    //   * sphere0 chrome (instanceID 0)
+    //   * torus / "donut" (instanceID 4)
+    //   * klein bottle    (instanceID 8)
+    // Plus the animated sphere (handled separately in a future commit
+    // -- animated clones aren't generated yet).
+    //
+    // Match by instanceID rather than vector index so this stays
+    // robust to scene-data reordering.
+    const UINT kCloneSourceInstanceIDs[] = { 0u, 4u, 8u };
+    std::vector<UINT> srcIndices;
+    srcIndices.reserve(_countof(kCloneSourceInstanceIDs));
+    for (UINT keepID : kCloneSourceInstanceIDs)
+    {
+        for (UINT i = 0; i < m_sourceObjectCount; ++i)
+        {
+            if (m_objects[i].instanceID == keepID)
+            {
+                srcIndices.push_back(i);
+                break;
+            }
+        }
+    }
+    if (srcIndices.empty())
+    {
+        SampleLog::LogF(L"[clones] WARN: no matching source instanceIDs found "
+                        L"in m_objects; clone pool is empty -- N=%u ignored\n", N_extra);
+        return;
+    }
+    const UINT srcPoolSize = (UINT)srcIndices.size();
+
     // Compute the floor footprint so clones start just outside it.
     // Floor is the last source object (slab at instanceID=6) with
     // slabHalfSizeU = 3.5.  We don't know which source is the floor at
@@ -997,7 +1033,7 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     m_objects.reserve(m_sourceObjectCount + N_extra);
     for (UINT i = 0; i < N_extra; ++i)
     {
-        const UINT srcIdx = i % m_sourceObjectCount;
+        const UINT srcIdx = srcIndices[i % srcPoolSize];
         // Index-into-pre-clone vector is safe because reserve() above
         // prevents reallocation; capturing by value avoids dangling-ref
         // worries either way.

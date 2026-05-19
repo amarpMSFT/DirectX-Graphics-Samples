@@ -5928,13 +5928,18 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevTotalMs = p.pfInstantiateMs + p.pfBlasRebuildMs + p.pfTlasRebuildMs;
             // Only colour-compare the per-frame timings if prev had valid
             // timing too (else we'd compare against a stale 0.0 every time).
-            const bool   prevValid   = p.pfTimingValid;
-            auto pfPick = [&](double cur, double prev) -> XMVECTOR {
+            // pfPickV takes an explicit prevValid so callers can pass a
+            // different prev's validity bit (cross-mode prev pX vs
+            // same-mode prev p have independently-valid timing flags).
+            auto pfPickV = [&](double cur, double prev, bool prevValid) -> XMVECTOR {
                 if (!deltaActive || !prevValid) return kSubtle;
                 const double base = std::max(std::abs(prev), 1e-9);
                 const double rel  = std::abs(cur - prev) / base;
                 if (rel < kDeltaPctThreshold) return kSubtle;
                 return (cur < prev) ? kGreen : kRed;
+            };
+            auto pfPick = [&](double cur, double prev) -> XMVECTOR {
+                return pfPickV(cur, prev, p.pfTimingValid);
             };
             // Auto-picked unit so the user always knows what scale they're
             // looking at -- "0.073" is ambiguous (ms? us? s?), "73 us" /
@@ -5956,15 +5961,77 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
                 return dst;
             };
 
+            // The "(...)" sub-time labels differ by mode (and by [F] toggle
+            // in trad mode):
+            //
+            //   Slot 0..1 (first sub-time):
+            //     Cluster: pfTimestampBase+0..+1 brackets ONLY
+            //              INSTANTIATE_CLUSTER_TEMPLATES (the compute
+            //              deform runs untimed in the prologue)
+            //              -> "template instantiate"
+            //     Trad:    same slot brackets the AnimateBall.cs compute
+            //              deform (there are no templates in trad mode
+            //              at all) -> "compute deform"
+            //
+            //   Slot 2..3 (BLAS sub-time):
+            //     Cluster: BUILD_BLAS_FROM_CLAS -> "BLAS from CLAS"
+            //     Trad:    BuildRaytracingAccelerationStructure on
+            //              the animated DXR1 BLAS, with mode depending
+            //              on [F] toggle -> "BLAS refit" or "BLAS rebuild"
+            //
+            // The user's intuitive cross-mode comparison ("template
+            // instantiate is morally equivalent to a refit") is then
+            // possible by reading the cluster line's first sub-time
+            // against the trad line's BLAS-refit sub-time -- both are
+            // "incremental work to refresh a pre-built BVH from new
+            // vertex positions".
+            //
+            // Delta-colour prev pointer SELECTION per sub-time:
+            //   Slot 0..1 (instantiate vs deform): use SAME-mode prev
+            //     ('p' above).  Cross-mode coloring here would compare
+            //     two genuinely-different ops timed in the same slot,
+            //     which is misleading -- "deform got 5us cheaper than
+            //     instantiate" is meaningless.
+            //   Slot 2..3 (BLAS), slot 4..5 (TLAS), and the rebuild
+            //   TOTAL: use IMMEDIATE prev (m_overlayStatsPrev).  In
+            //     same-mode frames this IS the same-mode prev so
+            //     behaviour matches today; right after a [T] toggle
+            //     the immediate prev is the OTHER mode's last snapshot
+            //     and the colour now shows the cross-mode delta the
+            //     user actually wants to see ("did BLAS work get
+            //     faster/slower when I switched modes?").  BLAS work
+            //     is morally comparable cross-mode (both produce the
+            //     final animated BVH from inputs); TLAS is the same op
+            //     in both modes; the total approximates "all per-frame
+            //     AS work" in either mode (cluster total is missing
+            //     the deform, but the deform is small enough that the
+            //     comparison stays useful).
+            const bool   isClusterMode = (m_geometryMode == GeometryMode::Clusters);
+            const wchar_t* pfSubLabel  = isClusterMode
+                ? L"   (template instantiate "
+                : L"   (compute deform ";
+            const wchar_t* pfBlasLabel = isClusterMode
+                ? L"  +  BLAS from CLAS "
+                : (s.animatedTradModeIsRefit ? L"  +  BLAS refit " : L"  +  BLAS rebuild ");
+
+            // Cross-mode-aware prev for the comparable sub-times.  Note
+            // we recompute prevTotalMs from this prev so the TOTAL
+            // colour is consistent with the sum of its sub-times'
+            // colours.
+            const auto&  pX            = m_overlayStatsPrev;
+            const double prevTotalMsX  = pX.pfInstantiateMs + pX.pfBlasRebuildMs + pX.pfTlasRebuildMs;
+            const bool   pXValid       = pX.pfTimingValid;
+
             XMFLOAT2 c = pos;
             drawSeg(L"  rebuild ", c, kSubtle);
-            drawSeg(fmtTime(fnum, _countof(fnum), totalMs), c, pfPick(totalMs, prevTotalMs));
-            drawSeg(L"   (template instantiate ", c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), totalMs), c, pfPickV(totalMs, prevTotalMsX, pXValid));
+            drawSeg(pfSubLabel, c, kSubtle);
+            // First sub-time uses SAME-mode prev 'p' (see comment above).
             drawSeg(fmtTime(fnum, _countof(fnum), s.pfInstantiateMs), c, pfPick(s.pfInstantiateMs, p.pfInstantiateMs));
-            drawSeg(L"  +  BLAS ", c, kSubtle);
-            drawSeg(fmtTime(fnum, _countof(fnum), s.pfBlasRebuildMs), c, pfPick(s.pfBlasRebuildMs, p.pfBlasRebuildMs));
+            drawSeg(pfBlasLabel, c, kSubtle);
+            drawSeg(fmtTime(fnum, _countof(fnum), s.pfBlasRebuildMs), c, pfPickV(s.pfBlasRebuildMs, pX.pfBlasRebuildMs, pXValid));
             drawSeg(L"  +  TLAS ", c, kSubtle);
-            drawSeg(fmtTime(fnum, _countof(fnum), s.pfTlasRebuildMs), c, pfPick(s.pfTlasRebuildMs, p.pfTlasRebuildMs));
+            drawSeg(fmtTime(fnum, _countof(fnum), s.pfTlasRebuildMs), c, pfPickV(s.pfTlasRebuildMs, pX.pfTlasRebuildMs, pXValid));
             drawSeg(L")", c, kSubtle);
             pos.y += kLineH;
 

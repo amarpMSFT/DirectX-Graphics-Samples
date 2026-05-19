@@ -415,6 +415,21 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
     SampleLog::LogF(L"  ClustersAndPTLASSupported: %s   (hr=0x%08X)\n",
                     m_clustersAndPtlasSupported ? L"YES" : L"NO", (unsigned)hr);
 
+    // Resolve the auto-default for m_aaSamplesPerPixel now that the adapter
+    // description is known.  Sentinel 0 in the header means "not set by
+    // CLI"; an explicit --aa-samples N takes precedence and skips this
+    // branch.  WARP / Basic Render -> 1 (4x on a software rasterizer
+    // pushes a 1280x720 frame to seconds-per-frame); HW -> 4.
+    if (m_aaSamplesPerPixel == 0)
+    {
+        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
+        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
+                                (wcsstr(desc, L"Basic Render") != nullptr);
+        m_aaSamplesPerPixel = isSoftware ? 1u : 4u;
+        SampleLog::LogF(L"  auto AA samples-per-pixel: %u  (%ls adapter)\n",
+                        m_aaSamplesPerPixel, isSoftware ? L"software" : L"hardware");
+    }
+
     if (!m_clustersAndPtlasSupported)
     {
         // Hardware doesn't support clusters -- lock the sample into
@@ -840,6 +855,30 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
     // CaptureOverlayStatsSnapshot call at the bottom of
     // RebuildStaticAccelerationStructures).
     CaptureOverlayStatsSnapshot();
+}
+
+// ---------------------------------------------------------------------------------
+// Hook for Win32Application::Run -- decide between SW_NORMAL and SW_MAXIMIZE
+// on the initial ShowWindow.  Two opt-outs:
+//   1. Software adapter (WARP / Basic Render) -- maximizing on a CPU
+//      rasterizer turns each frame into a seconds-long affair; the window
+//      stays at the launched 1280x720 so the app is at least interactive.
+//   2. Headless run (any of --screenshot-at, --screenshot-frame,
+//      --exit-after-frames is set) -- the back-buffer size is significant
+//      because captured screenshots use it; maximizing would silently
+//      change the screenshot resolution from 1280x720 to the user's
+//      desktop res, breaking any reference-image diff.
+// Otherwise (interactive HW run) -- maximize, since the 4K canvas is
+// where the cluster geometry actually showcases.
+// ---------------------------------------------------------------------------------
+bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
+{
+    if (m_screenshotAtSeconds >= 0.0 || m_screenshotFrame >= 0 || m_exitAfterFrames > 0)
+        return false;
+    const wchar_t* desc = m_deviceResources->GetAdapterDescription();
+    const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
+                            (wcsstr(desc, L"Basic Render") != nullptr);
+    return !isSoftware;
 }
 
 // ---------------------------------------------------------------------------------
@@ -5849,26 +5888,44 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     //       snapshot it because the whole point of FPS is the instantaneous
     //       value the user can watch fluctuate.  Section header in blue +
     //       indented value in white, matching the convention above.
-    //       ms/frame added alongside FPS because at sub-1 FPS (WARP,
-    //       heavy debug-layer modes) the integer FPS rounds to 0 or 1
-    //       and stops being informative -- whereas the per-frame ms
-    //       smoothly reports the true frame cost.  At >= 1000 ms the
-    //       unit auto-switches to seconds so "3127 ms/frame" reads as
-    //       "3.13 s/frame" -- friendlier for the WARP case where a
-    //       single frame can take many seconds.  Uses
-    //       GetElapsedSeconds() (last-frame value) rather than
-    //       1000/GetFramesPerSecond() so we don't divide by a possibly-
-    //       zero averaged FPS at the slow end.
+    //
+    //       Both displayed values (FPS and ms/frame) are derived from the
+    //       SAME wall-clock measurement (m_smoothedFrameSeconds, updated
+    //       in OnUpdate).  Reasons we don't use m_timer.GetElapsedSeconds()
+    //       and m_timer.GetFramesPerSecond() any more:
+    //         1. StepTimer caps elapsed at 100 ms (m_qpcMaxDelta) so on
+    //            anything slower than 10 fps the ms reads "100.0" forever
+    //            -- doesn't match the integer fps the same StepTimer
+    //            shows (which uses unclamped delta into its 1-second
+    //            sliding window).  Two values from the same struct
+    //            disagreed by 30x on WARP.
+    //         2. StepTimer's fps is integer, rounding sub-1-fps to 0 or
+    //            1 -- ambiguous in exactly the WARP case we'd care.
+    //       Both fixed by 1) measuring real frame-to-frame wall clock
+    //       (no clamp) and 2) deriving fps as 1.0/seconds with
+    //       sub-10-fps shown to 1 decimal so 0.3 / 0.8 / 5.4 fps are
+    //       readable values, not rounded mush.  Time unit auto-switches
+    //       to seconds at >= 1000 ms (i.e. fps <= 1) so WARP's many-
+    //       seconds-per-frame reads naturally.
     draw(L"FPS:", pos, kAccent);
     pos.y += kLineH;
-    const double secPerFrame = m_timer.GetElapsedSeconds();
+    const double secPerFrame = (m_smoothedFrameSeconds > 0.0)
+                               ? m_smoothedFrameSeconds : 0.0;
+    const double fps         = (secPerFrame > 0.0) ? (1.0 / secPerFrame) : 0.0;
     const double msPerFrame  = secPerFrame * 1000.0;
-    if (msPerFrame >= 1000.0)
-        swprintf_s(buf, L"  %u   (%.2f s/frame)",
-                   (unsigned)m_timer.GetFramesPerSecond(), secPerFrame);
+    // FPS format: 2 decimals below 1 fps (so 0.05 fps doesn't round to
+    // "0.0"), 1 decimal between 1 and 10 fps, integer above.
+    wchar_t fpsBuf[32];
+    if (fps < 1.0)
+        swprintf_s(fpsBuf, L"%.2f", fps);
+    else if (fps < 10.0)
+        swprintf_s(fpsBuf, L"%.1f", fps);
     else
-        swprintf_s(buf, L"  %u   (%.1f ms/frame)",
-                   (unsigned)m_timer.GetFramesPerSecond(), msPerFrame);
+        swprintf_s(fpsBuf, L"%u", (unsigned)(fps + 0.5));
+    if (msPerFrame >= 1000.0)
+        swprintf_s(buf, L"  %ls   (%.2f s/frame)", fpsBuf, secPerFrame);
+    else
+        swprintf_s(buf, L"  %ls   (%.1f ms/frame)", fpsBuf, msPerFrame);
     draw(buf, pos, kSubtle);
     pos.y += kLineH * 1.4f;
 
@@ -6111,6 +6168,20 @@ void D3D12RaytracingClusteredGeometry::OnUpdate()
     if (!m_animPaused)
         m_animSeconds += m_timer.GetElapsedSeconds();
     UpdateSceneConstantBuffer();
+
+    // Wall-clock frame-time measurement for the overlay's FPS / ms-per-frame
+    // line.  Independent of StepTimer's 100 ms cap (see m_smoothedFrameSeconds
+    // header comment).  EMA so the displayed value doesn't jitter
+    // frame-to-frame; alpha 0.2 = ~5-frame window.  First frame skipped
+    // (no prior timestamp to diff against).
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastFrameWallTime.time_since_epoch().count() != 0)
+    {
+        const double dt = std::chrono::duration<double>(now - m_lastFrameWallTime).count();
+        if (m_smoothedFrameSeconds == 0.0) m_smoothedFrameSeconds = dt;  // seed
+        else m_smoothedFrameSeconds = 0.8 * m_smoothedFrameSeconds + 0.2 * dt;
+    }
+    m_lastFrameWallTime = now;
 }
 
 void D3D12RaytracingClusteredGeometry::OnRender()

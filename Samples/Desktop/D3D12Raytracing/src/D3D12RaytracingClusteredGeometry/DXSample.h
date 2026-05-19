@@ -48,6 +48,17 @@ public:
     virtual IDXGISwapChain* GetSwapchain() { return nullptr; }
     DX::DeviceResources* GetDeviceResources() const { return m_deviceResources.get(); }
 
+    // Whether Win32Application::Run should ShowWindow with SW_MAXIMIZE
+    // instead of SW_NORMAL on initial launch.  Default false (preserves
+    // legacy behaviour for samples that don't override).  Samples that
+    // benefit from the larger canvas at hardware speeds override this --
+    // they typically gate on (adapter != WARP && !headless_screenshot)
+    // so a screenshot-driven measurement run keeps its native back-buffer
+    // size and the WARP path stays at the user-launched dimensions
+    // (maximizing on WARP would push the per-frame cost into multi-
+    // second territory and the window would feel frozen).
+    virtual bool ShouldMaximizeWindowOnLaunch() const { return false; }
+
     void UpdateForSizeChange(UINT clientWidth, UINT clientHeight);
     void SetWindowBounds(int left, int top, int right, int bottom);
     std::wstring GetAssetFullPath(LPCWSTR assetName);

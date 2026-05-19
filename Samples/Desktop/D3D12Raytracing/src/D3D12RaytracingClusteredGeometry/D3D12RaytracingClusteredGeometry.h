@@ -144,6 +144,10 @@ public:
 
     // DXSample messages.
     virtual void OnInit() override;
+    // Override DXSample's default-false: this sample maximizes on launch
+    // on hardware adapters in interactive (non-headless) mode.  See the
+    // .cpp implementation for the exact gating.
+    virtual bool ShouldMaximizeWindowOnLaunch() const override;
     virtual void OnUpdate() override;
     virtual void OnRender() override;
     virtual void OnSizeChanged(UINT width, UINT height, bool minimized) override;
@@ -368,12 +372,21 @@ private:
     UINT                                 m_positionTruncateBits = 12;
 
     // ANTIALIASING / SUPERSAMPLING.  How many primary rays per output pixel,
-    // each at a different sub-pixel jitter offset.  Set via --aa-samples N
-    // (1, 2, or 4).  Default 1 keeps the sample stable on Debug builds (4x
-    // jitter + recursive reflection/refraction is heavy on the CPU-side
-    // shader validation; on Release a 4090 handles 4 samples comfortably).
+    // Anti-aliasing samples per pixel for the raygen shader.  Each pixel
+    // gets N jittered primary rays; supported values are 1, 2, 4.
+    //   Default 0 = AUTO (resolved in OnInit once the adapter is known):
+    //     - WARP / Basic Render -> 1   (a single AA sample is the only way
+    //       the software rasterizer stays interactive; 4x quadruples the
+    //       per-pixel ray cost which already dominates the frame at
+    //       ~0.5-3 s/frame.  user explicitly asked for this default in
+    //       the dxr2-sample brain branch on 2026-05-18.)
+    //     - HW (anything else)  -> 4   (a 4090 handles 4x easily and the
+    //       3-bounce reflective glass benefits visibly from the noise
+    //       reduction).
+    //   Explicit override via --aa-samples N takes precedence over the
+    //   auto-default and skips the OnInit resolve below.
     // Pass-through to the raygen shader is via SceneConstantBuffer.miscParams.z.
-    UINT                                 m_aaSamplesPerPixel = 4;
+    UINT                                 m_aaSamplesPerPixel = 0;
 
     // CLUSTER-RAINBOW VISUALISATION KNOB.  miscParams.w in the scene CB.
     // Multiplies the cosine-palette per-cluster tint into the material
@@ -948,6 +961,22 @@ private:
 
     // ---------- App state ----------
     StepTimer m_timer;
+
+    // Wall-clock per-frame timing for the overlay's "FPS / ms-per-frame"
+    // line.  StepTimer caps GetElapsedSeconds() at 100 ms (m_qpcMaxDelta
+    // = frequency/10) to keep animation steps sane after debugger pauses
+    // -- great for game-logic update, useless for "how slow is WARP
+    // really?".  On a 3 s/frame WARP run the StepTimer-derived value
+    // would lock at 100 ms while the FPS counter (uses the UNCLAMPED
+    // delta into its 1-second sliding window) honestly reports ~0 fps;
+    // the two disagree by ~30x and the user can't tell what's true.
+    // Use these two members instead -- raw QPC delta + an EMA-smoothed
+    // value -- and derive BOTH displayed FPS and ms/frame from the
+    // same source so they always agree.  EMA alpha 0.2 = ~5-frame
+    // smoothing, dampens single-frame jitter without lagging slowly-
+    // changing values.
+    std::chrono::steady_clock::time_point m_lastFrameWallTime{};
+    double                               m_smoothedFrameSeconds = 0.0;
     double    m_animSeconds       = 0.0;          // wall-clock pan time (frame-rate independent)
     bool      m_animPaused        = false;
 

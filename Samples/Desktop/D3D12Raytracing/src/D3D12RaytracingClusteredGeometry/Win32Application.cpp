@@ -61,7 +61,9 @@ int Win32Application::Run(DXSample* pSample, HINSTANCE hInstance, int nCmdShow)
         auto desc = pSample->GetDeviceResources()->GetAdapterDescription();
         bool isSoftwareAdapter = (wcsstr(desc, L"WARP") != nullptr) ||
                                  (wcsstr(desc, L"Basic Render") != nullptr);
-        ShowWindow(m_hwnd, SW_NORMAL);
+        ShowWindow(m_hwnd, pSample->ShouldMaximizeWindowOnLaunch()
+                               ? SW_MAXIMIZE
+                               : SW_NORMAL);
 
         // On software adapters (WARP / Basic Render), spin up the async
         // display worker: the sample's OnRender (slow on a CPU rasterizer

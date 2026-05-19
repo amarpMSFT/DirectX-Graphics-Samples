@@ -522,6 +522,15 @@ private:
 
     // ---------- Scene = N procedurally-generated objects ----------
     std::vector<ClusterObject>           m_objects;
+    // Source-object count captured the first time the scene is built.
+    // m_objects[0..m_sourceObjectCount) are the "real" scene objects;
+    // m_objects[m_sourceObjectCount..end()) are clones spawned by the
+    // [N] workload-scaling toggle.  RebuildStaticAccelerationStructures
+    // truncates m_objects back to m_sourceObjectCount at the top, then
+    // regenerates clones for the current m_extraInstancesMode before
+    // running the per-object build pipeline.  Zero until the first
+    // BuildScene finishes.
+    UINT                                 m_sourceObjectCount   = 0;
     UINT                                 m_totalClusterCount = 0;
     UINT                                 m_totalTriangleCount = 0;   // sum of all clusters' tris across static objects + animated (cached at scene-build time for the title bar)
 
@@ -1097,6 +1106,15 @@ private:
     // left alone (independent CLAS pipeline).  Drives the runtime 'v' and 'a'
     // keyboard toggles in OnKeyDown.
     void RebuildStaticAccelerationStructures(const wchar_t* reason);
+    // Regenerate the [N] workload-scaling clones: truncates m_objects to
+    // m_sourceObjectCount, then appends ExtraInstancesCount() deep-copied
+    // clones cycled through the source pool with spiral transforms and
+    // random material assignments.  Recomputes m_totalClusterCount +
+    // per-object globalClusterStart for the new total.  Called from
+    // RebuildStaticAccelerationStructures BEFORE the per-object reset
+    // loop + build pipeline so clones flow through the same code as
+    // sources and end up with their own CLAS arrays + BLASes.
+    void RegenerateWorkloadCloneInstances();
     void UploadClusterInputs();
     void BuildClasIndirect();              // dispatches to one of the three below
     void BuildClasImplicit();              // ClasAllocMode::Implicit

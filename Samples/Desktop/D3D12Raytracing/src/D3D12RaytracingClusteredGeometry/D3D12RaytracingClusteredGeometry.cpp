@@ -27,6 +27,7 @@
 #include <numeric>
 #include <chrono>
 #include <cmath>
+#include <random>
 
 using namespace std;
 using namespace DX;
@@ -627,6 +628,12 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     // m_animatedObject.mesh.totalTriangles is added later (after animated
     // mesh is generated in BuildAnimatedObjectSetup).
 
+    // Capture how many m_objects are SOURCES (not clones).  Any future
+    // RebuildStaticAccelerationStructures call will truncate m_objects
+    // back to this count before regenerating clones for the current
+    // [N] workload-scaling mode.
+    m_sourceObjectCount = (UINT)m_objects.size();
+
     SampleLog::LogF(L"\n[scene] %zu objects, %u total clusters\n",
                     m_objects.size(), m_totalClusterCount);
     UINT objIdx = 0;
@@ -913,6 +920,139 @@ bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
 }
 
 // ---------------------------------------------------------------------------------
+// [N] workload-scaling clone generator.  Called at the top of
+// RebuildStaticAccelerationStructures BEFORE the per-object resource
+// reset + build pipeline runs, so the build code naturally builds
+// CLAS+BLAS for every clone (1:1 instance:BLAS, matching the user's
+// "stress CLAS+CBLAS+templates progressively" intent).
+//
+// Each clone:
+//   * Cycles src = i % m_sourceObjectCount through the source pool
+//     (currently static-only -- animated source isn't in m_objects so
+//     it's skipped here; anim-clone follow-up is a separate task).
+//   * Deep-copies the source's mesh + encoded vertex blob (heavy but
+//     keeps build code unchanged -- no obj.mesh redirection plumbing).
+//   * Clears all GPU-resource ComPtrs so the upcoming reset loop is a
+//     no-op for the clone (and the upcoming build allocates fresh).
+//   * Gets a spiral world position via golden-angle sunflower packing
+//     starting just outside the floor, rising slowly in y so distant
+//     clones don't fully occlude near ones.
+//   * Records a uniformly-random material slot in obj.instanceID; the
+//     TLAS-build code reads this to populate the per-instance material
+//     override buffer (sentinel 0xFFFFFFFFu = no override for sources).
+//     Choosing 'instanceID' for this payload is a slight repurposing
+//     -- for sources it's the natural per-object material slot; for
+//     clones it doubles as the random override.  BuildTlasClassic
+//     distinguishes them via the index range [m_sourceObjectCount..end).
+//
+// Memory cost dominates at 10K:
+//   * Mesh deep-copies: ~250 KB/clone * 10K = ~2.5 GB CPU RAM
+//   * CLAS arrays:      ~200 clusters/clone * 500 B = ~100 KB GPU/clone
+//   * BLAS storage:     ~50 KB GPU/clone
+//   Total ~1.5 GB GPU + 2.5 GB CPU at 10K on a 4090-class card.
+// Build time at 10K is dominated by ~2M CLAS builds + 10K BLAS-from-CLAS;
+// expect 1-3 second toggle-delay (one-shot, doesn't repeat per frame).
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
+{
+    if (m_sourceObjectCount == 0)
+    {
+        // First call before BuildScene captured the source count -- nothing
+        // to do; this RebuildStatic call is the initial-build path and
+        // m_objects already holds only sources.
+        return;
+    }
+    // Truncate any previously-generated clones.
+    if (m_objects.size() > m_sourceObjectCount)
+    {
+        m_objects.resize(m_sourceObjectCount);
+    }
+
+    const UINT N_extra = ExtraInstancesCount();
+    if (N_extra == 0)
+    {
+        SampleLog::LogF(L"[clones] N=0 (no extras)\n");
+        return;
+    }
+
+    // Compute the floor footprint so clones start just outside it.
+    // Floor is the last source object (slab at instanceID=6) with
+    // slabHalfSizeU = 3.5.  We don't know which source is the floor at
+    // this point without an explicit lookup, so just hardcode a
+    // generous inner radius matching the 3.5 floor used in SceneData.
+    const float kFloorHalf      = 3.5f;
+    const float kInnerRadius    = kFloorHalf + 1.0f;  // 1 unit margin outside the floor
+    const float kRadialSpacing  = 0.5f;               // sqrt(i) * this = radial step
+    const float kHeightPerUnit  = 0.10f;              // y gain per radial unit (gentle rise)
+    const float kFloorY         = -0.7f;              // floor world-y
+    const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
+
+    // Cycle-deterministic RNG so re-toggling to the same N produces the
+    // same scene (helpful when comparing perf snapshots between cycles).
+    std::mt19937 rng(0xC10E5EEDu ^ N_extra);
+    std::uniform_int_distribution<UINT> matSlotDist(0u, (UINT)m_materials.size() - 1u);
+    std::uniform_real_distribution<float> rotDist(0.0f, 6.2831853f);
+    std::uniform_real_distribution<float> scaleDist(0.6f, 1.4f);
+
+    m_objects.reserve(m_sourceObjectCount + N_extra);
+    for (UINT i = 0; i < N_extra; ++i)
+    {
+        const UINT srcIdx = i % m_sourceObjectCount;
+        // Index-into-pre-clone vector is safe because reserve() above
+        // prevents reallocation; capturing by value avoids dangling-ref
+        // worries either way.
+        ClusterObject clone = m_objects[srcIdx];   // deep-copy mesh + encoded
+        // Reset all GPU-resource handles -- clones get fresh allocations
+        // through the normal build pipeline.
+        clone.blasStorage.Reset();      clone.blasGPUVA      = 0;
+        clone.tradVertexBuffer.Reset(); clone.tradIndexBuffer.Reset();
+        clone.tradNormalsBuffer.Reset();
+        clone.tradBlasStorage.Reset();  clone.tradBlasScratch.Reset();
+        clone.tradBlasGPUVA      = 0;
+        clone.tradVertexCount    = 0;
+        clone.tradTriangleCount  = 0;
+        clone.tradBlasResultBytes  = 0;
+        clone.tradBlasScratchBytes = 0;
+
+        // Spiral placement: i=0 lands just outside the floor; later
+        // clones spiral outward + rise in y.
+        const float angle  = (float)i * kGoldenAngleRad;
+        const float radius = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
+        clone.worldPos = {
+            radius * cosf(angle),
+            kFloorY + (radius - kInnerRadius) * kHeightPerUnit,
+            radius * sinf(angle)
+        };
+        clone.worldRotEuler = { rotDist(rng), rotDist(rng), rotDist(rng) };
+        clone.worldScale    = scaleDist(rng);
+        // Repurpose instanceID as the random material override slot;
+        // BuildTlasClassic reads it for clones (index >= m_sourceObjectCount).
+        clone.instanceID    = matSlotDist(rng);
+
+        m_objects.push_back(std::move(clone));
+    }
+
+    // Recompute global cluster offsets + counts so the build code sees
+    // the correct totals for the expanded m_objects vector.
+    UINT runningOffset = 0;
+    for (auto& obj : m_objects)
+    {
+        obj.globalClusterStart = runningOffset;
+        obj.clusterCount       = (UINT)obj.mesh.clusters.size();
+        runningOffset         += obj.clusterCount;
+    }
+    m_totalClusterCount = runningOffset;
+    m_totalTriangleCount = 0;
+    for (const auto& obj : m_objects)
+        m_totalTriangleCount += obj.mesh.totalTriangles;
+
+    SampleLog::LogF(L"[clones] N=%u extra clones generated; m_objects=%zu, "
+                    L"m_totalClusterCount=%u, m_totalTriangleCount=%u\n",
+                    N_extra, m_objects.size(),
+                    m_totalClusterCount, m_totalTriangleCount);
+}
+
+// ---------------------------------------------------------------------------------
 // Runtime tear-down + rebuild of the STATIC half of the AS pipeline (CLAS,
 // BLAS-from-CLAS, TLAS).  Animated object's per-frame INSTANTIATE + BLAS
 // rebuild uses its own buffers + scratch and is intentionally untouched -
@@ -955,6 +1095,14 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     //    the new actual-CLAS value and the per-frame-CLAS-actual field
     //    silently stops lighting up green/red on precision changes.
     StashOverlayStatsAsPrev();
+
+    // [N] workload-scaling: truncate previous clones, then regenerate
+    // for the current m_extraInstancesMode.  MUST happen BEFORE the
+    // per-object resource reset loop below so that the reset iterates
+    // the new full m_objects (clones have null ComPtrs so reset is a
+    // no-op for them) and the subsequent build pipeline allocates
+    // fresh CLAS+BLAS per clone.
+    RegenerateWorkloadCloneInstances();
 
     // 2) Drop all CLAS-related GPU resources.  Each mode's BuildClas* will
     //    reallocate these via ComPtr assignment (which releases stale slots).
@@ -4443,15 +4591,24 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     // Per-instance material override: one UINT per TLAS instance,
     // indexed by InstanceIndex() in the closesthit shader.  Sentinel
     // 0xFFFFFFFF = "no override -- use ctx.meta.materialSlot".
-    // Without extra-instances (clones) this whole buffer is just N
-    // sentinels; clones (added later) get their slot replaced with a
-    // randomly-picked m_materials index.  Always allocated so the
-    // shader's `g_instanceMatOverride[InstanceIndex()]` read is safe
-    // regardless of whether any clones exist yet.
+    // Source instances stay sentinel (per-cluster materials drive
+    // colour).  Clones (index >= m_sourceObjectCount in the static
+    // part of the TLAS) get the random material slot stashed in
+    // their clone.instanceID by RegenerateWorkloadCloneInstances.
+    // Animated source stays sentinel.
+    //
+    // Always allocated so the shader's
+    // `g_instanceMatOverride[InstanceIndex()]` read is safe regardless
+    // of whether any clones exist yet.
     {
         std::vector<UINT> overrides(N_total, 0xFFFFFFFFu);
-        // (Clone-generation patch will overwrite override entries here
-        //  for the extra-instance tail.)
+        for (UINT i = m_sourceObjectCount; i < N_static; ++i)
+        {
+            // For clones the override slot lives in instanceID (see
+            // RegenerateWorkloadCloneInstances) -- TLAS InstanceID is
+            // also set from there so the lookup matches.
+            overrides[i] = m_objects[i].instanceID;
+        }
         AllocateUploadBuffer(device, overrides.data(),
                              overrides.size() * sizeof(UINT),
                              &m_instanceMaterialOverrideBuffer,
@@ -6495,6 +6652,20 @@ void D3D12RaytracingClusteredGeometry::OnRender()
             else if (_wcsicmp(act, L"anim-refit")        == 0)
             {   m_traditionalAnimMode = TraditionalAnimMode::Refit;
                 CaptureOverlayStatsSnapshot(); }
+            else if (_wcsicmp(act, L"extra-none")        == 0)
+            {   m_extraInstancesMode = ExtraInstancesMode::None;
+                RebuildStaticAccelerationStructures(L"scheduled extra-none"); }
+            else if (_wcsicmp(act, L"extra-100")         == 0)
+            {   m_extraInstancesMode = ExtraInstancesMode::Hundred;
+                RebuildStaticAccelerationStructures(L"scheduled extra-100"); }
+            else if (_wcsicmp(act, L"extra-1k")          == 0 ||
+                     _wcsicmp(act, L"extra-1000")        == 0)
+            {   m_extraInstancesMode = ExtraInstancesMode::Thousand;
+                RebuildStaticAccelerationStructures(L"scheduled extra-1k"); }
+            else if (_wcsicmp(act, L"extra-10k")         == 0 ||
+                     _wcsicmp(act, L"extra-10000")       == 0)
+            {   m_extraInstancesMode = ExtraInstancesMode::TenThousand;
+                RebuildStaticAccelerationStructures(L"scheduled extra-10k"); }
             else if (_wcsicmp(act, L"log")               == 0)
             {   SampleLog::LogF(L"[scheduled-snap frame=%u alloc=%ls rebuild=%ls] "
                                 L"inst=%.3fus animBlas=%.3fus tlas=%.3fus "

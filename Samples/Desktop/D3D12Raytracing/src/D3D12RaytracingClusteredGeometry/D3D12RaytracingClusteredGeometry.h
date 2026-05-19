@@ -937,9 +937,20 @@ private:
     // Each frame:
     //   - If still skipping, decrement and return
     //   - Else accumulate this frame's raw deltas
-    //   - When kSnapshotSampleCount samples have been collected, divide and
+    //   - When m_pfSnapTargetCount samples have been collected, divide and
     //     write into m_overlayStats, then immediately start the next window
-    static const INT                     kSnapshotSampleCount = 60;
+    //
+    // m_pfSnapTargetCount used to be a compile-time constant kSnapshotSampleCount=60.
+    // 60 samples is ~1 s on a 60 fps HW adapter but ~10 MINUTES on WARP
+    // at the sample's ~10 s/frame rate -- the overlay's PER-FRAME line
+    // would read "recalculating..." for the entire useful WARP session.
+    // Now adapter-aware: resolved in OnInit from sentinel 0 to
+    //   software adapter (WARP / Basic Render) -> 5 samples  (~half a min
+    //                                              of WARP -- bearable)
+    //   hardware adapter                        -> 60 samples (~1 s -- same as before)
+    // Explicit CLI override is possible via --pf-snap-count N (added
+    // for headless measurement runs that want a longer averaging window).
+    INT                                  m_pfSnapTargetCount      = 0;   // 0 = auto, resolved in OnInit
     INT                                  m_pfSnapSkipFramesLeft   = 0;
     INT                                  m_pfSnapSamplesCollected = 0;
     struct PfSnapAccum {
@@ -970,13 +981,30 @@ private:
     // would lock at 100 ms while the FPS counter (uses the UNCLAMPED
     // delta into its 1-second sliding window) honestly reports ~0 fps;
     // the two disagree by ~30x and the user can't tell what's true.
-    // Use these two members instead -- raw QPC delta + an EMA-smoothed
-    // value -- and derive BOTH displayed FPS and ms/frame from the
-    // same source so they always agree.  EMA alpha 0.2 = ~5-frame
-    // smoothing, dampens single-frame jitter without lagging slowly-
-    // changing values.
+    //
+    // Replaced with a TRUE rolling-window average (was EMA initially --
+    // EMA at alpha=0.2 still jittered noticeably on a 240 fps HW run
+    // since one fat frame skews the value for ~5 frames).  Rolling
+    // average over m_frameTimeWindow samples gives a clean, predictable
+    // display value:
+    //   - HW: 60 samples = ~0.5-1 s window at 60-120 fps -- smooths
+    //     out vsync jitter and short hitches; matches user's intuitive
+    //     "FPS" reading.
+    //   - WARP: 3 samples -- frames are seconds long, a 60-sample
+    //     window would lag behind state changes by MINUTES.  3 is the
+    //     smallest count that still hides single-frame outliers.
+    // Window size is adapter-resolved in OnInit (sentinel 0 = auto).
+    //
+    // Implementation: circular buffer of frame-time samples (in
+    // seconds) + running sum.  m_frameTimeRingIdx is the slot we'll
+    // overwrite next; m_frameTimeRingCount is how many valid entries
+    // we've written so far (saturates at m_frameTimeWindow).
     std::chrono::steady_clock::time_point m_lastFrameWallTime{};
-    double                               m_smoothedFrameSeconds = 0.0;
+    UINT                                 m_frameTimeWindow    = 0;        // 0 = auto-resolve in OnInit
+    std::vector<double>                  m_frameTimeRing;                  // sized to m_frameTimeWindow
+    UINT                                 m_frameTimeRingIdx   = 0;
+    UINT                                 m_frameTimeRingCount = 0;
+    double                               m_frameTimeRingSum   = 0.0;       // sum of valid entries
     double    m_animSeconds       = 0.0;          // wall-clock pan time (frame-rate independent)
     bool      m_animPaused        = false;
 

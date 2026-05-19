@@ -429,6 +429,37 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
         SampleLog::LogF(L"  auto AA samples-per-pixel: %u  (%ls adapter)\n",
                         m_aaSamplesPerPixel, isSoftware ? L"software" : L"hardware");
     }
+    // Same auto-resolve for the per-frame timing snapshot window.  60
+    // samples on HW (~1 s at 60 fps), 5 samples on WARP (~30-50 s at
+    // 6-10 s/frame).  Without this, the PER-FRAME overlay line shows
+    // "recalculating..." for 10+ minutes on WARP after each toggle.
+    if (m_pfSnapTargetCount == 0)
+    {
+        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
+        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
+                                (wcsstr(desc, L"Basic Render") != nullptr);
+        m_pfSnapTargetCount = isSoftware ? 5 : 60;
+        SampleLog::LogF(L"  auto per-frame snap samples: %d  (%ls adapter)\n",
+                        m_pfSnapTargetCount, isSoftware ? L"software" : L"hardware");
+    }
+
+    // Wall-clock FPS rolling-average window size.  Same adapter-aware
+    // sentinel pattern.  60-frame window on HW (~0.5-1 s, smooths vsync
+    // jitter), 3-frame window on WARP (frames are seconds long, a
+    // large window would lag behind state changes by minutes).
+    if (m_frameTimeWindow == 0)
+    {
+        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
+        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
+                                (wcsstr(desc, L"Basic Render") != nullptr);
+        m_frameTimeWindow = isSoftware ? 3u : 60u;
+        m_frameTimeRing.assign(m_frameTimeWindow, 0.0);
+        m_frameTimeRingIdx   = 0;
+        m_frameTimeRingCount = 0;
+        m_frameTimeRingSum   = 0.0;
+        SampleLog::LogF(L"  auto FPS rolling window: %u frames  (%ls adapter)\n",
+                        m_frameTimeWindow, isSoftware ? L"software" : L"hardware");
+    }
 
     if (!m_clustersAndPtlasSupported)
     {
@@ -5786,15 +5817,22 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const auto& p = m_overlayStatsPrev;
         draw(L"PER-FRAME:", pos, kAccent);
         pos.y += kLineH;
-        // During the post-toggle settle (~kPerFrameRingSlots + kSnapshotSampleCount
-        // frames = ~1.1 s), the rolling EMA window is still refilling with
-        // new-mode samples, and m_overlayStats.pf* still holds the OLD
-        // mode's averages.  Showing those would mislead the user into
-        // thinking the toggle had no effect on per-frame cost; print
-        // "recalculating..." instead so the lag is explicit.
+        // During the post-toggle settle (~kPerFrameRingSlots +
+        // m_pfSnapTargetCount frames), the rolling EMA window is still
+        // refilling with new-mode samples, and m_overlayStats.pf* still
+        // holds the OLD mode's averages.  Showing those would mislead
+        // the user into thinking the toggle had no effect on per-frame
+        // cost; print "recalculating..." instead so the lag is explicit.
+        // (N/M) progress is most useful on WARP where each sample is a
+        // full multi-second frame -- watching it tick from 0/5 to 5/5
+        // confirms the app is still alive and gives a rough ETA.
         if (m_pfTimingSettlingAfterToggle)
         {
-            draw(L"  recalculating...", pos, kSubtle);
+            wchar_t pbuf[64];
+            swprintf_s(pbuf, L"  recalculating... (%d/%d)",
+                       (int)m_pfSnapSamplesCollected,
+                       (int)m_pfSnapTargetCount);
+            draw(pbuf, pos, kSubtle);
             pos.y += kLineH;
         }
         else if (s.pfTimingValid)
@@ -5901,9 +5939,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     //       indented value in white, matching the convention above.
     //
     //       Both displayed values (FPS and ms/frame) are derived from the
-    //       SAME wall-clock measurement (m_smoothedFrameSeconds, updated
-    //       in OnUpdate).  Reasons we don't use m_timer.GetElapsedSeconds()
-    //       and m_timer.GetFramesPerSecond() any more:
+    //       SAME wall-clock measurement (rolling average of the last N
+    //       frame deltas; N=m_frameTimeWindow, auto-resolved per adapter
+    //       in OnInit -- 60 on HW, 3 on WARP).  Reasons we don't use
+    //       m_timer.GetElapsedSeconds() and m_timer.GetFramesPerSecond()
+    //       any more:
     //         1. StepTimer caps elapsed at 100 ms (m_qpcMaxDelta) so on
     //            anything slower than 10 fps the ms reads "100.0" forever
     //            -- doesn't match the integer fps the same StepTimer
@@ -5914,14 +5954,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     //            1 -- ambiguous in exactly the WARP case we'd care.
     //       Both fixed by 1) measuring real frame-to-frame wall clock
     //       (no clamp) and 2) deriving fps as 1.0/seconds with
-    //       sub-10-fps shown to 1 decimal so 0.3 / 0.8 / 5.4 fps are
-    //       readable values, not rounded mush.  Time unit auto-switches
-    //       to seconds at >= 1000 ms (i.e. fps <= 1) so WARP's many-
-    //       seconds-per-frame reads naturally.
+    //       sub-10-fps shown to 1-2 decimals so 0.05 / 0.3 / 5.4 fps
+    //       are readable values, not rounded mush.  Time unit auto-
+    //       switches to seconds at >= 1000 ms (i.e. fps <= 1) so WARP's
+    //       many-seconds-per-frame reads naturally.
     draw(L"FPS:", pos, kAccent);
     pos.y += kLineH;
-    const double secPerFrame = (m_smoothedFrameSeconds > 0.0)
-                               ? m_smoothedFrameSeconds : 0.0;
+    const double secPerFrame = (m_frameTimeRingCount > 0)
+                               ? (m_frameTimeRingSum / m_frameTimeRingCount)
+                               : 0.0;
     const double fps         = (secPerFrame > 0.0) ? (1.0 / secPerFrame) : 0.0;
     const double msPerFrame  = secPerFrame * 1000.0;
     // FPS format: 2 decimals below 1 fps (so 0.05 fps doesn't round to
@@ -6181,16 +6222,25 @@ void D3D12RaytracingClusteredGeometry::OnUpdate()
     UpdateSceneConstantBuffer();
 
     // Wall-clock frame-time measurement for the overlay's FPS / ms-per-frame
-    // line.  Independent of StepTimer's 100 ms cap (see m_smoothedFrameSeconds
-    // header comment).  EMA so the displayed value doesn't jitter
-    // frame-to-frame; alpha 0.2 = ~5-frame window.  First frame skipped
-    // (no prior timestamp to diff against).
+    // line.  Independent of StepTimer's 100 ms cap (see m_frameTimeRing
+    // header comment).  Rolling average over m_frameTimeWindow samples so
+    // the displayed value doesn't jitter frame-to-frame (HW) and doesn't
+    // lag minutes behind state changes (WARP); window size auto-resolved
+    // in OnInit per adapter.  First frame has no prior timestamp so we
+    // just seed m_lastFrameWallTime; rolling buffer fills over the next
+    // N frames.
     const auto now = std::chrono::steady_clock::now();
-    if (m_lastFrameWallTime.time_since_epoch().count() != 0)
+    if (m_lastFrameWallTime.time_since_epoch().count() != 0 && m_frameTimeWindow > 0)
     {
         const double dt = std::chrono::duration<double>(now - m_lastFrameWallTime).count();
-        if (m_smoothedFrameSeconds == 0.0) m_smoothedFrameSeconds = dt;  // seed
-        else m_smoothedFrameSeconds = 0.8 * m_smoothedFrameSeconds + 0.2 * dt;
+        // Maintain rolling sum: subtract the slot we're about to overwrite,
+        // add the new dt.  Until the ring fills, the overwritten slot is
+        // 0 so we just accumulate.
+        m_frameTimeRingSum -= m_frameTimeRing[m_frameTimeRingIdx];
+        m_frameTimeRing[m_frameTimeRingIdx] = dt;
+        m_frameTimeRingSum += dt;
+        m_frameTimeRingIdx = (m_frameTimeRingIdx + 1) % m_frameTimeWindow;
+        if (m_frameTimeRingCount < m_frameTimeWindow) ++m_frameTimeRingCount;
     }
     m_lastFrameWallTime = now;
 }
@@ -6301,7 +6351,7 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     // Wait a few frames for swap chain warm-up before time-based capture too.
     // Need at least kPerFrameRingSlots * 2 + 5 frames to also get stable
     // per-frame timestamp EMA reads in the log on shutdown (otherwise the
-    // ring buffer hasn't filled yet).  Pump up to kSnapshotSampleCount + a
+    // ring buffer hasn't filled yet).  Pump up to m_pfSnapTargetCount + a
     // bit so the rolling per-frame snap window has actually completed when
     // we capture -- so screenshots after a config-change toggle show real
     // post-toggle numbers, not the "recalculating..." placeholder we
@@ -6388,7 +6438,7 @@ void D3D12RaytracingClusteredGeometry::DoRender()
                 }
 
                 // Rolling per-frame snapshot.  Accumulate samples into
-                // m_pfSnapAccum; when we have kSnapshotSampleCount, mean
+                // m_pfSnapAccum; when we have m_pfSnapTargetCount, mean
                 // them into m_overlayStats and start the next window.
                 // m_pfSnapSkipFramesLeft != 0 means a recent toggle and we
                 // need to flush stale ring-buffer entries first.  See the
@@ -6405,9 +6455,9 @@ void D3D12RaytracingClusteredGeometry::DoRender()
                     m_pfSnapAccum.staticBlasMs += staticBlasMs;
                     m_pfSnapAccum.staticClasMs += staticClasMs;
                     ++m_pfSnapSamplesCollected;
-                    if (m_pfSnapSamplesCollected >= kSnapshotSampleCount)
+                    if (m_pfSnapSamplesCollected >= m_pfSnapTargetCount)
                     {
-                        const double inv = 1.0 / kSnapshotSampleCount;
+                        const double inv = 1.0 / m_pfSnapTargetCount;
                         m_overlayStats.pfInstantiateMs = m_pfSnapAccum.instMs       * inv;
                         m_overlayStats.pfBlasRebuildMs = m_pfSnapAccum.blasMs       * inv;
                         m_overlayStats.pfTlasRebuildMs = m_pfSnapAccum.tlasMs       * inv;

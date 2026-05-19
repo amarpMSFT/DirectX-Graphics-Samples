@@ -484,17 +484,28 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
         // so GeometryIndex() in cluster mode is stuck at 0 and the
         // canonical lookup would always return geom 0's material.
         // See RaytracingHlslCompat.h for the gate definition.
-        uint matSlot;
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-        if (isTraditional)
-            matSlot = g_perInstGeomMaterial.Load(
-                (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
-        else
-            matSlot = ctx.meta.materialSlot;
-#else
-        matSlot = g_perInstGeomMaterial.Load(
-            (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
-#endif
+        // Per-(region) material lookup.  Both paths use ctx.meta.materialSlot
+        // (CPU-baked from per-cluster matRegionIdx +
+        // obj.perRegionMaterialSlot) since the canonical
+        // g_perInstGeomMaterial path requires GeometryIndex() to identify
+        // the region and that doesn't work in either mode:
+        //   - Cluster path: GeometryIndex() is stuck at 0 because the
+        //     NVIDIA DXR2 preview driver hangs on non-zero CLAS
+        //     BaseGeometryIndex (see DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND).
+        //   - Traditional path: with multi-geom-desc BLAS (only happens
+        //     for the mixed sphere -- instance 3 splits clusters by
+        //     hemisphere centroid into two material regions) the runtime
+        //     appears to consume only the first geom desc, so
+        //     GeometryIndex() also stays at 0.  Debug-paint diagnosis
+        //     in agent session 79874719: matSlot debug shows the entire
+        //     sphere reading slot 0 in trad mode (chrome) while cluster
+        //     mode correctly splits slot 0 (upper) / slot 3 (lower).
+        // ctx.meta.materialSlot is CPU-baked per-cluster from
+        // matRegionIdx, correct in both modes (the trad path recovers
+        // cid from g_tradTriToCid which is keyed by PrimitiveIndex
+        // independent of GeometryIndex), so using it uniformly is the
+        // simplest correct fix.
+        const uint matSlot = ctx.meta.materialSlot;
         ctx.mat = g_materials[matSlot];
     }
 

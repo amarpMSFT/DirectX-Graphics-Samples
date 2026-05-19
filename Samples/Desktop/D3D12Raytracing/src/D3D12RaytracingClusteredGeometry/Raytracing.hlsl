@@ -74,6 +74,17 @@ ByteAddressBuffer                 g_tradGeomTriBase   : register(t7);
 // lookup matches the legacy behaviour).
 ByteAddressBuffer                 g_perInstGeomMaterial : register(t8);
 
+// Per-instance material override.  One UINT per TLAS instance, indexed
+// by InstanceIndex().  Sentinel 0xFFFFFFFFu = "use the per-cluster
+// CPU-baked materialSlot from ctx.meta" (default for non-clone source
+// instances).  Anything else = apply that material slot uniformly to
+// every cluster of this instance.  Driven by the [N] workload-scaling
+// toggle: cloned source objects get a random override here so visually
+// distinct copies can share a single source BLAS/CLAS set.  Sentinel
+// path keeps multi-region instances (mixed sphere) rendering correctly
+// since the per-cluster materialSlot is region-aware.
+StructuredBuffer<uint>            g_instanceMatOverride : register(t9);
+
 ClusterMeta LoadClusterMeta(uint cid)
 {
     // Stride = 48 bytes (matches CPU-side sizeof(ClusterMeta)).  Plain
@@ -505,7 +516,18 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
         // cid from g_tradTriToCid which is keyed by PrimitiveIndex
         // independent of GeometryIndex), so using it uniformly is the
         // simplest correct fix.
-        const uint matSlot = ctx.meta.materialSlot;
+        uint matSlot = ctx.meta.materialSlot;
+        // Per-instance material override (workload-scaling clones).
+        // Sentinel 0xFFFFFFFFu = no override.  Cloned instances get a
+        // random material slot here so duplicates of one source object
+        // look visually distinct without per-clone CLAS/BLAS storage.
+        // Note: an override applies UNIFORMLY across every cluster of
+        // the instance, so cloning the mixed sphere collapses its
+        // hemisphere split to one material -- acceptable for a
+        // workload-scaling demo.
+        const uint overrideSlot = g_instanceMatOverride[InstanceIndex()];
+        if (overrideSlot != 0xFFFFFFFFu)
+            matSlot = overrideSlot;
         ctx.mat = g_materials[matSlot];
     }
 

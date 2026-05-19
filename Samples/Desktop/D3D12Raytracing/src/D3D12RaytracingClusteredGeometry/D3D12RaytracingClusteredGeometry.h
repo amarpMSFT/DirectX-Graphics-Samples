@@ -47,6 +47,14 @@ namespace GlobalRootSig {
         // so multi-geometry instances can present different materials
         // per geom (the mixed-material small sphere demo).
         PerInstGeomMaterialSRVSlot,
+        // Per-instance material override.  One UINT per TLAS instance,
+        // indexed by InstanceIndex().  Sentinel 0xFFFFFFFF = "use the
+        // per-cluster CPU-baked materialSlot" (default for non-clone
+        // instances).  Anything else = apply that material slot
+        // uniformly to every cluster of the instance.  Used by the
+        // [N] workload-scaling toggle to give cloned instances visual
+        // variety without per-clone CLAS/BLAS storage.
+        InstanceMaterialOverrideSRVSlot,
         Count
     };
 }
@@ -346,6 +354,65 @@ private:
         }
         return L"?";
     }
+
+    // ---------- Workload scaling: extra cloned instances ----------
+    // [N] cycles through {None, Hundred, Thousand, TenThousand} to add
+    // a tail of extra TLAS instances after the static + animated ones.
+    // 10K cap (instead of 100K) keeps memory in a feasible band on a
+    // 4090-class card: each clone gets its OWN full CLAS array + BLAS
+    // (no sharing), so per-clone storage is ~tens-to-hundreds of KB
+    // depending on which source it cycled from -- 10K * ~150 KB ~= 1.5 GB
+    // of acceleration-structure storage, plus the per-frame
+    // template-instantiate / BLAS-from-CLAS cost for animated clones
+    // (every 8th clone is an animated one).  100K is left as a
+    // commented-out tier for users on bigger cards.
+    //
+    // Each extra instance:
+    //   * Cycles through the source-object pool (m_objects[0..N) + the
+    //     animated object as the wrap-around N+1th).  Cycle wrap-arounds
+    //     spawn additional animated clones, each with its own per-frame
+    //     CLAS / BLAS work (the WHOLE point: stress
+    //     CLAS+BLAS+templates progressively).
+    //   * Builds its OWN CLAS array (one CLAS per source cluster) and
+    //     its OWN BLAS-from-CLAS into private GPU resources.  No CLAS
+    //     or BLAS GVA is shared between clones; the TLAS sees N_total
+    //     distinct BLAS GVAs.
+    //   * Gets a random material slot picked from m_materials, fed
+    //     into the per-instance override buffer below so the visual
+    //     diversity is high (override is uniform per-instance --
+    //     applies to every cluster of the instance -- so a cloned
+    //     mixed sphere collapses to one material; acceptable for a
+    //     workload-scaling demo).
+    //   * Sits on a golden-angle sunflower spiral that starts just
+    //     outside the floor and rises in height with radius so distant
+    //     clones don't fully occlude the near ones.
+    enum class ExtraInstancesMode : UINT {
+        None        = 0,
+        Hundred     = 100,
+        Thousand    = 1000,
+        TenThousand = 10000,
+    };
+    ExtraInstancesMode                   m_extraInstancesMode = ExtraInstancesMode::None;
+    UINT                                 ExtraInstancesCount() const { return (UINT)m_extraInstancesMode; }
+    const wchar_t*                       ExtraInstancesModeName() const
+    {
+        switch (m_extraInstancesMode)
+        {
+        case ExtraInstancesMode::None:        return L"0";
+        case ExtraInstancesMode::Hundred:     return L"100";
+        case ExtraInstancesMode::Thousand:    return L"1,000";
+        case ExtraInstancesMode::TenThousand: return L"10,000";
+        }
+        return L"?";
+    }
+    // Per-instance material override buffer: one UINT per TLAS instance.
+    // Sentinel 0xFFFFFFFF = "use ctx.meta.materialSlot (per-cluster CPU-
+    // baked default)".  Any other value = use g_materials[value] uniformly
+    // for every cluster of that instance.  Set 0xFFFFFFFF for non-clone
+    // instances and a randomly-picked slot for each clone.  Lives in the
+    // global root signature so the closesthit shader can read it via
+    // InstanceIndex().
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_instanceMaterialOverrideBuffer;
 
     // ---------- Position-truncate bits (FLOAT32_3 mode only) ----------
     // Per-vertex float positions can have their LOW N mantissa bits zeroed

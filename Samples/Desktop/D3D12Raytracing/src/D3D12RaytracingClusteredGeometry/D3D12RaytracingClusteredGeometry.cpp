@@ -4440,6 +4440,24 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
                          &m_tlasInstanceDescs, L"TLAS instance descs");
 
+    // Per-instance material override: one UINT per TLAS instance,
+    // indexed by InstanceIndex() in the closesthit shader.  Sentinel
+    // 0xFFFFFFFF = "no override -- use ctx.meta.materialSlot".
+    // Without extra-instances (clones) this whole buffer is just N
+    // sentinels; clones (added later) get their slot replaced with a
+    // randomly-picked m_materials index.  Always allocated so the
+    // shader's `g_instanceMatOverride[InstanceIndex()]` read is safe
+    // regardless of whether any clones exist yet.
+    {
+        std::vector<UINT> overrides(N_total, 0xFFFFFFFFu);
+        // (Clone-generation patch will overwrite override entries here
+        //  for the extra-instance tail.)
+        AllocateUploadBuffer(device, overrides.data(),
+                             overrides.size() * sizeof(UINT),
+                             &m_instanceMaterialOverrideBuffer,
+                             L"Per-instance material overrides");
+    }
+
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
     tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tlasInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
@@ -4662,6 +4680,10 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         params[GlobalRootSig::TradTriToCidSRVSlot].InitAsShaderResourceView(6);
         params[GlobalRootSig::TradGeomTriBaseSRVSlot].InitAsShaderResourceView(7);
         params[GlobalRootSig::PerInstGeomMaterialSRVSlot].InitAsShaderResourceView(8);
+        // Per-instance material override (one UINT per TLAS instance);
+        // see InstanceMaterialOverrideSRVSlot in the header for the
+        // sentinel semantics.
+        params[GlobalRootSig::InstanceMaterialOverrideSRVSlot].InitAsShaderResourceView(9);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -6702,6 +6724,8 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         m_tradGeomTriBaseBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::PerInstGeomMaterialSRVSlot,
         m_perInstGeomMaterialBuffer->GetGPUVirtualAddress());
+    cl4->SetComputeRootShaderResourceView(GlobalRootSig::InstanceMaterialOverrideSRVSlot,
+        m_instanceMaterialOverrideBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
@@ -6992,6 +7016,25 @@ void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
                                 : TraditionalAnimMode::Rebuild;
         SampleLog::LogF(L"[input] traditional animated mode -> %s\n", TraditionalAnimModeName());
         CaptureOverlayStatsSnapshot();
+    }
+    else if (key == 'N' || key == 'n')
+    {
+        // [N] cycles workload scaling: extra cloned TLAS instances
+        // spiraling out from the floor.  Each clone gets its OWN full
+        // CLAS + BLAS set (no GVA sharing); animated clones add their
+        // own per-frame INSTANTIATE_CLUSTER_TEMPLATES + BUILD_BLAS_FROM_CLAS
+        // work.  Triggers a full RebuildStaticAccelerationStructures
+        // which clones+builds all extras and rebuilds the TLAS.  Toggle
+        // delay scales with count -- ~1s at 10K on a 4090.
+        switch (m_extraInstancesMode)
+        {
+        case ExtraInstancesMode::None:        m_extraInstancesMode = ExtraInstancesMode::Hundred;     break;
+        case ExtraInstancesMode::Hundred:     m_extraInstancesMode = ExtraInstancesMode::Thousand;    break;
+        case ExtraInstancesMode::Thousand:    m_extraInstancesMode = ExtraInstancesMode::TenThousand; break;
+        case ExtraInstancesMode::TenThousand: m_extraInstancesMode = ExtraInstancesMode::None;        break;
+        }
+        SampleLog::LogF(L"[input] extra instances -> %s\n", ExtraInstancesModeName());
+        RebuildStaticAccelerationStructures(L"extra-instances toggle");
     }
     // ----- ',' / '.' = bounce-depth slider.  See m_bounceSlider in the
     //   header for the canonical mapping table.  Slider direction has a

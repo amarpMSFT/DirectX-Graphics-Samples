@@ -134,26 +134,6 @@
       <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
       <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
     </CustomBuild>
-<CustomBuild Include="FillBlasFromClasArgs.hlsl">
-      <FileType>Document</FileType>
-      <Message>Compiling FillBlasFromClasArgs.hlsl -> $(IntDir)CompiledShaders\%(Filename).hlsl.h (cs_6_6)</Message>
-      <Command Condition="'$(Configuration)'=='Debug'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
-"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Zi -Qembed_debug -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
-      <Command Condition="'$(Configuration)'=='Release'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
-"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
-      <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
-      <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
-    </CustomBuild>
-    <CustomBuild Include="FillClasFromTrianglesArgs.hlsl">
-      <FileType>Document</FileType>
-      <Message>Compiling FillClasFromTrianglesArgs.hlsl -> $(IntDir)CompiledShaders\%(Filename).hlsl.h (cs_6_6)</Message>
-      <Command Condition="'$(Configuration)'=='Debug'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
-"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Zi -Qembed_debug -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
-      <Command Condition="'$(Configuration)'=='Release'">if not exist "$(IntDir)CompiledShaders" mkdir "$(IntDir)CompiledShaders"
-"$(DxrExperimentalDxcRoot)\dxc.exe" -nologo -T cs_6_6 -E main -HV 2021 -Fh "$(IntDir)CompiledShaders\%(Filename).hlsl.h" -Vn g_p%(Filename) "%(FullPath)"</Command>
-      <Outputs>$(IntDir)CompiledShaders\%(Filename).hlsl.h</Outputs>
-      <AdditionalInputs>$(DxrExperimentalDxcRoot)\dxc.exe;$(DxrExperimentalDxcRoot)\dxcompiler.dll;$(DxrExperimentalDxcRoot)\dxil.dll</AdditionalInputs>
-    </CustomBuild>
 </ItemGroup>
 
   <!-- Loose files visible in IDE. -->

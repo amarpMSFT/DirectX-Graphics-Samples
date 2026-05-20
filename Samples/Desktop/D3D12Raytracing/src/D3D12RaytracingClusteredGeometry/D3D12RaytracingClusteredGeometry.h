@@ -448,7 +448,6 @@ private:
     // rebuilt whenever the vertex-format / position-truncate-bits change.
     // Distinct from the shader-side m_clusterMetaBuffer (per-cluster
     // material + colour data consumed by raygen).
-    ComPtr<ID3D12Resource>               m_clasArgsMetaBuffer;
     D3D12_GPU_VIRTUAL_ADDRESS            m_clasArgsArrayGPUVA = 0;
     UINT                                 m_clasArgsStride     = 0;
 
@@ -467,7 +466,6 @@ private:
     ComPtr<ID3D12Resource>               m_blasArgsBuffer;         // N_objects x BUILD_BLAS_FROM_CLAS_ARGS
     // Per-object {clusterCount, clasArrayGvaLo, clasArrayGvaHi} input for
     // the BLAS-args CS.  12 bytes/object, upload heap, built once at init.
-    ComPtr<ID3D12Resource>               m_blasArgsMeta;
     ComPtr<ID3D12Resource>               m_blasResultAddrBuffer;   // N_objects x GVA (explicit dests)
 
     ComPtr<ID3D12Resource>               m_tlasBuffer;
@@ -631,10 +629,6 @@ private:
     // See the matching .hlsl files for layout details.
     ComPtr<ID3D12RootSignature>          m_fillMoveArgsRS;
     ComPtr<ID3D12PipelineState>          m_fillMoveArgsPSO;
-    ComPtr<ID3D12RootSignature>          m_fillBlasArgsRS;
-    ComPtr<ID3D12PipelineState>          m_fillBlasArgsPSO;
-    ComPtr<ID3D12RootSignature>          m_fillClasTriArgsRS;
-    ComPtr<ID3D12PipelineState>          m_fillClasTriArgsPSO;
     ComPtr<ID3D12RootSignature>          m_fillTemplateArgsRS;
     ComPtr<ID3D12PipelineState>          m_fillTemplateArgsPSO;
 
@@ -1027,8 +1021,6 @@ void BuildTlasClassic();
 void CreateRaytracingPipelineAndShaderTables();
     // Compile-once-at-init compute pipeline used by the per-frame GPU ball
     // deformation pass (see UpdateAnimatedObjectPerFrame).
-void CreateFillBlasArgsPipeline();
-    void CreateFillClasTriArgsPipeline();
 void CreateDescriptorHeapAndRaytracingOutput();
     void UpdateSceneConstantBuffer();
 

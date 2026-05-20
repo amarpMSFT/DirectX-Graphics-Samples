@@ -13,8 +13,6 @@
 #include "D3D12RaytracingClusteredGeometry.h"
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\\Raytracing.hlsl.h"
-#include "CompiledShaders\\FillBlasFromClasArgs.hlsl.h"
-#include "CompiledShaders\\FillClasFromTrianglesArgs.hlsl.h"
 #include "CompiledShaders\\FillClusterTemplateArgs.hlsl.h"
 
 #include <DirectXMath.h>
@@ -134,8 +132,6 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
 
     QueryDXR2Support();
     BuildScene();
-    CreateFillBlasArgsPipeline();
-    CreateFillClasTriArgsPipeline();
     BuildAccelerationStructures();
     CreateRaytracingPipelineAndShaderTables();
     CreateDescriptorHeapAndRaytracingOutput();
@@ -618,79 +614,46 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
     m_clusterInputBuffer->Unmap(0, nullptr);
 
     // ------------------------------------------------------------------
-    // Per-cluster metadata for the FillClasFromTrianglesArgs CS.
-    // 36 bytes/cluster: see ClasArgsMeta layout in FillClasFromTrianglesArgs.hlsl.
-    //   { clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag,
-    //     matRegionIdx, vbGvaLo, vbGvaHi }
-    // matRegionIdx becomes BaseGeometryIndex in the CLAS (upper 24 bits
-    // of BaseGeometryIndexAndFlags), so GeometryIndex() in the closest-
-    // hit returns this per-cluster value -- the same identifier the
-    // traditional path's per-material-region geom-desc layout produces.
-    //
-    // vbGvaLo/Hi: per-cluster absolute GPU VA for the VertexBuffer.
-    // In default (kPerClusterVbExperiment==false OR not COMPRESSED1) it
-    // is just (baseGpuVa + vbOff) so the CS sees the same value
-    // whether it adds the offset itself or trusts the meta -- the
-    // hypothesis-test path leaves the CS using GVA-from-meta
-    // unconditionally to minimise control-flow changes.
+    // Per-cluster D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS,
+    // filled DIRECTLY on the CPU then uploaded.  Originally a compute
+    // shader (FillClasFromTrianglesArgs.hlsl) populated this on the GPU
+    // because the production sample drove cluster animations and wanted
+    // per-frame args generation -- but in this minimal repro everything
+    // is static, so CPU-fill is far simpler.
     // ------------------------------------------------------------------
     {
-        struct ClasArgsMeta {
-            UINT clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag, matRegionIdx;
-        };
-        static_assert(sizeof(ClasArgsMeta) == 28, "must match the HLSL load offsets");
-
-        std::vector<ClasArgsMeta> meta(m_totalClusterCount);
+        std::vector<D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS> args(m_totalClusterCount);
         gIdx = 0;
         for (const auto& obj : m_objects)
         for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++gIdx)
         {
             const auto& src = obj.mesh.clusters[i];
-            meta[gIdx].clusterID    = src.clusterID;
-            meta[gIdx].triCount     = (UINT)(src.indices.size() / 3);
-            meta[gIdx].vertCount    = (UINT)src.positions.size();
-            meta[gIdx].vbOff        = (UINT)slots[gIdx].vbOffset;
-            meta[gIdx].ibOff        = (UINT)slots[gIdx].ibOffset;
-            meta[gIdx].opaqueFlag   = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
-            meta[gIdx].matRegionIdx = 0;
+            auto& a = args[gIdx];
+            a = {};
+            a.ClusterID                        = src.clusterID;
+            a.ClusterFlags                     = 0;
+            a.TriangleCount                    = (UINT16)(src.indices.size() / 3);
+            a.VertexCount                      = (UINT16)src.positions.size();
+            // BaseGeometryIndexAndFlags: GeometryIndex in low 24 bits,
+            // flags in high 8 bits (FLAG_OPAQUE = 0x80000000).
+            a.BaseGeometryIndexAndFlags        = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
+            a.OpacityMicromapBaseLocation      = 0;
+            a.VertexBufferStride               = useFloat ? (UINT16)sizeof(ProceduralGeometry::float3) : 0;
+            a.IndexBufferStride                = sizeof(uint16_t);
+            a.OpacityMicromapIndexBufferStride = 0;
+            a.GeometryIndexAndFlagsArrayStride = 0;
+            a.PositionTruncateBitCount         = useFloat ? (UINT16)m_positionTruncateBits : 0;
+            a.ReservedPadding                  = 0;
+            a.VertexBuffer                     = baseGPUVA + (D3D12_GPU_VIRTUAL_ADDRESS)slots[gIdx].vbOffset;
+            a.IndexBuffer                      = baseGPUVA + (D3D12_GPU_VIRTUAL_ADDRESS)slots[gIdx].ibOffset;
+            a.GeometryIndexAndFlagsArray       = 0;
+            a.GeometryIndexAndFlagsIndexBuffer = 0;
+            a.OpacityMicromapArray             = 0;
+            a.OpacityMicromapIndexBuffer       = 0;
         }
-        AllocateUploadBuffer(device, meta.data(),
-                             meta.size() * sizeof(ClasArgsMeta),
-                             &m_clasArgsMetaBuffer, L"Cluster args metadata");
-    }
-
-    // GPU-written args buffer (DEFAULT/UAV).
-    {
-        const UINT64 argsBytes = (UINT64)m_totalClusterCount * sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS);
-        AllocateUAVBuffer(device, argsBytes,
-            &m_clasArgsBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            L"CLAS-from-triangles args (GPU-filled)");
-    }
-
-    // Dispatch FillClasFromTrianglesArgs.
-    {
-        auto cmdList = m_deviceResources->GetCommandList();
-        cmdList->SetComputeRootSignature(m_fillClasTriArgsRS.Get());
-        cmdList->SetPipelineState(m_fillClasTriArgsPSO.Get());
-        struct {
-            UINT baseLo, baseHi;
-            UINT count;
-            UINT vbStride;
-            UINT posTruncBits;
-        } cb;
-        cb.baseLo       = (UINT)(baseGPUVA & 0xFFFFFFFFu);
-        cb.baseHi       = (UINT)(baseGPUVA >> 32);
-        cb.count        = m_totalClusterCount;
-        cb.vbStride     = useFloat ? (UINT)sizeof(ProceduralGeometry::float3) : 0u;
-        cb.posTruncBits = useFloat ? m_positionTruncateBits : 0u;
-        cmdList->SetComputeRoot32BitConstants(0, sizeof(cb) / 4, &cb, 0);
-        cmdList->SetComputeRootShaderResourceView(1, m_clasArgsMetaBuffer->GetGPUVirtualAddress());
-        cmdList->SetComputeRootUnorderedAccessView(2, m_clasArgsBuffer->GetGPUVirtualAddress());
-        const UINT groups = (m_totalClusterCount + 63) / 64;
-        cmdList->Dispatch(groups, 1, 1);
-        D3D12_RESOURCE_BARRIER uav =
-            CD3DX12_RESOURCE_BARRIER::UAV(m_clasArgsBuffer.Get());
-        cmdList->ResourceBarrier(1, &uav);
+        AllocateUploadBuffer(device, args.data(),
+                             args.size() * sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS),
+                             &m_clasArgsBuffer, L"CLAS-from-triangles args (CPU-filled)");
     }
 
     m_clasArgsArrayGPUVA = m_clasArgsBuffer->GetGPUVirtualAddress();
@@ -994,43 +957,23 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
                       L"Cluster BLAS scratch");
 
     // Build args array: one BUILD_BLAS_FROM_CLAS_ARGS per object, each
-    // referencing a sub-range of the global CLAS-address array.  GPU-filled
-    // by FillBlasFromClasArgs CS (shared with the animated path).  CPU
-    // prepares a small per-object {count, gvaLo, gvaHi} input buffer.
+    // referencing a sub-range of the global CLAS-address array.  CPU-filled
+    // and uploaded directly (was previously a compute shader for symmetry
+    // with per-frame animated rebuilds; CPU-fill is simpler for this static
+    // repro).
     {
-        struct BlasArgsMeta { UINT count, gvaLo, gvaHi; };
-        static_assert(sizeof(BlasArgsMeta) == 12, "must match HLSL Load3 stride");
-
         const D3D12_GPU_VIRTUAL_ADDRESS clasArrayGPUVA = m_clasAddressArray->GetGPUVirtualAddress();
-        std::vector<BlasArgsMeta> meta(N_obj);
+        std::vector<D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS> args(N_obj);
         for (UINT i = 0; i < N_obj; ++i)
         {
-            const D3D12_GPU_VIRTUAL_ADDRESS perObjArrayGva = clasArrayGPUVA
+            args[i].ClasAddressCount  = m_objects[i].clusterCount;
+            args[i].ClasAddressStride = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+            args[i].ClasAddressArray  = clasArrayGPUVA
                 + (UINT64)m_objects[i].globalClusterStart * sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-            meta[i].count = m_objects[i].clusterCount;
-            meta[i].gvaLo = (UINT)(perObjArrayGva & 0xFFFFFFFFu);
-            meta[i].gvaHi = (UINT)(perObjArrayGva >> 32);
         }
-        AllocateUploadBuffer(device, meta.data(), meta.size() * sizeof(BlasArgsMeta),
-                             &m_blasArgsMeta, L"BLAS args metadata (multi-object)");
-
-        AllocateUAVBuffer(device,
-            (UINT64)N_obj * sizeof(D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS),
-            &m_blasArgsBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            L"BLAS args (multi-object, GPU-filled)");
-
-        auto cmdList = m_deviceResources->GetCommandList();
-        cmdList->SetComputeRootSignature(m_fillBlasArgsRS.Get());
-        cmdList->SetPipelineState(m_fillBlasArgsPSO.Get());
-        const UINT cb[2] = { N_obj, (UINT)sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-        cmdList->SetComputeRoot32BitConstants(0, 2, cb, 0);
-        cmdList->SetComputeRootShaderResourceView(1, m_blasArgsMeta->GetGPUVirtualAddress());
-        cmdList->SetComputeRootUnorderedAccessView(2, m_blasArgsBuffer->GetGPUVirtualAddress());
-        const UINT groups = (N_obj + 63) / 64;
-        cmdList->Dispatch(groups, 1, 1);
-        D3D12_RESOURCE_BARRIER uav =
-            CD3DX12_RESOURCE_BARRIER::UAV(m_blasArgsBuffer.Get());
-        cmdList->ResourceBarrier(1, &uav);
+        AllocateUploadBuffer(device, args.data(),
+                             args.size() * sizeof(D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS),
+                             &m_blasArgsBuffer, L"BLAS-from-CLAS args (CPU-filled)");
     }
     {
         // Explicit destination addresses: one entry per object = its m_blasGPUVA.
@@ -1663,36 +1606,10 @@ static void BuildArgsFillPipeline(
 
 
 // FillBlasFromClasArgs: b0 + t0 (meta) + u0 (out args).
-void D3D12RaytracingClusteredGeometry::CreateFillBlasArgsPipeline()
-{
-    auto device = m_deviceResources->GetD3DDevice();
-    CD3DX12_ROOT_PARAMETER rp[3] = {};
-    rp[0].InitAsConstants(2, /*shaderReg*/0);                  // b0 = { entryCount, addrStride }
-    rp[1].InitAsShaderResourceView(/*shaderReg*/0);            // t0 = inputs
-    rp[2].InitAsUnorderedAccessView(/*shaderReg*/0);           // u0 = argsOut
-    BuildArgsFillPipeline(device, rp, _countof(rp),
-        g_pFillBlasFromClasArgs, ARRAYSIZE(g_pFillBlasFromClasArgs),
-        L"FillBlasFromClasArgs root sig", L"FillBlasFromClasArgs compute PSO",
-        m_fillBlasArgsRS, m_fillBlasArgsPSO);
-    SampleLog::LogF(L"[fill-args-cs] FillBlasFromClasArgs PSO built (%zu bytes)\n",
-                    (size_t)ARRAYSIZE(g_pFillBlasFromClasArgs));
-}
+
 
 // FillClasFromTrianglesArgs: b0 (5 dwords) + t0 (meta) + u0 (out args).
-void D3D12RaytracingClusteredGeometry::CreateFillClasTriArgsPipeline()
-{
-    auto device = m_deviceResources->GetD3DDevice();
-    CD3DX12_ROOT_PARAMETER rp[3] = {};
-    rp[0].InitAsConstants(5, /*shaderReg*/0);                  // b0
-    rp[1].InitAsShaderResourceView(/*shaderReg*/0);            // t0 = meta
-    rp[2].InitAsUnorderedAccessView(/*shaderReg*/0);           // u0 = argsOut
-    BuildArgsFillPipeline(device, rp, _countof(rp),
-        g_pFillClasFromTrianglesArgs, ARRAYSIZE(g_pFillClasFromTrianglesArgs),
-        L"FillClasFromTrianglesArgs root sig", L"FillClasFromTrianglesArgs compute PSO",
-        m_fillClasTriArgsRS, m_fillClasTriArgsPSO);
-    SampleLog::LogF(L"[fill-args-cs] FillClasFromTrianglesArgs PSO built (%zu bytes)\n",
-                    (size_t)ARRAYSIZE(g_pFillClasFromTrianglesArgs));
-}
+
 
 // FillClusterTemplateArgs: b0 (4 dwords) + t0 (meta) + u0 (out args).
 

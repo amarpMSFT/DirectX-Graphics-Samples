@@ -238,7 +238,7 @@ private:
     // initial AS build.  Implicit mode is still selectable via --clas-alloc
     // implicit / cycling with [A] for users who want the "no post-process,
     // worst-case alloc" baseline to compare against.
-    ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Compact;
+    ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Implicit;  // forced for COMPRESSED1 min repro (Compact path stubbed out)
 
     // ---------- Static-AS per-frame rebuild mode (cycled via [R]) ----------
     // Simulates LOD-driven AS churn by forcing rebuilds every frame even

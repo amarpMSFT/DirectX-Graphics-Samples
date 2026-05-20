@@ -74,8 +74,6 @@ namespace DebugIsolate {
 #include "CompiledShaders\\FillBlasFromClasArgs.hlsl.h"
 #include "CompiledShaders\\FillClasFromTrianglesArgs.hlsl.h"
 #include "CompiledShaders\\FillClusterTemplateArgs.hlsl.h"
-#include "SceneData.h"
-#include "MaterialData.h"
 
 #include <DirectXMath.h>
 #include <algorithm>
@@ -409,272 +407,46 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildScene()
 {
-    // (COMPRESSED1 precision used to be a constexpr 12 here; promoted to the
-    // m_compressedBitsPerComponent member so the '[' / ']' keys can cycle it
-    // live in COMPRESSED1 mode.  EncodeCompressedClusters() reads the live
-    // member, so re-calling it after a slider change re-encodes everything.)
-    // GENERIC scene-build pass.  Iterates over the pure-data scene
-    // definition (SceneData::BuildSceneDefinition()) and dispatches to
-    // the right ProceduralGeometry generator per ObjectSpec.  All art /
-    // material / placement / per-cluster-checker config lives in
-    // SceneData.cpp - this function has zero hardcoded geometry numbers
-    // and zero per-object branches outside the GenKind switch.
-    using SD = SceneData::ObjectSpec;
-    const auto scene = SceneData::BuildSceneDefinition();
+    // ===== MINIMAL COMPRESSED1 REPRO SCENE =====
+    // A single cube object: 6 face clusters of 4 verts / 2 tris each.
+    // No spheres, torus, klein bottle, floor, animated ball, or
+    // mixed-material regions -- everything the bug-isolation work
+    // confirmed was not necessary to trigger the corruption.
+    ClusterObject obj;
+    obj.mesh = ProceduralGeometry::GenerateCubeSpatialTiles(
+        /*halfExtent  */ 0.45f,
+        /*faceSubdiv  */ 1,
+        /*tileSize    */ 1,
+        /*firstClusterID*/ 500);
 
-    auto genMesh = [](const SD& s) -> ProceduralGeometry::Mesh
-    {
-        switch (s.kind)
-        {
-        case SceneData::GenKind::UVSphere:
-            return ProceduralGeometry::GenerateUVSphereSpatialTiles(
-                s.args.sphereRadius, s.args.sphereNumLat, s.args.sphereNumLong,
-                s.args.sphereTileLat, s.args.sphereTileLong, s.firstClusterID);
-        case SceneData::GenKind::Torus:
-            return ProceduralGeometry::GenerateTorusSpatialTiles(
-                s.args.torusMajor, s.args.torusMinor,
-                s.args.torusRingSegs, s.args.torusSideSegs,
-                s.args.torusTileRing, s.args.torusTileSide, s.firstClusterID);
-        case SceneData::GenKind::Cube:
-            return ProceduralGeometry::GenerateCubeSpatialTiles(
-                s.args.cubeHalfExtent, s.args.cubeFaceSubdiv,
-                s.args.cubeTileSize, s.firstClusterID);
-        case SceneData::GenKind::Slab:
-            return ProceduralGeometry::GeneratePlaneSpatialTiles(
-                s.args.slabHalfSizeU, s.args.slabHalfSizeV,
-                s.args.slabTilesU, s.args.slabTilesV,
-                s.args.slabTileQuadsU, s.args.slabTileQuadsV,
-                s.firstClusterID, s.args.slabThickness);
-        case SceneData::GenKind::Klein:
-            return ProceduralGeometry::GenerateKleinBottleSpatialTiles(
-                s.args.kleinScale, s.args.kleinNumU, s.args.kleinNumV,
-                s.args.kleinTileUSize, s.args.kleinTileVSize, s.firstClusterID);
-        }
-        // Unreachable - all enum cases handled above.
-        return ProceduralGeometry::Mesh{};
-    };
+    obj.worldPos      = XMFLOAT3(1.275f, 0.0f, -2.208f);  // hex slot 5 at R=2.55
+    obj.worldScale    = 1.0f;
+    obj.worldRotEuler = XMFLOAT3(0, 0, 0);
+    obj.instanceID    = 5;
+    obj.checker       = CheckerConfig{};            // disabled (no per-cluster material override)
+    obj.surfTintMul   = 1.0f;
+    obj.refrTintMul   = 0.50f;
+    obj.reflTintMul   = 1.08f;
+    obj.nonOrientable = false;
+    obj.globalClusterStart = 0;
+    obj.clusterCount       = (UINT)obj.mesh.clusters.size();
 
-    for (const SD& s : scene)
-    {
-        ClusterObject obj;
-        obj.mesh          = genMesh(s);
-        obj.worldPos      = s.pos;
-        obj.worldScale    = s.scale;
-        obj.worldRotEuler = s.rotEuler;
-        obj.instanceID    = s.instanceID;
-        obj.checker       = s.checker;
-        obj.surfTintMul   = s.surfTintMul;
-        obj.refrTintMul   = s.refrTintMul;
-        obj.reflTintMul   = s.reflTintMul;
-        obj.nonOrientable = s.nonOrientable;
-        m_objects.push_back(std::move(obj));
-    }
+    m_totalClusterCount  = obj.clusterCount;
+    m_totalTriangleCount = obj.mesh.totalTriangles;
+    m_objects.push_back(std::move(obj));
 
-    // -------------------------------------------------------------
-    // Mixed-material demo: split the smallest sphere (sphere3, was
-    // amethyst glass) into chrome upper hemisphere + amethyst glass
-    // lower hemisphere.  Per-cluster matRegionIdx assignment drives
-    //   - the cluster path's CLAS BaseGeometryIndex stamp (so
-    //     GeometryIndex() at hit time returns the region),
-    //   - the traditional path's per-region geom-desc layout (one
-    //     geom desc per region, NOT per cluster),
-    //   - per-(InstIdx, GeomIdx) material lookup
-    //     (chrome for region 0, amethyst glass for region 1),
-    //   - fixed-function shader-table routing via
-    //     MultiplierForGeometryContributionToHitGroupIndex=2 (chrome
-    //     hemisphere -> OpaqueHitGroup with no any-hit dispatch;
-    //     glass hemisphere -> GlassHitGroup whose any-hit runs for
-    //     stochastic translucency).
-    // Region split is by cluster centroid Y in object space -- the
-    // cluster's tile boundaries already align with parametric latitude
-    // rings on the UV sphere, so the equator is a clean cluster seam
-    // (no partial-cluster splits).
-    // -------------------------------------------------------------
-    // -------------------------------------------------------------
-    // Mixed-material demo: split the smallest sphere (sphere3, was
-    // amethyst glass) into chrome upper hemisphere + amethyst glass
-    // lower hemisphere.  Per-cluster matRegionIdx assignment drives:
-    //   - the traditional path's per-region geom-desc layout (one
-    //     geom desc per region, NOT per cluster) + per-(InstIdx,
-    //     GeomIdx) material lookup + fixed-function shader-table
-    //     routing via MultiplierForGeometryContributionToHitGroupIndex=2
-    //     so chrome hits OpaqueHitGroup (no any-hit dispatch) and
-    //     glass hits GlassHitGroup (any-hit runs).
-    //   - the cluster path's per-cluster material override via
-    //     ClusterMeta::materialSlot (CPU-baked from matRegionIdx +
-    //     ClusterObject::perRegionMaterialSlot).
-    //     [TODO: when the NVIDIA DXR2 preview driver fixes the
-    //     non-zero-BaseGeometryIndex hang on CLAS, the cluster path
-    //     can also route via GeometryIndex() and the per-cluster
-    //     materialSlot becomes redundant -- both paths converge.]
-    // Region split is by cluster centroid Y in object space -- the
-    // cluster's tile boundaries already align with parametric latitude
-    // rings on the UV sphere, so the equator is a clean cluster seam.
-    // -------------------------------------------------------------
-    for (auto& obj : m_objects)
-    {
-        if (obj.instanceID != 3) continue;  // only sphere3 (amethyst -> mixed)
+    SampleLog::LogF(L"\n[scene] cube-only: %u clusters, %u tris\n",
+                    m_totalClusterCount, m_totalTriangleCount);
 
-        for (auto& cl : obj.mesh.clusters)
-        {
-            float centroidY = 0.0f;
-            for (const auto& p : cl.positions) centroidY += p.y;
-            centroidY /= (float)cl.positions.size();
-            cl.matRegionIdx = (centroidY >= 0.0f) ? 0u : 1u;   // 0 = upper (chrome), 1 = lower (glass)
-        }
-        // Region 0 = chrome (material slot 0, same as sphere0's body).
-        // Region 1 = amethyst glass (material slot 3, sphere3's original).
-        obj.perRegionMaterialSlot = { 0u, 3u };
-        SampleLog::LogF(L"[mixed sphere] obj instanceID=%u split into 2 regions "
-                        L"(upper hemisphere -> material slot %u, lower -> %u)\n",
-                        obj.instanceID,
-                        obj.perRegionMaterialSlot[0],
-                        obj.perRegionMaterialSlot[1]);
-        break;
-    }
+    SampleLog::LogF(L"[vertex format] %s\n",
+                    m_vertexMode == VertexMode::Compressed1
+                        ? L"COMPRESSED1 (shared-exponent quantized)"
+                        : L"FLOAT32_3 (no quantization)");
 
-    // ---- COMPRESSED1 isolation: erase non-cube objects so only a
-    // configurable subset of m_objects is built (to bisect which other
-    // clusters need to be in the same batched CLAS build to trigger the
-    // NVIDIA COMPRESSED1 corruption).
-    //
-    // BISECT_KEEP_IID env var (comma-separated list of instanceIDs to
-    // keep, besides the cube).  Examples:
-    //   (unset) -> only cube
-    //   "0" -> cube + sphere0
-    //   "1,4" -> cube + sphere1 + torus
-    //   "0,1,2,3,4,6,8" -> all non-cube objects
-    constexpr bool kFilterObjects = true;
-    if (DebugIsolate::kIsolateTarget != DebugIsolate::kIsolateNone && kFilterObjects)
-    {
-        std::set<UINT> keepSet;
-        keepSet.insert(DebugIsolate::kIsolateTarget);
-        char envBuf[256] = {};
-        DWORD envLen = GetEnvironmentVariableA("BISECT_KEEP_IID", envBuf, sizeof(envBuf));
-        if (envLen > 0 && envLen < sizeof(envBuf))
-        {
-            std::string s(envBuf);
-            size_t pos = 0;
-            while (pos < s.size())
-            {
-                size_t comma = s.find(',', pos);
-                if (comma == std::string::npos) comma = s.size();
-                std::string tok = s.substr(pos, comma - pos);
-                try { keepSet.insert((UINT)std::stoi(tok)); } catch (...) {}
-                pos = comma + 1;
-            }
-        }
-        m_objects.erase(
-            std::remove_if(m_objects.begin(), m_objects.end(),
-                [&](const ClusterObject& o) { return keepSet.find(o.instanceID) == keepSet.end(); }),
-            m_objects.end());
-        SampleLog::LogF(L"[isolation] BISECT_KEEP_IID='%hs' -> kept %zu objects:\n",
-                        envBuf, m_objects.size());
-
-        // BISECT_DUP_TARGET=N : append N additional COPIES of the
-        // remaining target object (offset on x by 1.5 per copy).  Lets
-        // us test "minimum additional clusters needed to trigger" by
-        // pairing the cube with copies of itself (6 clusters each).
-        // Default 0 = no copies.
-        char dupBuf[32] = {};
-        DWORD dupLen = GetEnvironmentVariableA("BISECT_DUP_TARGET", dupBuf, sizeof(dupBuf));
-        UINT nDup = 0;
-        if (dupLen > 0) try { nDup = (UINT)std::stoi(dupBuf); } catch (...) {}
-        if (nDup > 0 && !m_objects.empty())
-        {
-            ClusterObject seed = m_objects.front();
-            for (UINT k = 0; k < nDup; ++k)
-            {
-                ClusterObject copy = seed;
-                copy.worldPos.x += 1.5f * float(k + 1);
-                copy.instanceID  = 100u + k;    // unique
-                m_objects.push_back(std::move(copy));
-            }
-            SampleLog::LogF(L"[isolation] BISECT_DUP_TARGET=%u: now %zu objects\n",
-                            nDup, m_objects.size());
-        }
-
-        for (const auto& o : m_objects)
-            SampleLog::LogF(L"  instanceID=%u clusters=%zu\n",
-                            o.instanceID, o.mesh.clusters.size());
-    }
-
-    // Determine per-cluster offsets in the global cluster array (used by the
-    // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
-    UINT runningOffset = 0;
-    for (auto& obj : m_objects)
-    {
-        obj.globalClusterStart = runningOffset;
-        obj.clusterCount       = (UINT)obj.mesh.clusters.size();
-        runningOffset         += obj.clusterCount;
-    }
-    m_totalClusterCount = runningOffset;
-    m_totalTriangleCount = 0;
-    for (const auto& obj : m_objects)
-        m_totalTriangleCount += obj.mesh.totalTriangles;
-    // m_animatedObject.mesh.totalTriangles is added later (after animated
-    // mesh is generated in BuildAnimatedObjectSetup).
-
-    SampleLog::LogF(L"\n[scene] %zu objects, %u total clusters\n",
-                    m_objects.size(), m_totalClusterCount);
-    UINT objIdx = 0;
-    for (const auto& obj : m_objects)
-    {
-        SampleLog::LogF(L"  object[%u]: %u clusters, %u tris, %u verts at (%.2f,%.2f,%.2f) scale %.2f\n",
-                        objIdx++, obj.clusterCount, obj.mesh.totalTriangles, obj.mesh.totalVertices,
-                        obj.worldPos.x, obj.worldPos.y, obj.worldPos.z, obj.worldScale);
-    }
-
-    SampleLog::LogF(L"\n[vertex format] %s\n",
-                    m_vertexMode == VertexMode::Compressed1 ? L"COMPRESSED1 (shared-exponent quantized)"
-                                                            : L"FLOAT32_3 (no quantization)");
-
-    // ============================================================================
-    // COMPRESSED1 STATIC PATH - NVIDIA DRIVER BUG (open as of 2026-05-15)
-    // ----------------------------------------------------------------------------
-    // SUMMARY: The exact same compressed1 byte stream produced by this sample's
-    // encoder renders correctly on experimental WARP and incorrectly on NVIDIA
-    // (RTX 4090, D3D12Core 1.10 preview, agility SDK 722). On NVIDIA, the cube
-    // renders cleanly but sphere/torus clusters are mangled: one cluster appears
-    // as a stretched "tail" reaching well beyond the object's bounds, an
-    // adjacent cluster goes missing, the rest of the scene renders correctly.
-    //
-    // EVIDENCE:
-    //   1. Force-warp=true: all 7 objects (animated sphere + 4 static spheres +
-    //      torus + cube) render pixel-equivalent to the FLOAT32_3 path.
-    //   2. Force-warp=false (NVIDIA): same input bytes, same args -> broken.
-    //   3. CPU-side Compressed1::Decode is bit-exact (max error ~0.0002 units,
-    //      sub-quantization-step).
-    //   4. Byte-for-byte cluster dumps via DUMP_COMPRESSED1_DIAG match the
-    //      d3d12conf reference encoder's header layout and bitstream packing
-    //      (see Compressed1.h header for the side-by-side derivation).
-    //   5. Breakage on NVIDIA persists across every variable I tried:
-    //        - 8 / 12 / 16 bits/axis
-    //        - uniform vs per-axis bit counts
-    //        - 16-byte vs 256-byte vertex-buffer alignment
-    //        - positive-only anchors (mesh shifted to +x +y +z)
-    //        - MaxCompressedClusterPositionsSize exact vs 4x oversize
-    //        - UPLOAD heap vs DEFAULT heap for the vertex buffer
-    //
-    // CONCLUSION: The bug is in NVIDIA's COMPRESSED1 BVH-build implementation,
-    // not in this sample. Filed as: <TODO bug-tracker link>. Until resolved,
-    // the sample defaults to FLOAT32_3 (VertexMode::Float32_3 in the header);
-    // pass --vertex-format compressed to exercise the broken path against a
-    // future NVIDIA driver update.
-    // ============================================================================
+    // Re-encode every cluster's positions into the active vertex format.
     EncodeCompressedClusters();
-    // FLOAT32_3 path uses obj.mesh.clusters[i].positions directly at upload
-    // time; obj.rawPositions is unused and intentionally left empty.  Log
-    // the equivalent byte count so the user can compare paths at a glance.
-    {
-        size_t totalBytes = 0;
-        for (const auto& obj : m_objects)
-            for (const auto& c : obj.mesh.clusters)
-                totalBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
-        SampleLog::LogF(L"[float32_3] %u clusters: %zu bytes total\n",
-                        m_totalClusterCount, totalBytes);
-    }
 }
+
 
 // ---------------------------------------------------------------------------------
 // Re-encode every cluster's positions into Compressed1 blobs using the live

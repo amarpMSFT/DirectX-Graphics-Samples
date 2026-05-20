@@ -1136,30 +1136,32 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // more in the distance") so the spiral's position for clone i
     // depends ONLY on i, not on the active N.  Toggling 100 -> 1K
     const float kRadialSpacing  = 1.5f;
-    // Height curve.  Mild stadium-seating rise: inner ring just
-    // below the floor (kInnerY = -1.0 sits ~0.3 below the floor
-    // surface at -0.7), each successive ring slightly higher so
-    // back rows are visible over front rows.  Sqrt-of-radial-step
-    // gives a curve that rises moderately fast at the inner band
-    // (where neighboring rings have small dR) and tapers in the
-    // outer band (so distant clones stay in the scene, not in the
-    // clouds).  Tuned to:
-    //     i=0:    y = -1.00  (just under the floor)
-    //     i=10:   y ~= -0.20
-    //     i=100:  y ~= +1.00
-    //     i=1K:   y ~= +3.10
-    //     i=10K:  y ~= +6.90  (back row reads as elevated but the
-    //                          field is firmly framed against the
-    //                          horizon, not above it)
+    // Height curve: LINEAR in (radius - innerRadius).
+    // Sqrt tapered off at the far end (exactly the wrong shape for
+    // stadium-seating visibility -- distant clones got squeezed
+    // into a narrow horizon band by perspective AND had less world
+    // y-rise to compensate).  Linear keeps the per-radius-unit
+    // rise constant so the back rows have enough world height to
+    // project above the front rows after perspective compression.
     //
-    // Earlier attempts:
-    //   * kHeightSqrtMul=3.0 -> outer ~33: way in the sky, user said no
-    //   * pow(r,1.5) bowl   -> looked like the bottom of a hole, user
-    //                          clarified that was a DESCRIPTION of the
-    //                          wrong outcome (not the goal)
-    // This curve aims for "gentle stadium" -- visible rise, no hole.
-    const float kInnerY         = -1.00f;
-    const float kHeightSqrtMul  =  0.65f;
+    //     i=0:    y = -2.00   (clearly below floor, but not "deep
+    //                          hole" -- still within ~1 unit of
+    //                          the floor at -0.7)
+    //     i=10:   y ~= -1.69  (rising fast toward floor)
+    //     i=100:  y ~= -0.32  (near floor level)
+    //     i=1K:   y ~= +5.43
+    //     i=10K:  y ~= +20.0  (high enough to project above the
+    //                          near rings after perspective; reads
+    //                          as the back of the stadium)
+    //
+    // Earlier sqrt attempts (mul=0.65 -> outer +6.9) had distant
+    // clones occluded by near ones because at radius 150 a clone
+    // at y=7 only projects at ~4 degrees above horizon, while
+    // near outer at y=1, radius 15 projects at ~6 degrees.  Linear
+    // mul=0.155 puts outer at +20 -- ~13 degrees, clearly above
+    // the near rings' silhouette.
+    const float kInnerY         = -2.00f;
+    const float kHeightLinearMul = 0.155f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  On whenever there are extra clones, NOT just at
@@ -1213,12 +1215,10 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         // sparser than outer (per user feedback "first ring is too
         // sparse, gets nicely dense only at a distance") because
         // each outer annulus is bigger per dR.  Height is sqrt of
-        // (r - innerR) for the gentle stadium rise (see kInnerY
-        // and kHeightSqrtMul comments at the top of the function).
         const float angle    = (float)i * kGoldenAngleRad;
         const float radius   = sqrtf(kInnerRadius * kInnerRadius
                                      + (float)i * kRadialSpacing * kRadialSpacing);
-        const float heightY  = kInnerY + sqrtf(std::max(0.0f, radius - kInnerRadius)) * kHeightSqrtMul;
+        const float heightY  = kInnerY + std::max(0.0f, radius - kInnerRadius) * kHeightLinearMul;
         const DirectX::XMFLOAT3 spiralPos = {
             radius * cosf(angle),
             heightY,

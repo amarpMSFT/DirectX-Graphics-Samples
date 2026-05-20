@@ -1135,21 +1135,31 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // 100 instances should stay the same when 1000 are drawn -- just
     // more in the distance") so the spiral's position for clone i
     // depends ONLY on i, not on the active N.  Toggling 100 -> 1K
-    // -> 10K extends the spiral outward without reshuffling the
-    // existing clones.
     const float kRadialSpacing  = 1.5f;
-    // Height curve.  Inner ring sunk well below the floor (kInnerY)
-    // so the spiral rises out of depth.  Steep sqrt-of-radial-step
-    // ramp gives the "stadium seating" look the user asked for:
-    // each ring lands visibly higher than the prior, so distant
-    // clones aren't all occluded by near ones.
-    //     i=0:    y = -3.5
-    //     i=10:   y ~= +2.6   (rise of ~6 across first 10 clones)
-    //     i=100:  y ~= +8.1   (rise tapers as sqrt does)
-    //     i=1K:   y ~= +17.1
-    //     i=10K:  y ~= +33.2  (outer ring is high but framed against sky)
-    const float kInnerY         = -3.50f;
-    const float kHeightSqrtMul  =  3.00f;
+    // Height curve.  Mild stadium-seating rise: inner ring just
+    // below the floor (kInnerY = -1.0 sits ~0.3 below the floor
+    // surface at -0.7), each successive ring slightly higher so
+    // back rows are visible over front rows.  Sqrt-of-radial-step
+    // gives a curve that rises moderately fast at the inner band
+    // (where neighboring rings have small dR) and tapers in the
+    // outer band (so distant clones stay in the scene, not in the
+    // clouds).  Tuned to:
+    //     i=0:    y = -1.00  (just under the floor)
+    //     i=10:   y ~= -0.20
+    //     i=100:  y ~= +1.00
+    //     i=1K:   y ~= +3.10
+    //     i=10K:  y ~= +6.90  (back row reads as elevated but the
+    //                          field is firmly framed against the
+    //                          horizon, not above it)
+    //
+    // Earlier attempts:
+    //   * kHeightSqrtMul=3.0 -> outer ~33: way in the sky, user said no
+    //   * pow(r,1.5) bowl   -> looked like the bottom of a hole, user
+    //                          clarified that was a DESCRIPTION of the
+    //                          wrong outcome (not the goal)
+    // This curve aims for "gentle stadium" -- visible rise, no hole.
+    const float kInnerY         = -1.00f;
+    const float kHeightSqrtMul  =  0.65f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  On whenever there are extra clones, NOT just at
@@ -1188,18 +1198,26 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     std::uniform_real_distribution<float> rotDist(0.0f, 6.2831853f);
     std::uniform_real_distribution<float> scaleDist(0.6f, 1.4f);
 
-
-    m_objects.reserve(m_sourceObjectCount + N_extra);   // upper bound (anim clones go to m_animatedClones, not here)
+    m_objects.reserve(m_sourceObjectCount + N_extra);
     for (UINT i = 0; i < N_extra; ++i)
     {
         const UINT cycleSlot = i % srcPoolSize;
 
         // Spiral placement: shared between static + anim clones.
-        // Height curve is sqrt-based with a sunken inner-ring start
-        // (kInnerY) so the spiral feels like it rises out of depth;
-        // see kHeightSqrtMul comment for the tuning rationale.
+        // Radius formula is the proper Vogel/sunflower spiral:
+        // r = sqrt(innerR^2 + i * spacing^2).  This grows r^2
+        // linearly with i so each clone gets exactly the same
+        // annulus area (= pi * spacing^2 ~= 7 sq units), giving
+        // CONSTANT density throughout the spiral.  The previous
+        // r = innerR + sqrt(i)*spacing formula made inner clones
+        // sparser than outer (per user feedback "first ring is too
+        // sparse, gets nicely dense only at a distance") because
+        // each outer annulus is bigger per dR.  Height is sqrt of
+        // (r - innerR) for the gentle stadium rise (see kInnerY
+        // and kHeightSqrtMul comments at the top of the function).
         const float angle    = (float)i * kGoldenAngleRad;
-        const float radius   = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
+        const float radius   = sqrtf(kInnerRadius * kInnerRadius
+                                     + (float)i * kRadialSpacing * kRadialSpacing);
         const float heightY  = kInnerY + sqrtf(std::max(0.0f, radius - kInnerRadius)) * kHeightSqrtMul;
         const DirectX::XMFLOAT3 spiralPos = {
             radius * cosf(angle),

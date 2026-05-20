@@ -143,72 +143,10 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
     D3D12_FEATURE_DATA_D3D12_OPTIONS_EXPERIMENTAL opts = {};
     HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_EXPERIMENTAL, &opts, sizeof(opts));
     m_clustersAndPtlasSupported = SUCCEEDED(hr) && opts.ClustersAndPTLASSupported;
-
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5 = {};
-    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5));
-
-    SampleLog::LogF(L"\n[DXR2] adapter: %s\n", m_deviceResources->GetAdapterDescription());
-    SampleLog::LogF(L"  D3D12_RAYTRACING_TIER: 0x%X\n", (unsigned)opts5.RaytracingTier);
-    SampleLog::LogF(L"  ClustersAndPTLASSupported: %s   (hr=0x%08X)\n",
-                    m_clustersAndPtlasSupported ? L"YES" : L"NO", (unsigned)hr);
-
-    // Resolve the auto-default for m_aaSamplesPerPixel now that the adapter
-    // description is known.  Sentinel 0 in the header means "not set by
-    // CLI"; an explicit --aa-samples N takes precedence and skips this
-    // branch.  WARP / Basic Render -> 1 (4x on a software rasterizer
-    // pushes a 1280x720 frame to seconds-per-frame); HW -> 4.
-    if (m_aaSamplesPerPixel == 0)
-    {
-        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
-        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
-                                (wcsstr(desc, L"Basic Render") != nullptr);
-        m_aaSamplesPerPixel = isSoftware ? 1u : 4u;
-        SampleLog::LogF(L"  auto AA samples-per-pixel: %u  (%ls adapter)\n",
-                        m_aaSamplesPerPixel, isSoftware ? L"software" : L"hardware");
-    }
-    // Same auto-resolve for the per-frame timing snapshot window.  60
-    // samples on HW (~1 s at 60 fps), 5 samples on WARP (~30-50 s at
-    // 6-10 s/frame).  Without this, the PER-FRAME overlay line shows
-    // "recalculating..." for 10+ minutes on WARP after each toggle.
-    if (m_pfSnapTargetCount == 0)
-    {
-        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
-        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
-                                (wcsstr(desc, L"Basic Render") != nullptr);
-        m_pfSnapTargetCount = isSoftware ? 5 : 60;
-        SampleLog::LogF(L"  auto per-frame snap samples: %d  (%ls adapter)\n",
-                        m_pfSnapTargetCount, isSoftware ? L"software" : L"hardware");
-    }
-
-    // Wall-clock FPS rolling-average window size.  Same adapter-aware
-    // sentinel pattern.  60-frame window on HW (~0.5-1 s, smooths vsync
-    // jitter), 3-frame window on WARP (frames are seconds long, a
-    // large window would lag behind state changes by minutes).
-    if (m_frameTimeWindow == 0)
-    {
-        const wchar_t* desc = m_deviceResources->GetAdapterDescription();
-        const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
-                                (wcsstr(desc, L"Basic Render") != nullptr);
-        m_frameTimeWindow = isSoftware ? 3u : 60u;
-        m_frameTimeRing.assign(m_frameTimeWindow, 0.0);
-        m_frameTimeRingIdx   = 0;
-        m_frameTimeRingCount = 0;
-        m_frameTimeRingSum   = 0.0;
-        SampleLog::LogF(L"  auto FPS rolling window: %u frames  (%ls adapter)\n",
-                        m_frameTimeWindow, isSoftware ? L"software" : L"hardware");
-    }
-
     if (!m_clustersAndPtlasSupported)
     {
-        // Hardware doesn't support clusters -- lock the sample into
-        // Traditional (DXR1) mode.  The [T] toggle becomes a no-op, the
-        // overlay shows a "(locked, clusters unsupported)" hint, and the
-        // window title flags the fallback so it's obvious before the
-        // overlay even renders.  All cluster-path init / per-frame work
-        // is gated on m_clustersAndPtlasSupported below.
-        m_geometryMode = GeometryMode::Traditional;
-        SampleLog::Write(L"  -> clusters unsupported; falling back to traditional BLAS, [T] toggle disabled.\n");
-        SetCustomWindowText(L"clusters not supported on this adapter -- traditional BLAS fallback");
+        SampleLog::Write(L"DXR2 clusters not supported on this adapter; sample requires the experimental D3D12Core.\n");
+        SetCustomWindowText(L"clusters not supported on this adapter");
     }
 }
 
@@ -660,114 +598,15 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
     m_clasArgsStride     = (UINT)sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS);
 }
 
-// =====================================================================================
-// CLAS allocation strategies.
-//
-// All three modes share the same per-cluster inputs (vertex/index buffers,
-// triangle counts, args array, etc.). They differ only in HOW the per-cluster
-// output CLAS bytes get placed in GPU memory:
-//
-//   Implicit  - one IMPLICIT_DESTINATIONS build; allocate worst-case storage
-//               from prebuild.ResultDataMaxSizeInBytes. Simplest path. Wastes
-//               memory when actual per-cluster size << worst case (typical
-//               5x over-alloc for this scene on NVIDIA).
-//
-//   GetSizes  - two passes:
-//                 1. MODE_GET_SIZES: no result-buffer alloc, driver writes
-//                    per-cluster bytes-needed into a UAV size array.
-//                 2. CPU readback of sizes, sum to get the exact total,
-//                    compute per-cluster destination offsets, allocate an
-//                    exact-sized result buffer.
-//                 3. MODE_EXPLICIT_DESTINATIONS build into that buffer.
-//               No over-allocation at any point. Cost: one extra GPU pass +
-//               a CPU stall on the size readback.
-//
-//   Compact   - two passes, opposite tradeoff:
-//                 1. MODE_IMPLICIT_DESTINATIONS build (worst-case alloc),
-//                    with ResultSizeArray attached so per-cluster actual
-//                    sizes are written as a side effect of the build.
-//                 2. CPU readback of sizes -> compacted total.
-//                 3. MOVE_CLUSTER_OBJECTS in MODE_IMPLICIT_DESTINATIONS into
-//                    a tightly-sized compacted result buffer.
-//                 4. Old (worst-case) result buffer is released.
-//               Peak GPU memory = worst-case + compacted (briefly, during
-//               step 3). Final = compacted. No CPU-blocking required if the
-//               size info is consumed by a GPU shader -> only useful if you
-//               want EXACT post-build alloc on a single GPU timeline.
-//
-// All three end with m_clasResultBuffer, m_clasAddressArray, m_clasSizeArray
-// in their canonical post-CLAS state so the subsequent BLAS-from-CLAS build
-// can proceed identically. The captured stats (m_clasMemStats) let the
-// user see the tradeoff in numbers via the [CLAS mem] log line.
-// =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
-{
-    m_clasMemStats = ClasMemStats{};
-    BuildClasImplicit();
-}
+// BuildClasIndirect: thin wrapper -- only Implicit alloc mode supported
+// in this minimal repro (Compact / GetSizes paths gutted along with
+// the alloc-mode CLI flag).
+void D3D12RaytracingClusteredGeometry::BuildClasIndirect() { BuildClasImplicit(); }
 
-// ---------------------------------------------------------------------------------
-// Build the shared D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC + ClusterLimits.
-// All three modes need the same input description; only their Mode field and
-// the surrounding batched-op-data setup differ. Keeping this in one helper
-// avoids drift between the three paths.
-// ---------------------------------------------------------------------------------
-static void BuildSharedClusterTrianglesInputs(
-    const D3D12RaytracingClusteredGeometry& self,
-    UINT N, bool useFloat, UINT maxTris, UINT maxVerts, UINT totalTris, UINT totalVerts,
-    UINT maxCompressedSize,
-    D3D12_RTAS_CLUSTER_LIMITS& outLimits,
-    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC& outClasDesc)
-{
-    (void)self;
-    outLimits = {};
-    outLimits.MaxArgCount                                   = N;
-    outLimits.MaxGeometryIndexValue                         = 0;
-    // DEBUG: conformance test uses 256 here.  Sample previously used 1
-    // (every cluster has only ONE geom-index slot since the per-cluster
-    // GeometryIndexAndFlagsArray is null).  Testing whether NVIDIA's
-    // optimization path for count=1 has a COMPRESSED1 bug.
-    outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 256;
-    outLimits.MaxTriangleCountPerCluster                    = maxTris;
-    outLimits.MaxVertexCountPerCluster                      = maxVerts;
-    outLimits.MaxTotalTriangleCount                         = totalTris;
-    outLimits.MaxTotalVertexCount                           = totalVerts;
-    outLimits.MaxOpacityMicromapIndicesPerCluster           = 0;
-
-    outClasDesc = {};
-    outClasDesc.ClusterLimits                       = outLimits;
-    // FAST_TRACE: optimise for trace performance over build speed (the typical
-    // static-asset choice; use FAST_OPERATION instead for streaming rebuilds).
-    // ALLOW_DATA_ACCESS: required for the TriangleObjectPositions() HLSL
-    // intrinsic the closest-hit shader uses to compute per-hit normals - the
-    // driver stores the cluster's source positions in/alongside the BVH so the
-    // intrinsic can read them back. Per-cluster ClusterFlags can override with
-    // D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_DISALLOW_DATA_ACCESS to opt some
-    // clusters out (we don't).
-    outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
-    outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
-                                                               : D3D12_VERTEX_FORMAT_COMPRESSED1;
-    outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT16;
-    outClasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
-    outClasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
-    // The last field is a union: in COMPRESSED1 mode it's
-    // MaxCompressedClusterPositionsSize (the max compressed-blob bytes per
-    // cluster), in FLOAT32_3 mode it's MinPositionTruncateBitCount (the
-    // floor on per-cluster mantissa-truncation; per-cluster
-    // PositionTruncateBitCount in the args struct must be >= this).
-    if (useFloat)
-        outClasDesc.MinPositionTruncateBitCount = self.PositionTruncateBits();
-    else
-        outClasDesc.MaxCompressedClusterPositionsSize = maxCompressedSize;
-    // .Mode set by each caller.
-}
-
-// ---------------------------------------------------------------------------------
-// Implicit mode (default). Single IMPLICIT_DESTINATIONS build covering all
-// clusters. Allocates the worst-case result-buffer size from prebuild info;
-// per-cluster GVAs land in m_clasAddressArray; per-cluster sizes land in
-// m_clasSizeArray (as a side effect of the build, useful for stats).
-// ---------------------------------------------------------------------------------
+// Single IMPLICIT_DESTINATIONS BUILD_CLAS_FROM_TRIANGLES across all
+// clusters in m_objects.  Worst-case result-buffer allocation from the
+// prebuild query; per-cluster CLAS GVAs land in m_clasAddressArray and
+// feed directly into the BUILD_BLAS_FROM_CLAS step that follows.
 void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
 {
     auto device = m_deviceResources->GetD3DDevice();
@@ -787,11 +626,25 @@ void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
             maxCompressedSize = std::max(maxCompressedSize, (UINT)obj.encoded[i].TotalBytes());
     }
 
-    D3D12_RTAS_CLUSTER_LIMITS limits;
-    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc;
-    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
-                                      totalTris, totalVerts, maxCompressedSize,
-                                      limits, clasDesc);
+    D3D12_RTAS_CLUSTER_LIMITS limits = {};
+    limits.MaxArgCount                                   = N;
+    limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 256;
+    limits.MaxTriangleCountPerCluster                    = maxTris;
+    limits.MaxVertexCountPerCluster                      = maxVerts;
+    limits.MaxTotalTriangleCount                         = totalTris;
+    limits.MaxTotalVertexCount                           = totalVerts;
+
+    D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc = {};
+    clasDesc.ClusterLimits                    = limits;
+    clasDesc.Flags                            = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    clasDesc.VertexFormat                     = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3 : D3D12_VERTEX_FORMAT_COMPRESSED1;
+    clasDesc.IndexFormat                      = D3D12_INDEX_FORMAT_UINT16;
+    clasDesc.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
+    clasDesc.OpacityMicromapIndexFormat       = D3D12_INDEX_FORMAT_NONE;
+    if (useFloat)
+        clasDesc.MinPositionTruncateBitCount = m_positionTruncateBits;
+    else
+        clasDesc.MaxCompressedClusterPositionsSize = maxCompressedSize;
     clasDesc.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
     D3D12_RTAS_OPERATION_INPUTS opInputs = {};
@@ -800,92 +653,34 @@ void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
 
     D3D12_RTAS_OPERATION_PREBUILD_INFO prebuild = {};
     m_dxr2Device->GetRTASOperationPrebuildInfo(&opInputs, &prebuild);
-    SampleLog::LogF(L"[CLAS prebuild] %u clusters: result max=%llu bytes, scratch=%llu bytes\n",
-                    N,
-                    (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
-                    (unsigned long long)prebuild.ScratchDataSizeInBytes);
-
-    m_clasMemStats.resultPrebuildMax  = prebuild.ResultDataMaxSizeInBytes;
-    m_clasMemStats.resultInitialBytes = prebuild.ResultDataMaxSizeInBytes;
-    m_clasMemStats.resultFinalBytes   = prebuild.ResultDataMaxSizeInBytes;
-    m_clasMemStats.peakResidentBytes  = prebuild.ResultDataMaxSizeInBytes;
-    m_clasMemStats.scratchBytesPhase1 = prebuild.ScratchDataSizeInBytes;
 
     AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
                       &m_clasResultBuffer, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                      L"All-cluster CLAS result buffer (implicit)");
+                      L"CLAS result");
     AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
                       &m_clasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                       L"CLAS scratch");
     AllocateUAVBuffer(device, (UINT64)N * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
                       &m_clasAddressArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                       L"CLAS address array");
-    AllocateUAVBuffer(device, (UINT64)N * sizeof(UINT64),
-                      &m_clasSizeArray, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                      L"CLAS size array");
 
     D3D12_RTAS_BATCHED_OPERATION_DATA batched = {};
-    batched.AddressResolutionFlags    = D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_NONE;
-    batched.BatchResultData           = m_clasResultBuffer->GetGPUVirtualAddress();
-    batched.BatchScratchData          = m_clasScratchBuffer->GetGPUVirtualAddress();
-    batched.ResultAddressArray        = { m_clasAddressArray->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-    batched.ResultSizeArray           = { m_clasSizeArray->GetGPUVirtualAddress(),    sizeof(UINT64) };
-    batched.IndirectArgumentArray     = { m_clasArgsArrayGPUVA, m_clasArgsStride };
-    batched.IndirectArgumentArraySize = 0;
-    batched.ToolsInfo                 = 0;
+    batched.AddressResolutionFlags = D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_NONE;
+    batched.BatchResultData        = m_clasResultBuffer->GetGPUVirtualAddress();
+    batched.BatchScratchData       = m_clasScratchBuffer->GetGPUVirtualAddress();
+    batched.ResultAddressArray     = { m_clasAddressArray->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
+    batched.IndirectArgumentArray  = { m_clasArgsArrayGPUVA, m_clasArgsStride };
 
     D3D12_RTAS_OPERATION_DESC opDesc = {};
     opDesc.Inputs                = opInputs;
     opDesc.pBatchedOperationData = &batched;
 
-    const auto t0 = std::chrono::steady_clock::now();
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDesc, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
     D3D12_RESOURCE_BARRIER barriers[] = {
         CD3DX12_RESOURCE_BARRIER::UAV(m_clasResultBuffer.Get()),
         CD3DX12_RESOURCE_BARRIER::UAV(m_clasAddressArray.Get()),
-        CD3DX12_RESOURCE_BARRIER::UAV(m_clasSizeArray.Get()),
     };
     m_dxrCommandList->ResourceBarrier(_countof(barriers), barriers);
-    const auto t1 = std::chrono::steady_clock::now();
-    m_clasMemStats.cpuWallMsPhase1 = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-    // Read back the per-cluster sizes the driver wrote into m_clasSizeArray
-    // as a side effect of the build, so the [CLAS mem] stats line can show
-    // the actual irreducible storage (sum_actual). This is a one-time CPU
-    // stall - production code that picks implicit mode would skip it. The
-    // sample does it so users can see the over-allocation at a glance.
-    auto cmdList = m_deviceResources->GetCommandList();
-    ComPtr<ID3D12Resource> sizesReadback;
-    {
-        auto rbHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-        auto rbDesc = CD3DX12_RESOURCE_DESC::Buffer((UINT64)N * sizeof(UINT64));
-        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sizesReadback)));
-        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cmdList->ResourceBarrier(1, &toCopy);
-        cmdList->CopyBufferRegion(sizesReadback.Get(), 0, m_clasSizeArray.Get(), 0,
-            (UINT64)N * sizeof(UINT64));
-        auto fromCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_clasSizeArray.Get(),
-            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdList->ResourceBarrier(1, &fromCopy);
-    }
-    m_deviceResources->ExecuteCommandList();
-    m_deviceResources->WaitForGpu();
-    {
-        void* mapped = nullptr;
-        D3D12_RANGE rr = { 0, (SIZE_T)N * sizeof(UINT64) };
-        ThrowIfFailed(sizesReadback->Map(0, &rr, &mapped));
-        auto* sizes = reinterpret_cast<const UINT64*>(mapped);
-        UINT64 sum = 0;
-        for (UINT i = 0; i < N; ++i) sum += sizes[i];
-        D3D12_RANGE noWrite = {0, 0};
-        sizesReadback->Unmap(0, &noWrite);
-        m_clasMemStats.sumActualBytes = sum;
-    }
-    auto cmdAlloc = m_deviceResources->GetCommandAllocator();
-    ThrowIfFailed(cmdAlloc->Reset());
-    ThrowIfFailed(cmdList->Reset(cmdAlloc, nullptr));
 }
 
 // ---------------------------------------------------------------------------------

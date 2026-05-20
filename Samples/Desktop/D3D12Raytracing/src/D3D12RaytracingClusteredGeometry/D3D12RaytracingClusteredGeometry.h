@@ -152,10 +152,6 @@ private:
     // Aggregated traditional-static-BLAS sizes, refreshed each rebuild for
     // the overlay's apples-to-apples comparison vs the cluster path's
     // CLAS+BLAS totals.  See BuildTraditionalStaticAS.
-    UINT64 m_traditionalStaticTotalResultBytes  = 0;   // sum of obj.tradBlasResultBytes (== alloc bytes)
-    UINT64 m_traditionalStaticTotalActualBytes  = 0;   // == result bytes in Implicit; sum of compacted sizes in Compact
-    UINT64 m_traditionalStaticTotalScratchBytes = 0;
-    double m_traditionalStaticBuildMs            = 0.0;
     // Per-triangle cluster-ID lookup table for the traditional-BLAS
     // closest-hit.  Indexed by a (per-instance, per-geom) tri base +
     // PrimitiveIndex().  Returns the global cluster ID for that
@@ -301,22 +297,12 @@ private:
     //               every adapter I've measured.
     enum class TraditionalAllocMode { Implicit, Compact };
     TraditionalAnimMode                  m_traditionalAnimMode  = TraditionalAnimMode::Rebuild;
-    TraditionalAllocMode                 m_traditionalAllocMode = TraditionalAllocMode::Compact;
     const wchar_t*                       TraditionalAnimModeName() const
     {
         switch (m_traditionalAnimMode)
         {
         case TraditionalAnimMode::Rebuild: return L"rebuild";
         case TraditionalAnimMode::Refit:   return L"refit";
-        }
-        return L"?";
-    }
-    const wchar_t*                       TraditionalAllocModeName() const
-    {
-        switch (m_traditionalAllocMode)
-        {
-        case TraditionalAllocMode::Implicit: return L"implicit (no compaction)";
-        case TraditionalAllocMode::Compact:  return L"post-build compact";
         }
         return L"?";
     }
@@ -403,19 +389,6 @@ private:
     // per-cluster compressed blobs first, then rebuilds CLAS/BLAS/TLAS).
     UINT                                 m_compressedBitsPerComponent = 12;
     // Stats captured by BuildClasIndirect, reported via RenderUI overlay + log.
-    struct ClasMemStats
-    {
-        UINT64 resultPrebuildMax  = 0;  // prebuild.ResultDataMaxSizeInBytes (worst case)
-        UINT64 resultInitialBytes = 0;  // what we actually allocated initially
-        UINT64 resultFinalBytes   = 0;  // final live result-buffer size after this function returns
-        UINT64 peakResidentBytes  = 0;  // max concurrent live result-buffer memory
-        UINT64 scratchBytesPhase1 = 0;
-        UINT64 scratchBytesPhase2 = 0;
-        UINT64 sumActualBytes     = 0;  // sum of per-cluster sizes (= the irreducible CLAS storage)
-        double cpuWallMsPhase1    = 0.0;
-        double cpuWallMsPhase2    = 0.0;
-    };
-    ClasMemStats                         m_clasMemStats;
 
     // ---------- Scene = N procedurally-generated objects ----------
     std::vector<ClusterObject>           m_objects;
@@ -456,8 +429,6 @@ private:
     ComPtr<ID3D12Resource>               m_clasResultBuffer;
     ComPtr<ID3D12Resource>               m_clasScratchBuffer;
     ComPtr<ID3D12Resource>               m_clasAddressArray;       // N_total_clusters x GVA
-    ComPtr<ID3D12Resource>               m_clasSizeArray;          // N_total_clusters x UINT64
-    ComPtr<ID3D12Resource>               m_clasMoveArgsBuffer;     // ClasAllocMode::Compact only - kept alive across function returns
 
     // Single BLAS-from-CLAS build covers all BLASes (one per object).
     ComPtr<ID3D12Resource>               m_blasScratchBuffer;
@@ -614,23 +585,15 @@ private:
     //   slot 2: raw UAV (animated positions, u0)
     // Used by UpdateAnimatedObjectPerFrame's Dispatch -- one thread group per
     // 64 verts, IM->UAV barrier, then INSTANTIATE_CLUSTER_TEMPLATES reads.
-    ComPtr<ID3D12RootSignature>          m_animComputeRS;
-    ComPtr<ID3D12PipelineState>          m_animComputePSO;
     // GPU pipeline that writes per-cluster
     // INSTANTIATE_CLUSTER_TEMPLATES_ARGS into AnimatedObject::
     // perFrameInstArgsBuffer.  Built once at init by
     // CreateFillInstantiateArgsPipeline, dispatched once at the end of
     // BuildAnimatedObjectSetup (and on every config-change rebuild).
-    ComPtr<ID3D12RootSignature>          m_fillInstArgsRS;
-    ComPtr<ID3D12PipelineState>          m_fillInstArgsPSO;
     // Args-fill pipelines for the remaining RTAS op types.  Each writes
     // its corresponding D3D12_RTAS_OPERATION_*_ARGS array from a small
     // CPU-prepared per-entry metadata buffer + a few root constants.
     // See the matching .hlsl files for layout details.
-    ComPtr<ID3D12RootSignature>          m_fillMoveArgsRS;
-    ComPtr<ID3D12PipelineState>          m_fillMoveArgsPSO;
-    ComPtr<ID3D12RootSignature>          m_fillTemplateArgsRS;
-    ComPtr<ID3D12PipelineState>          m_fillTemplateArgsPSO;
 
     // ---------- Output texture + descriptor heap ----------
     // Descriptor heap layout (CBV_SRV_UAV, shader-visible):
@@ -650,15 +613,12 @@ private:
     // the back buffer.  Replaces the title-bar text approach (Win11 title bars
     // truncate around ~280 visible chars regardless of available pixel width).
     std::unique_ptr<DirectX::GraphicsMemory> m_graphicsMemory;
-    std::unique_ptr<DirectX::SpriteBatch>    m_spriteBatch;
-    std::unique_ptr<DirectX::SpriteFont>     m_uiFont;
     // 1x1 white texture used by the overlay's per-segment dark backing.
     // SpriteBatch stretches it to each text segment's exact bounding box
     // (cursor.x..cursor.x+measureX, pos.y..pos.y+kLineH) and tints it
     // with a semi-transparent dark colour, so the bright body text reads
     // against any scene colour underneath.  Allocated in CreateUIFont,
     // lives in the shared descriptor heap.
-    Microsoft::WRL::ComPtr<ID3D12Resource>   m_overlayPanelTexture;
     // Adaptive overlay sizing -- the overlay TARGETS kScale=0.625 (the
     // size you see at 4K) but if that scale would overflow the back
     // buffer width (typically on 1280x720), kScale is dropped just
@@ -757,17 +717,8 @@ private:
     // precision (which only affect INSTANTIATE).
     static const UINT                    kPerFrameTsPerSlot      = 10;
     static const UINT                    kPerFrameRingSlots      = 3;
-    UINT64                               m_timestampFrequency = 0;
-    double                               m_tlasBuildMs        = 0.0;
-    double                               m_totalBuildMs       = 0.0;
     // Per-frame (EMA-smoothed) - split out so the precision / vertex-format
     // sweep can attribute time changes to the right op.
-    double                               m_pfInstantiateMs    = 0.0;  // INSTANTIATE_CLUSTER_TEMPLATES alone
-    double                               m_pfBlasRebuildMs    = 0.0;  // BUILD_BLAS_FROM_CLAS alone (animated)
-    double                               m_pfTlasRebuildMs    = 0.0;  // TLAS rebuild
-    UINT                                 m_pfFramesCaptured   = 0;
-    UINT64                               m_totalClasBytes     = 0;
-    UINT64                               m_totalBlasBytes     = 0;
 
     // ---------- Overlay stats snapshot ----------
     // To minimize per-frame overhead the overlay does NOT read live numbers
@@ -939,7 +890,6 @@ private:
     bool      m_animPaused        = false;
 
     // Screenshot capture (--screenshot N path.png).
-    int          m_screenshotFrame     = -1;
     UINT         m_framesRendered = 0;
 
     // ---------- Initialization helpers ----------

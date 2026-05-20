@@ -23,32 +23,7 @@
 //   offset 16 (4 B)   UINT   ibByteOffset    (from g_baseGpuVa)
 //   offset 20 (4 B)   UINT   opaqueFlag      (0 or D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE)
 //   offset 24 (4 B)   UINT   matRegionIdx    (becomes per-CLAS BaseGeometryIndex)
-//
-// Layout of D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS (80 bytes):
-//
-//   offset  0 (4 B)   UINT   ClusterID
-//   offset  4 (4 B)   UINT   ClusterFlags                       = 0
-//   offset  8 (2 B)   UINT16 TriangleCount
-//   offset 10 (2 B)   UINT16 VertexCount
-//   offset 12 (4 B)   UINT   BaseGeometryIndexAndFlags          = opaqueFlag
-//   offset 16 (4 B)   UINT   OpacityMicromapBaseLocation        = 0
-//   offset 20 (2 B)   UINT16 VertexBufferStride                 = g_vertexBufferStride
-//   offset 22 (2 B)   UINT16 IndexBufferStride                  = 1
-//   offset 24 (2 B)   UINT16 OpacityMicromapIndexBufferStride   = 0
-//   offset 26 (2 B)   UINT16 GeometryIndexAndFlagsArrayStride   = 0
-//   offset 28 (2 B)   UINT16 PositionTruncateBitCount           = g_positionTruncateBits
-//   offset 30 (2 B)   UINT16 ReservedPadding                    = 0
-//   offset 32 (8 B)   u64    VertexBuffer                       = g_baseGpuVa + vbByteOffset
-//   offset 40 (8 B)   u64    IndexBuffer                        = g_baseGpuVa + ibByteOffset
-//   offset 48 (8 B)   u64    GeometryIndexAndFlagsArray         = 0
-//   offset 56 (8 B)   u64    GeometryIndexAndFlagsIndexBuffer   = 0
-//   offset 64 (8 B)   u64    OpacityMicromapArray               = 0
-//   offset 72 (8 B)   u64    OpacityMicromapIndexBuffer         = 0
-//
-//---------------------------------------------------------------------------
 
-// Pulls in DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND for the
-// BaseGeometryIndex stamping gate further down.
 #define HLSL
 #include "RaytracingHlslCompat.h"
 
@@ -61,44 +36,16 @@ cbuffer Constants : register(b0)
     uint g_positionTruncateBits;   // 0..23
 };
 
-// Per-cluster metadata layout (36 bytes/cluster, matches ClasArgsMeta in
-// the C++ side):
-//
-//   offset  0 (4 B)   UINT   clusterID
-//   offset  4 (4 B)   UINT   triangleCount   (must fit in u16)
-//   offset  8 (4 B)   UINT   vertexCount     (must fit in u16)
-//   offset 12 (4 B)   UINT   vbByteOffset    (from g_baseGpuVa) -- DEPRECATED
-//                            (kept for layout compatibility; ignored in
-//                            this build, see vbGvaLo/Hi below)
-//   offset 16 (4 B)   UINT   ibByteOffset    (from g_baseGpuVa)
-//   offset 20 (4 B)   UINT   opaqueFlag      (0 or D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE)
-//   offset 24 (4 B)   UINT   matRegionIdx    (becomes per-CLAS BaseGeometryIndex)
-//   offset 28 (4 B)   UINT   vbGvaLo         -- per-cluster ABSOLUTE VB GVA, low 32 bits
-//   offset 32 (4 B)   UINT   vbGvaHi         -- per-cluster ABSOLUTE VB GVA, high 32 bits
-//
-// The CPU fills vbGvaLo/Hi with either (a) baseGpuVa+vbByteOffset (default
-// path -- shared buffer mode, identical to legacy behaviour) or (b) a
-// dedicated per-cluster resource's GVA (kPerClusterVbExperiment, used
-// to investigate NVIDIA COMPRESSED1 corruption).  The shader uses
-// vbGvaLo/Hi verbatim; only IndexBuffer still uses baseGpuVa+ibByteOffset.
 ByteAddressBuffer   g_meta    : register(t0);
-
-// Output: 80 bytes/cluster.
 RWByteAddressBuffer g_argsOut : register(u0);
 
-// Helper: 64-bit add of (gvaLo, gvaHi) + offset.
 uint2 add64(uint gvaLo, uint gvaHi, uint offset)
 {
     const uint sumLo = gvaLo + offset;
     const uint carry = (sumLo < gvaLo) ? 1u : 0u;
     return uint2(sumLo, gvaHi + carry);
 }
-
-// Helper: pack two u16s into one u32 (low/high).
-uint pack16(uint lo, uint hi)
-{
-    return (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16);
-}
+uint pack16(uint lo, uint hi) { return (lo & 0xFFFFu) | ((hi & 0xFFFFu) << 16); }
 
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
@@ -106,68 +53,40 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint idx = tid.x;
     if (idx >= g_clusterCount) return;
 
-    // Load 36 bytes of per-cluster metadata.
-    const uint3 m0 = g_meta.Load3(idx * 36u +  0);  // {clusterID, triCount, vertCount}
-    const uint3 m1 = g_meta.Load3(idx * 36u + 12);  // {vbOff, ibOff, opaqueFlag}
-    const uint  m2 = g_meta.Load (idx * 36u + 24);  // {matRegionIdx}
-    const uint2 m3 = g_meta.Load2(idx * 36u + 28);  // {vbGvaLo, vbGvaHi}
+    // Load 28 bytes of per-cluster metadata.
+    const uint3 m0 = g_meta.Load3(idx * 28u +  0);  // {clusterID, triCount, vertCount}
+    const uint3 m1 = g_meta.Load3(idx * 28u + 12);  // {vbOff, ibOff, opaqueFlag}
+    const uint  m2 = g_meta.Load (idx * 28u + 24);  // {matRegionIdx}
 
     const uint  clusterID    = m0.x;
     const uint  triCount     = m0.y;
     const uint  vertCount    = m0.z;
-    /* vbOff (m1.x) deprecated; vbGva from meta is the authoritative VB GVA. */
+    const uint  vbOff        = m1.x;
     const uint  ibOff        = m1.y;
     const uint  opaqueFlag   = m1.z;
     const uint  matRegionIdx = m2;
 
-    const uint2 vbGva = uint2(m3.x, m3.y);
+    const uint2 vbGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, vbOff);
     const uint2 ibGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, ibOff);
 
-    // BaseGeometryIndex packed into upper 24 bits of BaseGeometryIndexAndFlags.
-    // See RaytracingHlslCompat.h's DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    // gate for the rationale -- non-zero values currently hang
-    // BUILD_BLAS_FROM_CLAS on the NVIDIA DXR2 preview driver.
-    // BaseGeometryIndexAndFlags layout per spec (Raytracing2.md line 1512):
+    // BaseGeometryIndexAndFlags per Raytracing2.md:
     //   bits 23:0  = Geometry Index   (LOW 24 bits)
-    //   bits 31:24 = flags            (HIGH 8 bits)
-    // The D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_* enum values are
-    // PRE-POSITIONED in the upper 8 bits (e.g. FLAG_OPAQUE = 0x80000000),
-    // so they can be OR'd directly without shifting or masking.
-    //
-    // Earlier versions of this shader had the layout completely wrong:
-    //   (matRegionIdx << 8) | (opaqueFlag & 0xFFu)
-    // -> matRegionIdx leaked into the flag region, AND `opaqueFlag &
-    // 0xFFu` masks 0x80000000 down to 0, silently DROPPING the OPAQUE
-    // flag.  This was hidden because the only consumer-side check is at
-    // BVH traversal time, and the FLOAT32_3 path produced visually
-    // correct geometry despite the missing flag.  Confirmed against the
-    // conformance test layout (c:\experimental\src\D3D12Conf\Raytracing
-    // \IndirectBuild.cpp:6816 -- baseGeo & 0x00FFFFFF, baseFlags &
-    // 0xFF000000) and the d3d12.h enum definition (FLAG_OPAQUE =
-    // 0x80000000, FLAG_NO_DUPLICATE_ANYHIT = 0x40000000).
-    //
-    // See also the DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND below, which
-    // independently zeroes matRegionIdx to dodge an NVIDIA preview-driver
-    // hang on non-zero BaseGeometryIndex.
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    const uint baseGeomIdxAndFlags = 0u | (opaqueFlag & 0xFF000000u);
-#else
+    //   bits 31:24 = flags            (HIGH 8 bits) -- FLAG_OPAQUE = 0x80000000
     const uint baseGeomIdxAndFlags = (matRegionIdx & 0x00FFFFFFu) | (opaqueFlag & 0xFF000000u);
-#endif
 
     const uint baseByte = idx * 80u;
-    g_argsOut.Store (baseByte +  0, clusterID);                                                // ClusterID
-    g_argsOut.Store (baseByte +  4, 0u);                                                       // ClusterFlags
-    g_argsOut.Store (baseByte +  8, pack16(triCount, vertCount));                              // TriCount/VertCount
-    g_argsOut.Store (baseByte + 12, baseGeomIdxAndFlags);                                      // BaseGeometryIndexAndFlags
-    g_argsOut.Store (baseByte + 16, 0u);                                                       // OpacityMicromapBaseLocation
-    g_argsOut.Store (baseByte + 20, pack16(g_vertexBufferStride, 2u));                         // VBStride/IBStride (UINT16 indices = 2 bytes)
-    g_argsOut.Store (baseByte + 24, pack16(0u, 0u));                                           // OMM IB Stride / GeomIdxAndFlagsArrayStride
-    g_argsOut.Store (baseByte + 28, pack16(g_positionTruncateBits, 0u));                       // PosTruncBits/Pad
-    g_argsOut.Store2(baseByte + 32, vbGva);                                                    // VertexBuffer
-    g_argsOut.Store2(baseByte + 40, ibGva);                                                    // IndexBuffer
-    g_argsOut.Store2(baseByte + 48, uint2(0, 0));                                              // GeometryIndexAndFlagsArray
-    g_argsOut.Store2(baseByte + 56, uint2(0, 0));                                              // GeometryIndexAndFlagsIndexBuffer
-    g_argsOut.Store2(baseByte + 64, uint2(0, 0));                                              // OpacityMicromapArray
-    g_argsOut.Store2(baseByte + 72, uint2(0, 0));                                              // OpacityMicromapIndexBuffer
+    g_argsOut.Store (baseByte +  0, clusterID);
+    g_argsOut.Store (baseByte +  4, 0u);                                            // ClusterFlags
+    g_argsOut.Store (baseByte +  8, pack16(triCount, vertCount));
+    g_argsOut.Store (baseByte + 12, baseGeomIdxAndFlags);
+    g_argsOut.Store (baseByte + 16, 0u);                                            // OpacityMicromapBaseLocation
+    g_argsOut.Store (baseByte + 20, pack16(g_vertexBufferStride, 2u));              // VBStride/IBStride (UINT16 indices = 2)
+    g_argsOut.Store (baseByte + 24, pack16(0u, 0u));
+    g_argsOut.Store (baseByte + 28, pack16(g_positionTruncateBits, 0u));
+    g_argsOut.Store2(baseByte + 32, vbGva);
+    g_argsOut.Store2(baseByte + 40, ibGva);
+    g_argsOut.Store2(baseByte + 48, uint2(0, 0));
+    g_argsOut.Store2(baseByte + 56, uint2(0, 0));
+    g_argsOut.Store2(baseByte + 64, uint2(0, 0));
+    g_argsOut.Store2(baseByte + 72, uint2(0, 0));
 }

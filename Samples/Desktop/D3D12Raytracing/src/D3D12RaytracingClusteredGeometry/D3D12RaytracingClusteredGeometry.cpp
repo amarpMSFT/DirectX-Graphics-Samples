@@ -11,66 +11,8 @@
 
 #include "stdafx.h"
 #include "D3D12RaytracingClusteredGeometry.h"
-
-// =====================================================================
-// COMPRESSED1-bug isolation switch.
-// Set to one of the kIsolate* constants below to mask all TLAS
-// instances except the named one (and optionally the floor for context
-// reflections).  Used to narrow the NVIDIA-driver COMPRESSED1 rendering
-// corruption (works in WARP, broken on HW) down to a single object.
-// kIsolateNone = normal scene (every instance visible).
-//
-// Implementation: instances whose `obj.instanceID` doesn't match the
-// isolated id (and the animated ball if it isn't the target) get
-// `InstanceMask = 0` so the primary-ray `TraceRay(InclusionMask=0xff)`
-// AND skips them.  Geometry, BLAS, CLAS, etc. are still built -- only
-// traversal is suppressed -- so the AS-storage stats stay representative.
-// =====================================================================
-namespace DebugIsolate {
-    constexpr UINT kIsolateNone     = 0xFFFFFFFFu;
-    constexpr UINT kIsolateSphere0  = 0;
-    constexpr UINT kIsolateSphere1  = 1;
-    constexpr UINT kIsolateSphere2  = 2;
-    constexpr UINT kIsolateSphere3  = 3;
-    constexpr UINT kIsolateTorus    = 4;
-    constexpr UINT kIsolateCube     = 5;
-    constexpr UINT kIsolateFloor    = 6;
-    constexpr UINT kIsolateKlein    = 7;
-    constexpr UINT kIsolateAnimated = 99;   // synthetic id for the animated ball
-
-    // Which object to isolate.  Set to kIsolateNone for the full scene.
-    constexpr UINT kIsolateTarget   = kIsolateCube;
-    // Also keep the floor visible (useful so the isolated object has
-    // something to reflect / cast shadows on).  Ignored when
-    // kIsolateTarget == kIsolateNone.
-    constexpr bool kKeepFloor       = false;
-
-    // ---- Hypothesis test for the NVIDIA COMPRESSED1 corruption ----
-    // The non-template COMPRESSED1 conformance test (c:\experimental\src\
-    // D3D12Conf\Raytracing\IndirectBuild.cpp ~line 2974) creates a
-    // dedicated D3D12 resource per cluster for the COMPRESSED1 vertex
-    // data (cluster's VertexBuffer GVA points at OFFSET 0 of its own
-    // resource).  The sample, for memory efficiency, concatenates all
-    // clusters into one shared m_clusterInputBuffer and lets each
-    // cluster's VertexBuffer GVA be base+vbOff with offset > 0.
-    //
-    // When kPerClusterVbExperiment is true AND m_vertexMode is
-    // COMPRESSED1, UploadClusterInputs additionally allocates a tiny
-    // dedicated UPLOAD-heap resource for each cluster's compressed
-    // vertex blob.  The CLAS-args meta struct is extended (28 -> 36
-    // bytes) with the per-cluster VB GVA; FillClasFromTrianglesArgs
-    // uses that GVA directly instead of base+vbOff.  IndexBuffer keeps
-    // the shared-buffer offset (the experiment isolates VB only).  If
-    // rendering becomes correct, the bug is NVIDIA-driver mis-decoding
-    // COMPRESSED1 when VertexBuffer GVA is non-zero within a larger
-    // resource.
-    constexpr bool kPerClusterVbExperiment = true;
-}
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\\Raytracing.hlsl.h"
-#include "CompiledShaders\\AnimateBall.hlsl.h"
-#include "CompiledShaders\\FillInstantiateArgs.hlsl.h"
-#include "CompiledShaders\\FillMoveClusterArgs.hlsl.h"
 #include "CompiledShaders\\FillBlasFromClasArgs.hlsl.h"
 #include "CompiledShaders\\FillClasFromTrianglesArgs.hlsl.h"
 #include "CompiledShaders\\FillClusterTemplateArgs.hlsl.h"
@@ -921,86 +863,8 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
     {
         struct ClasArgsMeta {
             UINT clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag, matRegionIdx;
-            UINT vbGvaLo, vbGvaHi;
         };
-        static_assert(sizeof(ClasArgsMeta) == 36, "must match the HLSL load offsets");
-
-        // (Optional) per-cluster dedicated VB resources for the
-        // COMPRESSED1 NVIDIA-bug hypothesis test.  Each holds ONLY one
-        // cluster's compressed vertex blob; GVA = resource start.
-        m_perClusterVbResources.clear();
-        const bool kUsePerClusterVbResources =
-            DebugIsolate::kPerClusterVbExperiment && !useFloat;
-        if (kUsePerClusterVbResources)
-        {
-            // DEFAULT heap (matches conformance MakeBufferAndInitialize
-            // path -- conformance MakeBufferAndInitialize at
-            // c:\experimental\src\D3D12Conf\Raytracing\IndirectBuild.cpp:405
-            // calls MakeBuffer with D3D12_HEAP_TYPE_DEFAULT then uploads
-            // via a staging buffer.  Hypothesis: NVIDIA driver may have
-            // a COMPRESSED1 decode bug specifically when the per-cluster
-            // VertexBuffer GVA points into an UPLOAD-heap resource (the
-            // sample's default).  Earlier same experiment with UPLOAD
-            // heap did not fix the corruption -- testing DEFAULT now.
-            auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-            auto uploadHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-            m_perClusterVbResources.resize(m_totalClusterCount);
-
-            // Per-cluster: create DEFAULT-heap resource (COPY_DEST), then
-            // upload via a per-cluster staging UPLOAD resource + CopyBufferRegion.
-            // The command list is reset+executed by the caller; we issue
-            // copies against the current open list and rely on the existing
-            // ExecuteCommandList flow.
-            std::vector<ComPtr<ID3D12Resource>> stagings(m_totalClusterCount);
-            UINT g2 = 0;
-            for (const auto& obj : m_objects)
-            for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++g2)
-            {
-                const auto& enc = obj.encoded[i];
-                const UINT64 sz = (UINT64)enc.TotalBytes();
-                // Default-heap destination
-                auto bdDst = CD3DX12_RESOURCE_DESC::Buffer(sz);
-                ThrowIfFailed(device->CreateCommittedResource(
-                    &defaultHeap, D3D12_HEAP_FLAG_NONE, &bdDst,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                    IID_PPV_ARGS(&m_perClusterVbResources[g2])));
-                m_perClusterVbResources[g2]->SetName(L"Per-cluster COMPRESSED1 VB (DEFAULT heap experiment)");
-                // Upload-heap staging
-                auto bdSrc = CD3DX12_RESOURCE_DESC::Buffer(sz);
-                ThrowIfFailed(device->CreateCommittedResource(
-                    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bdSrc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                    IID_PPV_ARGS(&stagings[g2])));
-                uint8_t* p = nullptr;
-                CD3DX12_RANGE noR(0, 0);
-                ThrowIfFailed(stagings[g2]->Map(0, &noR, reinterpret_cast<void**>(&p)));
-                memcpy(p, &enc.header, sizeof(enc.header));
-                if (!enc.bitstream.empty())
-                    memcpy(p + sizeof(enc.header), enc.bitstream.data(), enc.bitstream.size());
-                stagings[g2]->Unmap(0, nullptr);
-                // Copy + transition to NON_PIXEL_SHADER_RESOURCE.
-                auto cl = m_deviceResources->GetCommandList();
-                cl->CopyBufferRegion(m_perClusterVbResources[g2].Get(), 0,
-                                     stagings[g2].Get(), 0, sz);
-                auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-                    m_perClusterVbResources[g2].Get(),
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                cl->ResourceBarrier(1, &barrier);
-            }
-            // Stagings stay alive in the local vector until function end --
-            // they get destroyed once the upload's command list has been
-            // submitted and waited on (the static-build path's
-            // WaitForGpu ensures GPU is done before returning, so this
-            // vector goes out of scope safely afterwards).
-            SampleLog::LogF(L"[per-cluster-vb experiment] allocated %u dedicated COMPRESSED1 VB resources (DEFAULT heap)\n",
-                            m_totalClusterCount);
-            // Keep stagings alive at function scope until ExecuteCommandList
-            // happens.  Move into the resources vector as a sidecar (we
-            // don't strictly need them after this function returns, but
-            // pinning until end-of-function is the simplest correct thing).
-            m_perClusterVbStagings = std::move(stagings);
-        }
+        static_assert(sizeof(ClasArgsMeta) == 28, "must match the HLSL load offsets");
 
         std::vector<ClasArgsMeta> meta(m_totalClusterCount);
         gIdx = 0;
@@ -1008,26 +872,13 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++gIdx)
         {
             const auto& src = obj.mesh.clusters[i];
-            const auto& mat = m_materials[obj.instanceID];
-            const bool isOpaqueLike = (mat.translucency == 0.0f) && (mat.refractivity == 0.0f);
             meta[gIdx].clusterID    = src.clusterID;
             meta[gIdx].triCount     = (UINT)(src.indices.size() / 3);
             meta[gIdx].vertCount    = (UINT)src.positions.size();
             meta[gIdx].vbOff        = (UINT)slots[gIdx].vbOffset;
             meta[gIdx].ibOff        = (UINT)slots[gIdx].ibOffset;
-            meta[gIdx].opaqueFlag   = isOpaqueLike
-                ? (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
-                : 0u;
-            meta[gIdx].matRegionIdx = src.matRegionIdx;
-            // Per-cluster VB GVA: experimental path uses dedicated
-            // resource (GVA = resource start), default uses
-            // baseSharedBuffer + per-cluster offset.
-            const D3D12_GPU_VIRTUAL_ADDRESS vbGva =
-                kUsePerClusterVbResources
-                    ? m_perClusterVbResources[gIdx]->GetGPUVirtualAddress()
-                    : (baseGPUVA + (D3D12_GPU_VIRTUAL_ADDRESS)slots[gIdx].vbOffset);
-            meta[gIdx].vbGvaLo = (UINT)(vbGva & 0xFFFFFFFFu);
-            meta[gIdx].vbGvaHi = (UINT)(vbGva >> 32);
+            meta[gIdx].opaqueFlag   = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
+            meta[gIdx].matRegionIdx = 0;
         }
         AllocateUploadBuffer(device, meta.data(),
                              meta.size() * sizeof(ClasArgsMeta),
@@ -1724,52 +1575,12 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 {
     auto device = m_deviceResources->GetD3DDevice();
-    const UINT N_static = (UINT)m_objects.size();
-    const UINT N_anim   = m_animatedObjectEnabled ? 1u : 0u;
-    const UINT N_total  = N_static + N_anim;
+    const UINT N_total = (UINT)m_objects.size();
 
-    // Build the full instance-desc array. The animated object's BLAS lives at
-    // a fixed GVA (EXPLICIT_DESTINATIONS), so this array is good for the life
-    // of the sample - only the TLAS BVH itself needs per-frame rebuild to
-    // pick up the animated BLAS's new root bounds.
-    // Per-instance flags + hit-group pick.
-    //
-    // FORCE_OPAQUE: set when neither baseline material nor any per-cluster
-    // checker override introduces translucency or refractivity - then the
-    // any-hit dispatch is skipped at traversal time.
-    //
-    // HIT GROUP: opaque-only instances use OpaqueHitGroup (no any-hit
-    // shader bound at all - cheapest possible closesthit path).
-    // Anything that may refract or translucently-reject goes to GlassHit-
-    // Group (closesthit handles full Fresnel + refraction; any-hit handles
-    // stochastic translucency).
-    //
-    // The two decisions share the same predicate ("does this instance
-    // EVER need refraction or translucency?") - if no, OpaqueHitGroup +
-    // FORCE_OPAQUE; if yes, GlassHitGroup + NONE.
-    auto needsGlass = [](const MaterialDesc& mat, const ClusterObject& obj) -> bool
-    {
-        if (mat.refractivity > 0.0f || mat.translucency > 0.0f)
-            return true;
-        if (obj.checker.enabled)
-        {
-            // Per-cluster checker override may introduce refractivity on
-            // a subset of clusters (e.g. sphere2: matte baseline + glass
-            // odd-parity tiles).  -1 sentinel = no override (keep baseline).
-            if (obj.checker.evenParity.overrideRefr > 0.0f) return true;
-            if (obj.checker.oddParity.overrideRefr  > 0.0f) return true;
-        }
-        return false;
-    };
-    // Matches the hit-group shader table layout in
-    // CreateRaytracingPipelineAndShaderTables: opaque block at offset 0,
-    // glass block at offset 2 (2 records per block: primary + shadow).
-    constexpr UINT kHitGroupContribOpaque = 0;
-    constexpr UINT kHitGroupContribGlass  = 2;
-
+    // Minimal TLAS for cube-only repro: one instance, opaque hit group,
+    // backface-cull-honouring (no double-sided), force-opaque (no any-hit).
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances(N_total);
-    UINT nOpaque = 0, nGlass = 0;
-    for (UINT i = 0; i < N_static; ++i)
+    for (UINT i = 0; i < N_total; ++i)
     {
         const auto& obj = m_objects[i];
         XMMATRIX rot = XMMatrixRotationRollPitchYaw(obj.worldRotEuler.x,
@@ -1779,94 +1590,12 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * rot
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
-        instances[i].InstanceID  = obj.instanceID;
-        // DEBUG ISOLATION (DebugIsolate::kIsolateTarget):
-        //   kIsolateNone -> every instance visible (normal scene)
-        //   otherwise    -> only the target instance (+ optionally the floor)
-        //                   has a non-zero mask; everything else is invisible
-        //                   to primary rays.
-        if (DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateNone ||
-            obj.instanceID == DebugIsolate::kIsolateTarget ||
-            (DebugIsolate::kKeepFloor && obj.instanceID == DebugIsolate::kIsolateFloor))
-            instances[i].InstanceMask= 0xFF;
-        else
-            instances[i].InstanceMask= 0x00;
-        // Hit-group contribution.  For multi-region objects we route
-        // by the FIRST region's material kind (geometryIndex 0 lands
-        // there with MultiplierForGeometryContributionToHitGroupIndex=2),
-        // and subsequent regions add Multiplier*GeomIdx to pick their
-        // own hit group automatically -- so the mixed sphere's chrome
-        // region (region 0, slot 0) lands at OpaqueHitGroup and its
-        // glass region (region 1, slot 3) lands at GlassHitGroup with
-        // NO per-pixel shader branch.
-        UINT firstRegionMatSlot = obj.perRegionMaterialSlot.empty()
-            ? obj.instanceID
-            : obj.perRegionMaterialSlot[0];
-        const bool firstIsGlass = needsGlass(m_materials[firstRegionMatSlot], obj);
-        // If this is a multi-region instance and ANY region is glass,
-        // we need any-hit (FORCE_OPAQUE would skip it).  Detect that
-        // separately from firstIsGlass for the FORCE_OPAQUE decision.
-        bool anyRegionIsGlass = firstIsGlass;
-        for (UINT r = 1; r < (UINT)obj.perRegionMaterialSlot.size(); ++r)
-        {
-            anyRegionIsGlass = anyRegionIsGlass ||
-                needsGlass(m_materials[obj.perRegionMaterialSlot[r]], obj);
-        }
-        instances[i].InstanceContributionToHitGroupIndex =
-            firstIsGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
-        instances[i].Flags = anyRegionIsGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
-                                              : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
-        const bool isGlass = anyRegionIsGlass;  // for stats below
-        // Non-orientable / self-intersecting surfaces need double-sided
-        // traversal: their triangle winding doesn't have a consistent
-        // global "outward" (Klein bottle's classic problem), and culling
-        // any "back-facing" triangles leaves visible holes along the
-        // orientation seam.  This per-instance flag overrides the ray's
-        // RAY_FLAG_CULL_BACK_FACING_TRIANGLES so only THIS instance pays
-        // the cost; orientable meshes (sphere, torus, cube, slab) keep
-        // their fast single-sided traversal.
-        if (m_objects[i].nonOrientable)
-            instances[i].Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
-        // Per-mode BLAS GVA: cluster path uses obj.blasGPUVA (built via
-        // BUILD_BLAS_FROM_CLAS); traditional path uses obj.tradBlasGPUVA
-        // (built via classic BuildRaytracingAccelerationStructure).
-        instances[i].AccelerationStructure =
-            (m_geometryMode == GeometryMode::Clusters) ? obj.blasGPUVA : obj.tradBlasGPUVA;
-        (isGlass ? nGlass : nOpaque)++;
+        instances[i].InstanceID                          = obj.instanceID;
+        instances[i].InstanceMask                        = 0xFF;
+        instances[i].InstanceContributionToHitGroupIndex = 0;
+        instances[i].Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        instances[i].AccelerationStructure               = obj.blasGPUVA;
     }
-    // Animated ball is included in both modes -- the cluster path
-    // references obj.blasGPUVA (BLAS-from-CLAS) while the traditional
-    // path references obj.tradBlasGPUVA (DXR1 BLAS rebuilt/refitted
-    // per frame from perFrameVertexBuffer + tradIndexBuffer).
-    const bool hasAnimInst = m_animatedObjectEnabled;
-    if (hasAnimInst)
-    {
-        const auto& a = m_animatedObject;
-        XMMATRIX m = XMMatrixScaling(a.worldScale, a.worldScale, a.worldScale)
-                   * XMMatrixTranslation(a.worldPos.x, a.worldPos.y, a.worldPos.z);
-        XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[N_static].Transform), m);
-        instances[N_static].InstanceID  = a.instanceID;
-        // DEBUG ISOLATION: see static loop above for semantics.
-        if (DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateNone ||
-            DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateAnimated)
-            instances[N_static].InstanceMask= 0xFF;
-        else
-            instances[N_static].InstanceMask= 0x00;
-        // Animated object has no ClusterObject scene config yet; treat by
-        // material only (currently refractive glass -> GlassHitGroup).
-        const auto& aMat = m_materials[a.instanceID];
-        const bool isGlass = (aMat.refractivity > 0.0f) || (aMat.translucency > 0.0f);
-        instances[N_static].InstanceContributionToHitGroupIndex =
-            isGlass ? kHitGroupContribGlass : kHitGroupContribOpaque;
-        instances[N_static].Flags = isGlass ? D3D12_RAYTRACING_INSTANCE_FLAG_NONE
-                                            : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
-        // Per-mode BLAS GVA for the animated instance.
-        instances[N_static].AccelerationStructure =
-            (m_geometryMode == GeometryMode::Clusters) ? a.blasGPUVA : a.tradBlasGPUVA;
-        (isGlass ? nGlass : nOpaque)++;
-    }
-    SampleLog::LogF(L"[hitgroups] %u opaque-instance(s) -> OpaqueHitGroup (no any-hit), "
-                    L"%u glass-instance(s) -> GlassHitGroup\n", nOpaque, nGlass);
     AllocateUploadBuffer(device, instances.data(), instances.size() * sizeof(instances[0]),
                          &m_tlasInstanceDescs, L"TLAS instance descs");
 
@@ -1879,8 +1608,8 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
     m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &prebuild);
-    SampleLog::LogF(L"[TLAS prebuild] %u instances (%u static + %u animated): result=%llu, scratch=%llu bytes\n",
-                    N_total, N_static, N_anim,
+    SampleLog::LogF(L"[TLAS prebuild] %u instances: result=%llu, scratch=%llu bytes\n",
+                    N_total,
                     (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
                     (unsigned long long)prebuild.ScratchDataSizeInBytes);
 

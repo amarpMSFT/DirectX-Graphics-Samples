@@ -61,14 +61,63 @@ d3dconfig device force-warp=false    # use the system's hardware adapter
 
 Currently exercised against:
 - **WARP**: works.
-- **NVIDIA preview driver**: works.
-
 ### Controls (placeholder for milestone 2+)
 
-| Key | Action                                                     |
-| --- | ---------------------------------------------------------- |
-| T   | Toggle templates+instantiate vs direct-CLAS rebuild        |
-| C   | Toggle ClusterID-color shading vs lit                      |
+### Runtime controls
+
+On-screen overlay (right column) lists the active value for each toggle.
+
+| Key      | Action                                                                                  |
+| -------- | --------------------------------------------------------------------------------------- |
+| `[T]`    | Geometry path: **clustered** ↔ **traditional** (DXR1 BLAS). Triggers static AS rebuild. |
+| `[A]`    | Cluster mode: cycle CLAS alloc strategy (`implicit-dest` → `get-sizes` → `compact`).    |
+|          | Trad mode: cycle BLAS alloc strategy (`implicit-dest` ↔ `compact`).                     |
+| `[V]`    | Vertex format: `FLOAT32_3` ↔ `COMPRESSED1` (shared-exponent quantized).                 |
+| `[F]`    | Trad mode: animated BLAS update strategy (`rebuild` ↔ `refit`).                         |
+| `[R]`    | Cluster mode: per-frame static-AS rebuild (`off` → `BLAS only` → `CLAS+BLAS`).          |
+| `[P]`    | Pause / resume animation.                                                               |
+| `[N]`    | Workload scaling — cycle extra clones (`0` → `100` → `1,000` → `10,000` → `0`).         |
+|          | Each clone gets its OWN CLAS array + BLAS (1:1 instance:BLAS), so toggling progressively |
+|          | stresses the CLAS/BLAS/template paths.  Clones spiral out from the floor in a           |
+|          | sunflower pattern; distance-based LOD swaps the source mesh for a lower-tessellation    |
+|          | variant as radius grows, so the back rings stay cheap.                                  |
+| `,` `.`  | Bounce slider — reflection + refraction depth (held +2 apart, range 0..5).              |
+| `[` `]`  | Vertex precision slider — fewer / more position bits (`FLOAT32_3` truncate-bits or      |
+|          | `COMPRESSED1` bits/component). Triggers full static rebuild on change.                  |
+
+### Headless / scripted runs
+
+`--screenshot-at <seconds> path.png --exit-after-frames <N>` renders headless,
+takes a screenshot, then quits. Useful for unattended visual diffs.
+
+`--at <seconds>:<action>` queues a runtime action that fires at the given
+wall-clock time. Combine multiple `--at` for scripted state sweeps. Actions:
+
+| Action               | Equivalent hotkey                          |
+| -------------------- | ------------------------------------------ |
+| `geom-clusters`      | `[T]` → clustered                          |
+| `geom-traditional`   | `[T]` → traditional                        |
+| `alloc-implicit`     | `[A]` in cluster mode → implicit-dest      |
+| `alloc-getsizes`     | `[A]` in cluster mode → get-sizes          |
+| `alloc-compact`      | `[A]` in cluster mode → compact            |
+| `trad-implicit`      | `[A]` in trad mode → implicit-dest         |
+| `trad-compact`       | `[A]` in trad mode → compact               |
+| `anim-rebuild`       | `[F]` → rebuild                            |
+| `anim-refit`         | `[F]` → refit                              |
+| `rebuild-none`       | `[R]` → off                                |
+| `rebuild-blas`       | `[R]` → BLAS only                          |
+| `rebuild-clas-blas`  | `[R]` → CLAS+BLAS                          |
+| `extra-none`         | `[N]` → 0                                  |
+| `extra-100`          | `[N]` → 100                                |
+| `extra-1k`           | `[N]` → 1,000                              |
+| `extra-10k`          | `[N]` → 10,000                             |
+
+### Window behavior
+
+On HW adapters the window launches maximized; on WARP / Basic Render it stays
+at the default 1280×720 since maximizing a CPU rasterizer to 4K would make
+each frame take seconds. Headless runs (any of the above CLI flags) also stay
+at 1280×720 so screenshot resolution is deterministic.
 | B   | Pause animation                                            |
 | S   | Toggle stats overlay (cluster sizes, build wallclocks)     |
 

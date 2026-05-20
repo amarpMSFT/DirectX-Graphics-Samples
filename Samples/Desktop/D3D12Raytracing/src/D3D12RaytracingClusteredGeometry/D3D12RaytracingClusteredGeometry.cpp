@@ -652,16 +652,17 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     // distribution.
     // Phase-2 anim clones: pool gets re-allocated by
     // BuildAnimatedClonesSetup() below if N_animClones > 0.  Reset
-    // here so the next BLAS-from-CLAS scratch sizing isn't carrying
     // forward an over-sized clone count.
     m_animClonesBlasPool.Reset();
     m_animClonesBlasArgsBuffer.Reset();
     m_animClonesBlasResultAddrBuffer.Reset();
     m_animClonesBlasScratchBuffer.Reset();
-    // BuildAnimatedClonesSetup() below if N_animClones > 0.  Reset
-    // here so the next BLAS-from-CLAS scratch sizing isn't carrying
-    // forward an over-sized clone count.
-    m_animClonesBlasPool.Reset();
+    // Trad-path VB+IB pools: re-allocated by BuildTraditionalStaticAS.
+    // Reset here so the next build starts from empty pools (sizes
+    // depend on the current clone count + LOD distribution).
+    m_tradVertexPool.Reset();
+    m_tradIndexPool.Reset();
+    m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalActualBytes  = 0;
     m_traditionalStaticTotalScratchBytes = 0;
@@ -2057,20 +2058,42 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
     // Per-object build info we accumulate in PASS A so PASS C can run
     // the actual BuildRaytracingAccelerationStructure into pre-allocated
     // pool slots instead of per-object CreateCommittedResource calls.
+    // Pass A also records per-object VB and IB BYTE OFFSETS into the
+    // shared trad VB/IB pools (allocated between PASS A and the geom-desc
+    // patch-up that finalises pool GVAs).
     struct PerObjInfo {
         std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs;
         UINT64 resultBytes  = 0;   // prebuild ResultDataMaxSizeInBytes
         UINT64 resultOffset = 0;   // running cumulative offset into the worst-case pool
         UINT64 scratchBytes = 0;
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags = (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS)0;
+        // Trad VB/IB pool slot offsets (vs the pool buffers'
+        // GetGPUVirtualAddress() base).  Used to finalise the per-region
+        // geom descs' VertexBuffer.StartAddress / IndexBuffer pointers
+        // once the pool buffers are allocated.
+        UINT64 vbOffset = 0;
+        UINT64 ibOffset = 0;
     };
     std::vector<PerObjInfo> info(m_objects.size());
 
     constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
     UINT64 maxScratchBytes = 0;
 
+    // Cumulative VB+IB pool data, built up during PASS A and uploaded as
+    // ONE committed UPLOAD resource each after the loop.  Replaces 2*N
+    // CreateCommittedResource calls (= 2*N driver round-trips at ~ms each)
+    // with 2 allocations + 2 memcpys.  At [N]=10K trad mode this is the
+    // single biggest startup-time saving on top of the existing BLAS pool:
+    // ~16 seconds of CreateCommittedResource overhead disappears.
+    std::vector<XMFLOAT3> poolVbData;
+    std::vector<UINT32>   poolIbData;
+    // Pre-allocate a reasonable hint (avoids quadratic-amortized
+    // reallocations during the loop's verts.size() push-backs).  Each
+    // object will adjust the actual sizes as it accumulates.
+    poolVbData.reserve(1024u * 1024u);   // 1M verts initial; grows on demand
+    poolIbData.reserve(2u * 1024u * 1024u); // 2M indices initial
+
     // -------- PASS A: per-object VB+IB + geom desc build + prebuild --------
-    // We allocate the per-object upload-heap VB+IB here (unavoidably
     // per-object since they hold distinct mesh data) but DON'T yet
     // allocate the BLAS or scratch -- those go into shared pools
     // built after this pass completes and we know per-obj prebuild
@@ -2142,10 +2165,20 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         obj.tradVertexCount   = (UINT)verts.size();
         obj.tradTriangleCount = (UINT)(idx32.size() / 3);
 
-        AllocateUploadBuffer(device, verts.data(), verts.size() * sizeof(XMFLOAT3),
-                             &obj.tradVertexBuffer, L"Traditional vertices (per-object, region-sorted)");
-        AllocateUploadBuffer(device, idx32.data(), idx32.size() * sizeof(UINT32),
-                             &obj.tradIndexBuffer,  L"Traditional indices (per-object, region-local)");
+
+        // Pool-mode: append this object's VB+IB data to the cumulative
+        // pool buffers, record the per-object byte offset, and clear the
+        // per-object ComPtrs (the pool owns the memory).  We'll allocate
+        // the actual UPLOAD-heap pool buffers + memcpy + finalise per-
+        // region GVAs after PASS A finishes.
+        info[oi].vbOffset = poolVbData.size() * sizeof(XMFLOAT3);
+        info[oi].ibOffset = poolIbData.size() * sizeof(UINT32);
+        poolVbData.insert(poolVbData.end(), verts.begin(), verts.end());
+        poolIbData.insert(poolIbData.end(), idx32.begin(), idx32.end());
+        obj.tradVertexBuffer.Reset();   // pool owns the memory; per-obj GVA via obj.tradVbGPUVA set below
+        obj.tradIndexBuffer.Reset();
+        obj.tradVbGPUVA = 0;            // patched in after pool allocation
+        obj.tradIbGPUVA = 0;
         totalVbBytes += verts.size() * sizeof(XMFLOAT3);
         totalIbBytes += idx32.size() * sizeof(UINT32);
 
@@ -2176,8 +2209,11 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
              obj.checker.oddParity.overrideRefr  > 0.0f);
 
         std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs(regions.size());
-        const auto vbGVA = obj.tradVertexBuffer->GetGPUVirtualAddress();
-        const auto ibGVA = obj.tradIndexBuffer->GetGPUVirtualAddress();
+        // Geom descs use PLACEHOLDER addresses (= per-object pool byte
+        // offset only); they get patched up with the actual pool-base GVA
+        // after the trad VB/IB pools are allocated below.
+        const D3D12_GPU_VIRTUAL_ADDRESS vbPlaceholder = info[oi].vbOffset;
+        const D3D12_GPU_VIRTUAL_ADDRESS ibPlaceholder = info[oi].ibOffset;
         for (size_t gi = 0; gi < regions.size(); ++gi)
         {
             const auto& rg = regions[gi];
@@ -2192,16 +2228,15 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
             const auto geomFlag = regionIsOpaqueLike
                 ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
                 : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-
             auto& gd = geomDescs[gi];
             gd.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
             gd.Flags = geomFlag;
             gd.Triangles.IndexFormat                 = DXGI_FORMAT_R32_UINT;
             gd.Triangles.IndexCount                  = rg.triCount * 3;
-            gd.Triangles.IndexBuffer                 = ibGVA + (UINT64)rg.firstTri * 3u * sizeof(UINT32);
+            gd.Triangles.IndexBuffer                 = ibPlaceholder + (UINT64)rg.firstTri * 3u * sizeof(UINT32);
             gd.Triangles.VertexFormat                = DXGI_FORMAT_R32G32B32_FLOAT;
             gd.Triangles.VertexCount                 = rg.vertCount;
-            gd.Triangles.VertexBuffer.StartAddress   = vbGVA + (UINT64)rg.firstVbIdx * sizeof(XMFLOAT3);
+            gd.Triangles.VertexBuffer.StartAddress   = vbPlaceholder + (UINT64)rg.firstVbIdx * sizeof(XMFLOAT3);
             gd.Triangles.VertexBuffer.StrideInBytes  = sizeof(XMFLOAT3);
         }
         totalGeomDescs += (UINT)geomDescs.size();
@@ -2241,6 +2276,50 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 
         obj.tradBlasResultBytes   = prebuild.ResultDataMaxSizeInBytes;
         obj.tradBlasScratchBytes  = prebuild.ScratchDataSizeInBytes;
+    }
+
+    // -------- PASS A.5: allocate trad VB/IB pools, upload, finalise GVAs --------
+    // Now that we know the total VB+IB byte counts (computed via the
+    // poolVbData/poolIbData accumulators in PASS A), allocate the two
+    // UPLOAD-heap pool buffers in ONE shot each and memcpy the
+    // accumulated data in.  Per-object geom descs were emitted with
+    // PLACEHOLDER addresses (= per-object byte offset only); patch them
+    // up here by adding the pool-base GVA.
+    if (!poolVbData.empty())
+    {
+        const UINT64 vbBytes = poolVbData.size() * sizeof(XMFLOAT3);
+        const UINT64 ibBytes = poolIbData.size() * sizeof(UINT32);
+        AllocateUploadBuffer(device, poolVbData.data(), vbBytes,
+                             &m_tradVertexPool,
+                             L"Traditional VB pool (all static objects)");
+        AllocateUploadBuffer(device, poolIbData.data(), ibBytes,
+                             &m_tradIndexPool,
+                             L"Traditional IB pool (all static objects)");
+        const D3D12_GPU_VIRTUAL_ADDRESS vbBase = m_tradVertexPool->GetGPUVirtualAddress();
+        const D3D12_GPU_VIRTUAL_ADDRESS ibBase = m_tradIndexPool->GetGPUVirtualAddress();
+        for (size_t oi = 0; oi < m_objects.size(); ++oi)
+        {
+            auto& obj = m_objects[oi];
+            obj.tradVbGPUVA = vbBase + info[oi].vbOffset;
+            obj.tradIbGPUVA = ibBase + info[oi].ibOffset;
+            // Patch each geom desc -- its VertexBuffer.StartAddress and
+            // IndexBuffer currently hold the OFFSET only (placeholders
+            // from PASS A); add the pool base GVA in place.
+            for (auto& gd : info[oi].geomDescs)
+            {
+                gd.Triangles.VertexBuffer.StartAddress += vbBase;
+                gd.Triangles.IndexBuffer               += ibBase;
+            }
+        }
+        SampleLog::LogF(L"[traditional VB+IB pool] %.2f MB VB + %.2f MB IB "
+                        L"(was %u per-object CreateCommittedResource pairs)\n",
+                        vbBytes / (1024.0 * 1024.0),
+                        ibBytes / (1024.0 * 1024.0),
+                        (unsigned)m_objects.size());
+
+        // Free the CPU-side scratch -- the pool buffers now own the data.
+        poolVbData = std::vector<XMFLOAT3>{};
+        poolIbData = std::vector<UINT32>{};
     }
 
     // -------- PASS B: allocate worst-case BLAS pool + shared scratch --------
@@ -5511,9 +5590,12 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_blasArgsMeta.Reset();
     m_blasResultAddrBuffer.Reset();
     m_clusterBlasPoolBuffer.Reset();
-    m_tradBlasWorstcasePool.Reset();
     m_tradBlasCompactPool.Reset();
     m_tradBlasSharedScratch.Reset();
+    // Trad VB+IB pools (introduced together with the per-clone BLAS pool).
+    m_tradVertexPool.Reset();
+    m_tradIndexPool.Reset();
+    m_animClonesBlasPool.Reset();
     m_animClonesBlasPool.Reset();
     m_tlasBuffer.Reset();
     m_tlasScratchBuffer.Reset();

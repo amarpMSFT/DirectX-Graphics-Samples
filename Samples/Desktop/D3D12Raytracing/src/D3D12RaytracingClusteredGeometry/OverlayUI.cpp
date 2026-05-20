@@ -165,6 +165,11 @@ void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
             if (obj.tradVertexBuffer) tradVbSum += obj.tradVertexBuffer->GetDesc().Width;
             if (obj.tradIndexBuffer)  tradIbSum += obj.tradIndexBuffer->GetDesc().Width;
         }
+        // Add pool-owned sizes too -- when per-obj VB/IB live in the
+        // shared trad VB/IB pools (m_tradVertexPool / m_tradIndexPool)
+        // their ComPtrs above are null, so we'd otherwise undercount.
+        if (m_tradVertexPool)  tradVbSum += m_tradVertexPool->GetDesc().Width;
+        if (m_tradIndexPool)   tradIbSum += m_tradIndexPool->GetDesc().Width;
         s.traditionalVbBytes          = tradVbSum;
         s.traditionalIbBytes          = tradIbSum;
         s.traditionalBuildMs          = m_traditionalStaticBuildMs;

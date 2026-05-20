@@ -117,21 +117,18 @@ D3D12RaytracingClusteredGeometry::D3D12RaytracingClusteredGeometry(UINT width, U
 
 void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc)
 {
+    // Minimal CLI for COMPRESSED1 repro.  Only --vertex-format and
+    // --screenshot-at / --exit-after-frames remain.  All other flags
+    // (alloc mode, geometry mode, rebuild mode, log-pf-every, --at
+    // scheduled actions, aa-samples, compressed-bits, cluster-tint,
+    // position-truncate, trad-alloc) stripped together with the code
+    // paths they used to drive.
     DXSample::ParseCommandLineArgs(argv, argc);
     for (int i = 1; i < argc; i++)
     {
-        if (_wcsicmp(argv[i], L"--screenshot") == 0 && i + 2 < argc)
+        if (_wcsicmp(argv[i], L"--screenshot-at") == 0 && i + 2 < argc)
         {
-            m_screenshotFrame = _wtoi(argv[i + 1]);
-            m_screenshotPath  = argv[i + 2];
-            i += 2;
-        }
-        else if (_wcsicmp(argv[i], L"--screenshot-at") == 0 && i + 2 < argc)
-        {
-            // --screenshot-at <seconds> <path> : jump m_animSeconds to <seconds>
-            // on frame 0 and capture once the swap chain has warmed up. Useful
-            // for verifying the time-based camera orbit at known angles
-            // (orbit period is 30s).
+            // --screenshot-at <seconds> <path>: capture once warmed up.
             m_screenshotAtSeconds = _wtof(argv[i + 1]);
             m_screenshotPath      = argv[i + 2];
             i += 2;
@@ -142,141 +139,10 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             else if (_wcsicmp(argv[i+1], L"compressed") == 0) m_vertexMode = VertexMode::Compressed1;
             i += 1;
         }
-        else if (_wcsicmp(argv[i], L"--clas-alloc") == 0 && i + 1 < argc)
-        {
-            // CLAS memory-allocation strategy. See ClasAllocMode in the header for
-            // the contract of each mode; the [CLAS mem] log line at init time
-            // reports the stats that change between them.
-            if      (_wcsicmp(argv[i+1], L"implicit")  == 0) m_clasAllocMode = ClasAllocMode::Implicit;
-            else if (_wcsicmp(argv[i+1], L"get-sizes") == 0) m_clasAllocMode = ClasAllocMode::GetSizes;
-            else if (_wcsicmp(argv[i+1], L"compact")   == 0) m_clasAllocMode = ClasAllocMode::Compact;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--position-truncate") == 0 && i + 1 < argc)
-        {
-            // FLOAT32_3 mode only - clamp the per-vertex position mantissa to
-            // 23-N bits by zeroing the low N. Range 0 (full precision, default)
-            // to 22 (only sign+exponent kept). Sweet spot for sub-mm scenes is
-            // 8-12. Ignored under --vertex-format compressed.
-            int n = _wtoi(argv[i+1]);
-            if (n < 0)  n = 0;
-            if (n > 22) n = 22;
-            m_positionTruncateBits = (UINT)n;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--geometry-mode") == 0 && i + 1 < argc)
-        {
-            // [T] runtime toggle, set from CLI for headless / scripted runs.
-            //   clusters    - DXR2 cluster-based BLAS (default)
-            //   traditional - classic DXR1 per-object monolithic BLAS
-            if      (_wcsicmp(argv[i+1], L"clusters")    == 0) m_geometryMode = GeometryMode::Clusters;
-            else if (_wcsicmp(argv[i+1], L"traditional") == 0) m_geometryMode = GeometryMode::Traditional;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--trad-alloc") == 0 && i + 1 < argc)
-        {
-            // [A] runtime toggle in traditional mode, set from CLI.  Mirrors
-            // the cluster path's --clas-alloc but two-mode instead of three.
-            if      (_wcsicmp(argv[i+1], L"implicit") == 0) m_traditionalAllocMode = TraditionalAllocMode::Implicit;
-            else if (_wcsicmp(argv[i+1], L"compact")  == 0) m_traditionalAllocMode = TraditionalAllocMode::Compact;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--rebuild-mode") == 0 && i + 1 < argc)
-        {
-            // Per-frame static-AS rebuild mode = [R] runtime toggle, set from CLI
-            // for headless / scripted measurement runs.
-            //   none      - off (default)
-            //   blas      - re-run BUILD_BLAS_FROM_CLAS every frame
-            //   clas-blas - re-run static CLAS + BLAS every frame (CLAS only
-            //               actually runs in --clas-alloc implicit)
-            if      (_wcsicmp(argv[i+1], L"none")      == 0) m_staticRebuildMode = StaticRebuildMode::None;
-            else if (_wcsicmp(argv[i+1], L"blas")      == 0) m_staticRebuildMode = StaticRebuildMode::BlasOnly;
-            else if (_wcsicmp(argv[i+1], L"clas-blas") == 0) m_staticRebuildMode = StaticRebuildMode::ClasAndBlas;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--log-pf-every") == 0 && i + 1 < argc)
-        {
-            // Every N frames, dump the per-frame timing EMA values (animated
-            // INSTANTIATE / animated BLAS / TLAS / static BLAS / static CLAS)
-            // to the SampleLog so a wrapper script can scrape them.  0 disables.
-            int n = _wtoi(argv[i+1]);
-            m_logPfEveryFrames = (UINT)std::max(0, n);
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--log-raw-every") == 0 && i + 1 < argc)
-        {
-            // Every N frames, dump the RAW (un-smoothed) per-frame timestamp
-            // deltas, not the EMA.  Useful for catching transients the EMA
-            // smooths away.  0 disables.
-            int n = _wtoi(argv[i+1]);
-            m_logRawPfEveryFrames = (UINT)std::max(0, n);
-            i += 1;
-        }
         else if (_wcsicmp(argv[i], L"--exit-after-frames") == 0 && i + 1 < argc)
         {
-            // Quit cleanly after rendering N frames (post-init).  Headless
-            // measurement helper -- pair with --log-pf-every to capture a
-            // settled timing run and exit.
             int n = _wtoi(argv[i+1]);
             m_exitAfterFrames = (UINT)std::max(0, n);
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--at") == 0 && i + 1 < argc)
-        {
-            // Schedule an action to fire at a specific frame.  Format:
-            //   --at <frame>:<action>
-            // where action is one of:
-            //   alloc-implicit / alloc-getsizes / alloc-compact   (=> [A] press)
-            //   rebuild-none / rebuild-blas / rebuild-clas-blas  (=> [R] press)
-            //   log    -- snapshot all 5 per-frame timing values to SampleLog
-            //   exit   -- post WM_QUIT
-            // Multiple --at args allowed; executed in order at OnRender time.
-            // Frame indices are 0-based and reference m_framesRendered AFTER init.
-            std::wstring spec = argv[i+1];
-            auto colon = spec.find(L':');
-            if (colon != std::wstring::npos)
-            {
-                ScheduledAction a;
-                a.frame  = (UINT)_wtoi(spec.substr(0, colon).c_str());
-                a.action = spec.substr(colon + 1);
-                m_scheduledActions.push_back(std::move(a));
-            }
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--compressed-bits") == 0 && i + 1 < argc)
-        {
-            // COMPRESSED1 mode only - bits per component for the shared-exponent
-            // quantizer. Range 1 (extreme - 1 bit each axis) to 16 (max).
-            // Same value the [/] runtime slider drives.  Ignored under
-            // --vertex-format float.
-            int n = _wtoi(argv[i+1]);
-            if (n < 1)  n = 1;
-            if (n > 16) n = 16;
-            m_compressedBitsPerComponent = (UINT)n;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--aa-samples") == 0 && i + 1 < argc)
-        {
-            // Anti-aliasing samples per pixel.  The raygen shader traces N
-            // jittered primary rays per pixel and averages.  N must be 1,
-            // 2, or 4 (clamped to nearest valid).  Default is 4.
-            int n = _wtoi(argv[i+1]);
-            if (n <= 1) n = 1;
-            else if (n <= 2) n = 2;
-            else n = 4;
-            m_aaSamplesPerPixel = (UINT)n;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--cluster-tint") == 0 && i + 1 < argc)
-        {
-            // Cluster-rainbow tint blend in [0..1].  0 = pure material
-            // colour; 1 = original "cluster rainbow dominates everything"
-            // look.  Default 0.3 leaves a visible hint of cluster
-            // boundaries without overpowering the material palette.
-            float t = (float)_wtof(argv[i+1]);
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            m_clusterTint = t;
             i += 1;
         }
     }
@@ -3171,8 +3037,7 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     if (!m_deviceResources->IsWindowVisible()) return;
 
     // For --screenshot-at <seconds>, advance the animation clock straight to
-    // the requested timestamp on the first rendered frame (so the orbit camera
-    // is at the right angle when we capture).
+    // the requested timestamp on the first rendered frame.
     if (m_screenshotAtSeconds >= 0 && !m_screenshotTaken && m_framesRendered == 0)
     {
         m_animSeconds = m_screenshotAtSeconds;
@@ -3182,106 +3047,14 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     DoRender();
     ++m_framesRendered;
 
-    // ---- Headless measurement helpers (--log-pf-every / --exit-after-frames /
-    // --at).  Driven off m_framesRendered, executed once per OnRender, all
-    // logged via SampleLog::LogF so a wrapper script can scrape them.
-    if (m_logPfEveryFrames > 0 && (m_framesRendered % m_logPfEveryFrames) == 0)
-    {
-        SampleLog::LogF(L"[pf-stats frame=%u alloc=%ls rebuild=%ls] "
-                        L"inst=%.3fus animBlas=%.3fus tlas=%.3fus "
-                        L"staticBlas=%.3fus staticClas=%.3fus\n",
-                        m_framesRendered, ClasAllocModeName(), StaticRebuildModeName(),
-                        m_pfInstantiateMs * 1000.0, m_pfBlasRebuildMs * 1000.0,
-                        m_pfTlasRebuildMs   * 1000.0,
-                        m_pfStaticBlasMs    * 1000.0,
-                        m_pfStaticClasMs    * 1000.0);
-    }
-    for (size_t i = 0; i < m_scheduledActions.size(); )
-    {
-        const auto& a = m_scheduledActions[i];
-        if (a.frame == m_framesRendered)
-        {
-            const wchar_t* act = a.action.c_str();
-            SampleLog::LogF(L"[scheduled frame=%u] action=%ls\n", m_framesRendered, act);
-            if      (_wcsicmp(act, L"alloc-implicit")    == 0)
-            {   m_clasAllocMode = ClasAllocMode::Implicit;
-                RebuildStaticAccelerationStructures(L"scheduled alloc-implicit"); }
-            else if (_wcsicmp(act, L"alloc-getsizes")    == 0)
-            {   m_clasAllocMode = ClasAllocMode::GetSizes;
-                RebuildStaticAccelerationStructures(L"scheduled alloc-getsizes"); }
-            else if (_wcsicmp(act, L"alloc-compact")     == 0)
-            {   m_clasAllocMode = ClasAllocMode::Compact;
-                RebuildStaticAccelerationStructures(L"scheduled alloc-compact"); }
-            else if (_wcsicmp(act, L"rebuild-none")      == 0)
-            {   m_staticRebuildMode = StaticRebuildMode::None;
-                CaptureOverlayStatsSnapshot(); }
-            else if (_wcsicmp(act, L"rebuild-blas")      == 0)
-            {   m_staticRebuildMode = StaticRebuildMode::BlasOnly;
-                CaptureOverlayStatsSnapshot(); }
-            else if (_wcsicmp(act, L"rebuild-clas-blas") == 0)
-            {   m_staticRebuildMode = StaticRebuildMode::ClasAndBlas;
-                CaptureOverlayStatsSnapshot(); }
-            else if (_wcsicmp(act, L"geom-clusters")     == 0)
-            {   if (m_clustersAndPtlasSupported) {
-                    m_geometryMode = GeometryMode::Clusters;
-                    RebuildStaticAccelerationStructures(L"scheduled geom-clusters"); } }
-            else if (_wcsicmp(act, L"geom-traditional")  == 0)
-            {   m_geometryMode = GeometryMode::Traditional;
-                RebuildStaticAccelerationStructures(L"scheduled geom-traditional"); }
-            else if (_wcsicmp(act, L"trad-implicit")     == 0)
-            {   m_traditionalAllocMode = TraditionalAllocMode::Implicit;
-                RebuildStaticAccelerationStructures(L"scheduled trad-implicit"); }
-            else if (_wcsicmp(act, L"trad-compact")      == 0)
-            {   m_traditionalAllocMode = TraditionalAllocMode::Compact;
-                RebuildStaticAccelerationStructures(L"scheduled trad-compact"); }
-            else if (_wcsicmp(act, L"anim-rebuild")      == 0)
-            {   m_traditionalAnimMode = TraditionalAnimMode::Rebuild;
-                CaptureOverlayStatsSnapshot(); }
-            else if (_wcsicmp(act, L"anim-refit")        == 0)
-            {   m_traditionalAnimMode = TraditionalAnimMode::Refit;
-                CaptureOverlayStatsSnapshot(); }
-            else if (_wcsicmp(act, L"log")               == 0)
-            {   SampleLog::LogF(L"[scheduled-snap frame=%u alloc=%ls rebuild=%ls] "
-                                L"inst=%.3fus animBlas=%.3fus tlas=%.3fus "
-                                L"staticBlas=%.3fus staticClas=%.3fus\n",
-                                m_framesRendered, ClasAllocModeName(), StaticRebuildModeName(),
-                                m_pfInstantiateMs * 1000.0, m_pfBlasRebuildMs * 1000.0,
-                                m_pfTlasRebuildMs   * 1000.0,
-                                m_pfStaticBlasMs    * 1000.0,
-                                m_pfStaticClasMs    * 1000.0); }
-            else if (_wcsicmp(act, L"exit")              == 0)
-            {   PostQuitMessage(0); return; }
-            // Remove fired action so it doesn't refire.
-            m_scheduledActions.erase(m_scheduledActions.begin() + i);
-        }
-        else
-        {
-            ++i;
-        }
-    }
     if (m_exitAfterFrames > 0 && m_framesRendered >= m_exitAfterFrames)
     {
         PostQuitMessage(0);
         return;
     }
-    // ----
 
-    bool capture = false;
-    if (m_screenshotFrame >= 0 && (UINT)m_screenshotFrame < m_framesRendered && !m_screenshotTaken)
-        capture = true;
-    // Wait a few frames for swap chain warm-up before time-based capture too.
-    // Need at least kPerFrameRingSlots * 2 + 5 frames to also get stable
-    // per-frame timestamp EMA reads in the log on shutdown (otherwise the
-    // ring buffer hasn't filled yet).  Pump up to m_pfSnapTargetCount + a
-    // bit so the rolling per-frame snap window has actually completed when
-    // we capture -- so screenshots after a config-change toggle show real
-    // post-toggle numbers, not the "recalculating..." placeholder we
-    // display during the ~1 s settle.  Old behaviour was a hardcoded
-    // frame 15 which exited too early on toggle-tests.
+    // Time-based screenshot capture: wait ~80 frames for swap chain warm-up.
     if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 80 && !m_screenshotTaken)
-        capture = true;
-
-    if (capture)
     {
         m_screenshotTaken = true;
         CaptureBackBufferToFile(m_screenshotPath);

@@ -407,49 +407,24 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone placement.
+            // Animated clone: lives in the SAME spiral as the static
+            // clones (every 5th slot in the cycle is the anim variant).
+            // Same spiralPos, same per-clone random scale, no random
+            // rotation (so the wave deformation reads the same way on
+            // every clone, matching the source ball's silhouette).
             //
-            // Constraints (from camera setup -- D3D12RaytracingClusteredGeometry.cpp
-            // UpdateSceneConstantBuffer):
-            //   * Camera orbits radius 3.5..6.5 around origin, eye height 1.5.
-            //   * Camera looks at (0.5, 0, 0), so visible y range at typical
-            //     view distance is roughly y=-3..+3.  y>4 is above the FOV.
-            //   * Source animated ball at (0, 1.10, 0), worldScale 1.0, mesh
-            //     radius 1.0, wobble envelope 1.3 -> deformed silhouette ~1.3.
-            //
-            // Place 20 clones on a ring at radius 3 (just outside source's
-            // deformed envelope), y=2.0 (above source's centre, inside FOV),
-            // 18deg apart -- so they form a clearly-visible halo of 20 small
-            // wave-deformed balls AROUND the central animated ball.  Each
-            // clone scale=0.4 so they don't overlap each other (ring
-            // circumference 6pi=18.85 / 20 = ~0.94 between centres; 0.4
-            // scale = 0.4 diameter ~ 0.8 silhouette with wobble; gap ~0.14).
-            const float kRingR    = 5.0f;
-            const float kRingY    = 2.0f;
-            const float kRingStep = 0.314159265f;   // 18 deg in radians
-            const UINT  k         = (UINT)m_animatedClones.size();
-            const float ang       = k * kRingStep;
+            // Material: sentinel 0xFFFFFFFFu => inherit source's per-
+            // cluster checker (material slot 7 chrome+glass) so each
+            // clone looks just like the central animated ball, just at
+            // a different position.  Anim clones thus appear as
+            // ~20-of-100 spheres in the spiral that visibly wave the
+            // same way as the central source ball.
             AnimatedCloneInstance ac;
-            ac.worldPos             = DirectX::XMFLOAT3(
-                kRingR * cosf(ang),
-                kRingY,
-                kRingR * sinf(ang));
+            ac.worldPos             = spiralPos;
             ac.worldRotEuler        = DirectX::XMFLOAT3(0.f, 0.f, 0.f);
-            ac.worldScale           = 0.6f;
-            // Material slot 3 = "warm metal" (35% reflection, no refraction).
-            // Distinctly different from source slot 7 (chrome + 70% refraction)
-            // so the clones POP visually instead of merging with the central
-            // source ball's chrome+glass checker.  Per-cluster overrides
-            // (overrideRefl/overrideRefr from source's checker pattern) still
-            // apply on top, so each clone gets a checker pattern -- but the
-            // BASE colour is warm metal orange-brown, clearly distinct.
-            ac.materialOverrideSlot = 3u;
+            ac.worldScale           = randScale;
+            ac.materialOverrideSlot = 0xFFFFFFFFu;
             m_animatedClones.push_back(ac);
-            // ⚠ DIAGNOSTIC LOGGING
-            if (k < 5) {
-                SampleLog::LogF(L"[anim-clone-place] k=%u ang=%.2fdeg pos=(%.2f,%.2f,%.2f) scale=%.2f\n",
-                                k, ang * 180.0f / 3.14159265f, ac.worldPos.x, ac.worldPos.y, ac.worldPos.z, ac.worldScale);
-            }
             continue;
         }
 

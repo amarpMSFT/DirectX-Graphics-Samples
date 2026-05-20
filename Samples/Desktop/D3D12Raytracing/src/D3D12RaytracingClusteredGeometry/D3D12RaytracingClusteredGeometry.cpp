@@ -1135,9 +1135,20 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // 100 instances should stay the same when 1000 are drawn -- just
     // more in the distance") so the spiral's position for clone i
     // depends ONLY on i, not on the active N.  Toggling 100 -> 1K
-    const float kRadialSpacing  = 1.5f;
-    // Height curve: LINEAR in (radius - innerRadius).
-    // Sqrt tapered off at the far end (exactly the wrong shape for
+    // -> 10K extends the spiral outward without reshuffling the
+    // existing clones.
+    //
+    // Density tuned tighter (1.0 area-equivalent vs old 1.5) per user
+    // feedback "near objects should be more closely packed" -- inner
+    // clones land at smaller (radius - innerR) so the per-clone
+    // annulus area drops from ~7 sq units to ~3 sq units, doubling
+    // density everywhere.
+    const float kRadialSpacing  = 1.0f;
+    // Jitter scale per-clone to break the visible Vogel-spiral arms
+    // (user feedback "can see curves of empty space radiating out").
+    // Random ±15% of spacing on radius + ±15% of golden angle on
+    // azimuth defeats the regularity without letting clones overlap.
+    const float kSpiralJitterFrac = 0.30f;  // applied as ±0.5 * frac scale
     // stadium-seating visibility -- distant clones got squeezed
     // into a narrow horizon band by perspective AND had less world
     // y-rise to compensate).  Linear keeps the per-radius-unit
@@ -1205,25 +1216,6 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     {
         const UINT cycleSlot = i % srcPoolSize;
 
-        // Spiral placement: shared between static + anim clones.
-        // Radius formula is the proper Vogel/sunflower spiral:
-        // r = sqrt(innerR^2 + i * spacing^2).  This grows r^2
-        // linearly with i so each clone gets exactly the same
-        // annulus area (= pi * spacing^2 ~= 7 sq units), giving
-        // CONSTANT density throughout the spiral.  The previous
-        // r = innerR + sqrt(i)*spacing formula made inner clones
-        // sparser than outer (per user feedback "first ring is too
-        // sparse, gets nicely dense only at a distance") because
-        // each outer annulus is bigger per dR.  Height is sqrt of
-        const float angle    = (float)i * kGoldenAngleRad;
-        const float radius   = sqrtf(kInnerRadius * kInnerRadius
-                                     + (float)i * kRadialSpacing * kRadialSpacing);
-        const float heightY  = kInnerY + std::max(0.0f, radius - kInnerRadius) * kHeightLinearMul;
-        const DirectX::XMFLOAT3 spiralPos = {
-            radius * cosf(angle),
-            heightY,
-            radius * sinf(angle)
-        };
         // Per-clone RNG keyed by i.  Hash-mix the index with the base
         // seed using a Wang-style mixer so neighboring i's produce
         // visually-uncorrelated random values (a raw `seed ^ i` would
@@ -1233,6 +1225,32 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         mixed = ((mixed >> 16) ^ mixed) * 0x119DE1F3u;
         mixed =  (mixed >> 16) ^ mixed;
         std::mt19937 perCloneRng(mixed);
+
+        // Spiral placement: Vogel/sunflower base with per-clone jitter
+        // to break the periodic spiral arms.  Radius formula
+        //   r = sqrt(innerR^2 + i * spacing^2)
+        // grows r^2 linearly with i so each clone gets the SAME
+        // annulus area (= pi * spacing^2 ~= 3 sq units at spacing
+        // 1.0), giving constant density throughout the spiral.  The
+        // jitter on angle + radius defeats the visible Vogel spiral
+        // curves that radiate out as empty space (artifact of the
+        // golden-angle's regularity) without disturbing the overall
+        // density.  Height is linear in (radius - innerR) so back
+        // rings get enough world y-rise to project above the near
+        // rings after perspective compression.
+        std::uniform_real_distribution<float> jitterDist(-0.5f, 0.5f);
+        const float angleJitter   = jitterDist(perCloneRng) * kGoldenAngleRad * kSpiralJitterFrac;
+        const float radiusJitter  = jitterDist(perCloneRng) * kRadialSpacing  * kSpiralJitterFrac;
+        const float angle    = (float)i * kGoldenAngleRad + angleJitter;
+        const float radiusBase = sqrtf(kInnerRadius * kInnerRadius
+                                       + (float)i * kRadialSpacing * kRadialSpacing);
+        const float radius   = std::max(kInnerRadius, radiusBase + radiusJitter);
+        const float heightY  = kInnerY + std::max(0.0f, radius - kInnerRadius) * kHeightLinearMul;
+        const DirectX::XMFLOAT3 spiralPos = {
+            radius * cosf(angle),
+            heightY,
+            radius * sinf(angle)
+        };
         const DirectX::XMFLOAT3 randRot = { rotDist(perCloneRng), rotDist(perCloneRng), rotDist(perCloneRng) };
         const float             randScale = scaleDist(perCloneRng);
         const UINT              randMatSlot = matSlotDist(perCloneRng);

@@ -1490,6 +1490,11 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     m_tradBlasWorstcasePool.Reset();
     m_tradBlasCompactPool.Reset();
     m_tradBlasSharedScratch.Reset();
+    // Phase-2 anim clones: pool gets re-allocated by
+    // BuildAnimatedClonesSetup() below if N_animClones > 0.  Reset
+    // here so the next BLAS-from-CLAS scratch sizing isn't carrying
+    // forward an over-sized clone count.
+    m_animClonesBlasPool.Reset();
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalActualBytes  = 0;
     m_traditionalStaticTotalScratchBytes = 0;
@@ -1515,6 +1520,9 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
         if (m_animatedObjectEnabled)
         {
             BuildAnimatedObjectSetup();
+            // Phase-2 anim clones: extend the source's per-frame
+            // BLAS-from-CLAS op to produce per-clone BLASes too.
+            BuildAnimatedClonesSetup();
             UpdateAnimatedObjectPerFrame();
         }
     }
@@ -4243,6 +4251,128 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 }
 
 // =====================================================================================
+// Phase-2 anim-clones setup: after the source animated object's per-frame
+// pipeline is built, allocate the per-clone BLAS pool and rewrite the
+// source's per-frame BLAS args + dest arrays so the existing per-frame
+// BUILD_BLAS_FROM_CLAS op produces 1 + N_animClones BLASes in one batched
+// call (source + every clone).
+//
+// Anim clones share the source's per-frame CLAS results (same per-cluster
+// GVAs in obj.perFrameClasAddressArray) -- this stresses the BLAS-from-CLAS
+// path per-clone WITHOUT multiplying the INSTANTIATE work.  At 10K total
+// extras the cycle yields ~2000 anim clones -> 2001 per-frame BLAS builds
+// (2K * ~50us GPU = ~100ms = the bulk of the per-frame budget) on top of
+// the single source CLAS pass that all of them ride.
+//
+// Each clone's BLAS lands at m_animClonesBlasPool + (cloneIdx * perBlasSize)
+// where perBlasSize = prebuild ResultDataMaxSizeInBytes rounded up to RTAS
+// alignment.  Pool sized at (N_animClones * perBlasSize); allocated as ONE
+// committed resource so we don't pay 2000+ CreateCommittedResource calls
+// at clone-gen time (same trick as the static BLAS pool).
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesSetup()
+{
+    // Cluster mode only for phase 2 (trad-mode anim clones still share
+    // source BLAS as in phase 1; per-frame DXR1-rebuild-per-clone would
+    // need a separate refactor of UpdateAnimatedTradPerFrame).
+    if (m_geometryMode != GeometryMode::Clusters) return;
+    if (m_animatedClones.empty()) return;
+    if (!m_animatedObjectEnabled) return;
+
+    auto device   = m_deviceResources->GetD3DDevice();
+    auto& obj     = m_animatedObject;
+    const UINT N  = (UINT)m_animatedClones.size();
+    const UINT M  = N + 1;  // 1 source + N clones
+
+    // Recompute the per-clone BLAS size via prebuild for the source's
+    // cluster count (every clone reads the source's CLAS array so each
+    // clone's BLAS has the same MaxClasCountPerArg = obj.clusterCount).
+    D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
+    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.MaxArgCount        = 1;
+    blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+    blasDesc.MaxTotalClasCount  = obj.clusterCount;
+    blasDesc.MaxClasCountPerArg = obj.clusterCount;
+    D3D12_RTAS_OPERATION_INPUTS opIn = {};
+    opIn.Type      = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
+    opIn.pClasDesc = &blasDesc;
+    D3D12_RTAS_OPERATION_PREBUILD_INFO pb = {};
+    m_dxr2Device->GetRTASOperationPrebuildInfo(&opIn, &pb);
+
+    constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
+    const UINT64 perBlasBytes = (pb.ResultDataMaxSizeInBytes + kAlign - 1) & ~(kAlign - 1);
+    const UINT64 poolBytes    = perBlasBytes * (UINT64)N;
+
+    // Allocate the clone BLAS pool in one shot.  Per-clone BLAS GVA is
+    // poolBase + (cloneIdx * perBlasBytes); BuildTlasClassic reads
+    // clone.blasGPUVA and bakes it into the per-clone TLAS instance row.
+    AllocateUAVBuffer(device, poolBytes, &m_animClonesBlasPool,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"Animated clones BLAS pool");
+    const D3D12_GPU_VIRTUAL_ADDRESS poolBaseGVA = m_animClonesBlasPool->GetGPUVirtualAddress();
+    for (UINT k = 0; k < N; ++k)
+        m_animatedClones[k].blasGPUVA = poolBaseGVA + (UINT64)k * perBlasBytes;
+
+    // Also grow the source's BLAS scratch buffer so it can fan out to
+    // the M concurrent BLAS builds the per-frame op now does.  Prebuild
+    // reported scratch for ONE build; the runtime needs M times that
+    // when MaxArgCount = M (driver may parallelize internally).
+    {
+        const UINT64 scratchBytes = std::max<UINT64>(
+            pb.ScratchDataSizeInBytes * (UINT64)M, 256ull);
+        AllocateUAVBuffer(device, scratchBytes, &obj.blasScratchBuffer,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          L"Animated: BLAS scratch (extended for clones)");
+    }
+
+    // Rewrite obj.blasArgsBuffer with M entries.  Each entry uses the
+    // SAME source perFrameClasAddressArray GVA (clones share source's
+    // CLAS results), so the M args are identical bytes:
+    //   ClasAddressCount  = obj.clusterCount
+    //   ClasAddressStride = sizeof(GVA) = 8
+    //   ClasAddressArray  = obj.perFrameClasAddressArray->GVA
+    {
+        struct ArgsLayout {
+            UINT  count;
+            UINT  stride;
+            UINT  gvaLo;
+            UINT  gvaHi;
+        };
+        static_assert(sizeof(ArgsLayout) == sizeof(D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS),
+                      "BLAS-from-CLAS args layout mismatch");
+        const D3D12_GPU_VIRTUAL_ADDRESS clasArrayGva =
+            obj.perFrameClasAddressArray->GetGPUVirtualAddress();
+        std::vector<ArgsLayout> argsCpu(M, ArgsLayout{
+            obj.clusterCount,
+            (UINT)sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
+            (UINT)(clasArrayGva & 0xFFFFFFFFu),
+            (UINT)(clasArrayGva >> 32),
+        });
+        AllocateUploadBuffer(device, argsCpu.data(),
+            argsCpu.size() * sizeof(ArgsLayout),
+            &obj.blasArgsBuffer,
+            L"Animated: BLAS args (1 + N_clones, CPU-filled)");
+    }
+
+    // Rewrite obj.blasResultAddrBuffer with M dest GVAs:
+    //   [0]      = source's blasStorage GVA
+    //   [1..N]   = each clone's pool-slot GVA
+    {
+        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> dests(M);
+        dests[0] = obj.blasGPUVA;
+        for (UINT k = 0; k < N; ++k)
+            dests[1 + k] = m_animatedClones[k].blasGPUVA;
+        AllocateUploadBuffer(device, dests.data(), dests.size() * sizeof(dests[0]),
+            &obj.blasResultAddrBuffer,
+            L"Animated: BLAS dest addrs (1 + N_clones)");
+    }
+
+    SampleLog::LogF(L"[anim-clones phase2] N=%u, per-clone BLAS=%llu bytes, pool=%.2f MB\n",
+                    N, (unsigned long long)perBlasBytes,
+                    poolBytes / (1024.0 * 1024.0));
+}
+
+// =====================================================================================
 // One-shot INSTANTIATE_CLUSTER_TEMPLATES with ResultSizeArray hooked up so we
 // can read the per-cluster CLAS leaf sizes the driver actually emitted.  This
 // is invoked ONCE at the end of BuildAnimatedObjectSetup (which itself runs
@@ -4777,7 +4907,6 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
     //    obj.perFrameVertexBuffer (UAV).  The compute root signature is
     //    intentionally tiny (root constants + raw SRV + raw UAV) so we
     //    don't need to touch the descriptor heap here -- the raytracing
-    //    pipeline's heap binding from the previous DispatchRays still
     //    holds (and Dispatch() doesn't read from it).
     //
     //    Per-frame CPU work is now ~5 D3D12 method calls: set RS+PSO,
@@ -4868,16 +4997,28 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
     m_dxrCommandList->ResourceBarrier(_countof(instBarriers), instBarriers);
 
     // ------------------------------------------------------------------
-    // 3) BUILD_BLAS_FROM_CLAS - 1 arg, EXPLICIT_DESTINATIONS so the BLAS
-    //    storage VA stays fixed across frames (the BLAS contents get
-    //    overwritten in place; the TLAS instance that points at this VA
-    //    just needs a rebuild/refit to pick up the new root bounds).
+    // 3) BUILD_BLAS_FROM_CLAS - per-frame BLAS rebuild.
+    //    Phase-2 anim clones extend this to produce 1 + N_animClones
+    //    BLASes in the same batched call (source + every clone reads
+    //    the SAME perFrameClasAddressArray, each writes to its own
+    //    dest slot listed in obj.blasResultAddrBuffer).
     // ------------------------------------------------------------------
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
     blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
-    blasDesc.MaxArgCount        = 1;
+    // Phase-2 anim clones: each clone gets its own per-frame BLAS,
+    // all built in the SAME batched call as the source.
+    //   M = 1 (source) + N_animClones
+    // All M args reference the SAME source perFrameClasAddressArray
+    // (clones share the source's CLAS results), so this scales BLAS-
+    // from-CLAS work per frame WITHOUT multiplying INSTANTIATE work.
+    // Per-clone BLAS storage is in m_animClonesBlasPool (alloc'd by
+    // BuildAnimatedClonesSetup); per-clone dest GVA was baked into
+    // obj.blasResultAddrBuffer at that time too.
+    const UINT N_animClones = (UINT)m_animatedClones.size();
+    const UINT M_blasArgs   = 1u + N_animClones;
+    blasDesc.MaxArgCount        = M_blasArgs;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
-    blasDesc.MaxTotalClasCount  = obj.clusterCount;
+    blasDesc.MaxTotalClasCount  = obj.clusterCount * M_blasArgs;
     blasDesc.MaxClasCountPerArg = obj.clusterCount;
 
     D3D12_RTAS_OPERATION_INPUTS opInputsBlas = {};
@@ -4905,7 +5046,17 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
         cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 3);
 
     auto blasBarrier = CD3DX12_RESOURCE_BARRIER::UAV(obj.blasStorage.Get());
-    m_dxrCommandList->ResourceBarrier(1, &blasBarrier);
+    // Two barriers when phase-2 clone pool exists: one on source's
+    // blasStorage (own committed resource) + one on the pool (separate
+    // committed resource).  Single barrier suffices in phase-1
+    // (no clone pool) -- m_animClonesBlasPool is null then.
+    D3D12_RESOURCE_BARRIER blasBarriers[2] = { blasBarrier, blasBarrier };
+    UINT nBlasBarriers = 1;
+    if (m_animClonesBlasPool) {
+        blasBarriers[1] = CD3DX12_RESOURCE_BARRIER::UAV(m_animClonesBlasPool.Get());
+        nBlasBarriers = 2;
+    }
+    m_dxrCommandList->ResourceBarrier(nBlasBarriers, blasBarriers);
 }
 
 void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
@@ -5088,7 +5239,14 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             instances[row].InstanceMask = 0xFF;
             instances[row].InstanceContributionToHitGroupIndex = contrib;
             instances[row].Flags = animFlags;
-            instances[row].AccelerationStructure = animBlasGVA;
+            // Cluster mode: each clone has its OWN per-frame BLAS in
+            // m_animClonesBlasPool (phase-2; blasGPUVA was set by
+            // BuildAnimatedClonesSetup).  Trad mode + the phase-1
+            // fallback still share the source's BLAS GVA.
+            instances[row].AccelerationStructure =
+                (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
+                    ? ac.blasGPUVA
+                    : animBlasGVA;
             (isGlass ? nGlass : nOpaque)++;
         }
     }
@@ -7617,6 +7775,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_tradBlasWorstcasePool.Reset();
     m_tradBlasCompactPool.Reset();
     m_tradBlasSharedScratch.Reset();
+    m_animClonesBlasPool.Reset();
     m_tlasBuffer.Reset();
     m_tlasScratchBuffer.Reset();
     m_tlasInstanceDescs.Reset();

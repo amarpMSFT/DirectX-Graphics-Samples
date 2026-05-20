@@ -753,8 +753,21 @@ private:
         DirectX::XMFLOAT3 worldRotEuler = {0, 0, 0};
         float             worldScale    = 1.0f;
         UINT              materialOverrideSlot = 0;  // for the per-instance override buffer
+        // Phase-2 per-clone BLAS GPU VA (cluster mode only).  A slot
+        // inside m_animClonesBlasPool; set by BuildAnimatedClonesSetup
+        // after the pool is sized; consumed by BuildTlasClassic.
+        // Zero in trad mode and at phase-1 baseline (TLAS falls back
+        // to the shared source GVA).
+        D3D12_GPU_VIRTUAL_ADDRESS blasGPUVA = 0;
     };
     std::vector<AnimatedCloneInstance>      m_animatedClones;
+    // Cluster mode only: one pool buffer holding every animated clone's
+    // per-frame BLAS storage.  Sized at clone-gen time as
+    // (N_animatedClones * source per-frame BLAS size); each clone's
+    // BLAS GVA = poolBase + (cloneIdx * perBlasBytes).  Allocated as
+    // ONE committed resource so we don't pay N CreateCommittedResource
+    // calls (same trick as the static BLAS pool).
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasPool;
 
     // Pre-generated LOD-chain meshes for the cloneable source types.
     // Keyed by source instanceID (0=sphere0, 4=torus, 8=klein).  Each
@@ -1214,6 +1227,18 @@ private:
     void RebuildStaticBlasPerFrame();
     void RebuildStaticClasPerFrame();
     void BuildAnimatedObjectSetup();          // generates mesh, builds templates ONCE
+    // Phase 2 anim-clones setup.  Called after BuildAnimatedObjectSetup
+    // whenever m_animatedClones is non-empty.  Allocates the per-clone
+    // BLAS pool and re-builds the source's per-frame BLAS args + dest
+    // arrays so the existing per-frame BUILD_BLAS_FROM_CLAS op produces
+    // 1 + N_animClones BLASes in one batched call (source + every
+    // clone).  Each clone shares the source's per-frame CLAS results
+    // (same per-cluster GVAs in obj.perFrameClasAddressArray) so this
+    // stresses the BLAS-from-CLAS path per-clone without multiplying
+    // INSTANTIATE work.  Clones' per-clone BLAS GVAs go into
+    // AnimatedCloneInstance.blasGPUVA, which BuildTlasClassic then
+    // bakes into the TLAS instance descs.
+    void BuildAnimatedClonesSetup();
     // Traditional-mode addendum to BuildAnimatedObjectSetup.  Runs after
     // the shared mesh + perFrameVertexBuffer setup (which both modes need
     // because AnimateBall.cs writes the same per-vertex animation buffer

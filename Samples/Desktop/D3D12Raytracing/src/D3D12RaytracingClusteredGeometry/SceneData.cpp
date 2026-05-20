@@ -76,11 +76,15 @@ namespace SceneData
         scene.push_back(s2);
 
         // sphere3 - simple amethyst glass.
+        // ISOLATION (NVIDIA COMPRESSED1 bisect): smallest possible cluster
+        // (1x1 grid = 4 verts, 2 tris) so we can test "cube + tiny same-
+        // sized cluster" against the cube-only baseline.  Original:
+        // numLat=24, numLong=48, tileLat=6, tileLong=8.
         scene.push_back({
             "sphere3_amethyst_glass",
             GenKind::UVSphere,
-            { .sphereRadius = 0.45f, .sphereNumLat = 24, .sphereNumLong = 48,
-              .sphereTileLat = 6,    .sphereTileLong = 8 },
+            { .sphereRadius = 0.45f, .sphereNumLat = 1, .sphereNumLong = 1,
+              .sphereTileLat = 1,    .sphereTileLong = 1 },
             300,
             with_y(hex(3), 0.3f), {0,0,0}, 1.0f, 3,
             {}, 1.0f, 0.50f, 1.08f
@@ -107,7 +111,9 @@ namespace SceneData
         scene.push_back({
             "cube_copper_glass",
             GenKind::Cube,
-            { .cubeHalfExtent = 0.45f, .cubeFaceSubdiv = 11, .cubeTileSize = 11 },
+            // ISOLATION: trivially simple cube (1 quad per face = 4 verts
+            // per cluster, 2 tris).  Original was {0.45, 11, 11}.
+            { .cubeHalfExtent = 0.45f, .cubeFaceSubdiv = 1, .cubeTileSize = 1 },
             500,
             with_y(hex(5), 0.0f), {0,0,0}, 1.0f, 5,
             {}, 1.0f, 0.50f, 1.08f

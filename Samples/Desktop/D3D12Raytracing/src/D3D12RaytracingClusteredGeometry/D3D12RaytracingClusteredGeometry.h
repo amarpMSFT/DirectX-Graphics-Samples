@@ -463,6 +463,19 @@ private:
     // array too; now the args live in a separate DEFAULT-heap UAV
     // (m_clasArgsBuffer below) so a compute shader can write them. ----------
     ComPtr<ID3D12Resource>               m_clusterInputBuffer;
+    // DEBUG (kPerClusterVbExperiment): in COMPRESSED1 mode, one dedicated
+    // upload-heap resource per cluster holding ONLY that cluster's
+    // compressed vertex blob, mirroring how the conformance test allocates
+    // its cluster vertex buffers.  Each entry's GVA is fed into the
+    // FillClasFromTrianglesArgs meta so the CS uses GVA+0 instead of
+    // baseSharedBuffer+offset.  Used to test whether the NVIDIA
+    // COMPRESSED1 rendering corruption goes away when each cluster's
+    // VertexBuffer GVA starts at its resource's offset 0.
+    std::vector<ComPtr<ID3D12Resource>>  m_perClusterVbResources;
+    // Upload-heap stagings used to fill m_perClusterVbResources via
+    // CopyBufferRegion (DEFAULT-heap destination).  Kept alive across
+    // function returns until the GPU finishes the copy.
+    std::vector<ComPtr<ID3D12Resource>>  m_perClusterVbStagings;
     // GPU-written args for the static BUILD_CLAS_FROM_TRIANGLES op.
     // FillClasFromTrianglesArgs CS reads m_clasArgsMetaBuffer + a few root
     // constants and writes here; the RTAS op then reads here as its

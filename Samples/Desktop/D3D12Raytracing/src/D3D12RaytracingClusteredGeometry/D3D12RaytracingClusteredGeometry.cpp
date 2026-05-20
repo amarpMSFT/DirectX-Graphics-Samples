@@ -11,6 +11,61 @@
 
 #include "stdafx.h"
 #include "D3D12RaytracingClusteredGeometry.h"
+
+// =====================================================================
+// COMPRESSED1-bug isolation switch.
+// Set to one of the kIsolate* constants below to mask all TLAS
+// instances except the named one (and optionally the floor for context
+// reflections).  Used to narrow the NVIDIA-driver COMPRESSED1 rendering
+// corruption (works in WARP, broken on HW) down to a single object.
+// kIsolateNone = normal scene (every instance visible).
+//
+// Implementation: instances whose `obj.instanceID` doesn't match the
+// isolated id (and the animated ball if it isn't the target) get
+// `InstanceMask = 0` so the primary-ray `TraceRay(InclusionMask=0xff)`
+// AND skips them.  Geometry, BLAS, CLAS, etc. are still built -- only
+// traversal is suppressed -- so the AS-storage stats stay representative.
+// =====================================================================
+namespace DebugIsolate {
+    constexpr UINT kIsolateNone     = 0xFFFFFFFFu;
+    constexpr UINT kIsolateSphere0  = 0;
+    constexpr UINT kIsolateSphere1  = 1;
+    constexpr UINT kIsolateSphere2  = 2;
+    constexpr UINT kIsolateSphere3  = 3;
+    constexpr UINT kIsolateTorus    = 4;
+    constexpr UINT kIsolateCube     = 5;
+    constexpr UINT kIsolateFloor    = 6;
+    constexpr UINT kIsolateKlein    = 7;
+    constexpr UINT kIsolateAnimated = 99;   // synthetic id for the animated ball
+
+    // Which object to isolate.  Set to kIsolateNone for the full scene.
+    constexpr UINT kIsolateTarget   = kIsolateCube;
+    // Also keep the floor visible (useful so the isolated object has
+    // something to reflect / cast shadows on).  Ignored when
+    // kIsolateTarget == kIsolateNone.
+    constexpr bool kKeepFloor       = false;
+
+    // ---- Hypothesis test for the NVIDIA COMPRESSED1 corruption ----
+    // The non-template COMPRESSED1 conformance test (c:\experimental\src\
+    // D3D12Conf\Raytracing\IndirectBuild.cpp ~line 2974) creates a
+    // dedicated D3D12 resource per cluster for the COMPRESSED1 vertex
+    // data (cluster's VertexBuffer GVA points at OFFSET 0 of its own
+    // resource).  The sample, for memory efficiency, concatenates all
+    // clusters into one shared m_clusterInputBuffer and lets each
+    // cluster's VertexBuffer GVA be base+vbOff with offset > 0.
+    //
+    // When kPerClusterVbExperiment is true AND m_vertexMode is
+    // COMPRESSED1, UploadClusterInputs additionally allocates a tiny
+    // dedicated UPLOAD-heap resource for each cluster's compressed
+    // vertex blob.  The CLAS-args meta struct is extended (28 -> 36
+    // bytes) with the per-cluster VB GVA; FillClasFromTrianglesArgs
+    // uses that GVA directly instead of base+vbOff.  IndexBuffer keeps
+    // the shared-buffer offset (the experiment isolates VB only).  If
+    // rendering becomes correct, the bug is NVIDIA-driver mis-decoding
+    // COMPRESSED1 when VertexBuffer GVA is non-zero within a larger
+    // resource.
+    constexpr bool kPerClusterVbExperiment = true;
+}
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\\Raytracing.hlsl.h"
 #include "CompiledShaders\\AnimateBall.hlsl.h"
@@ -27,6 +82,7 @@
 #include <numeric>
 #include <chrono>
 #include <cmath>
+#include <set>
 
 using namespace std;
 using namespace DX;
@@ -611,6 +667,72 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
         break;
     }
 
+    // ---- COMPRESSED1 isolation: erase non-cube objects so only a
+    // configurable subset of m_objects is built (to bisect which other
+    // clusters need to be in the same batched CLAS build to trigger the
+    // NVIDIA COMPRESSED1 corruption).
+    //
+    // BISECT_KEEP_IID env var (comma-separated list of instanceIDs to
+    // keep, besides the cube).  Examples:
+    //   (unset) -> only cube
+    //   "0" -> cube + sphere0
+    //   "1,4" -> cube + sphere1 + torus
+    //   "0,1,2,3,4,6,8" -> all non-cube objects
+    constexpr bool kFilterObjects = true;
+    if (DebugIsolate::kIsolateTarget != DebugIsolate::kIsolateNone && kFilterObjects)
+    {
+        std::set<UINT> keepSet;
+        keepSet.insert(DebugIsolate::kIsolateTarget);
+        char envBuf[256] = {};
+        DWORD envLen = GetEnvironmentVariableA("BISECT_KEEP_IID", envBuf, sizeof(envBuf));
+        if (envLen > 0 && envLen < sizeof(envBuf))
+        {
+            std::string s(envBuf);
+            size_t pos = 0;
+            while (pos < s.size())
+            {
+                size_t comma = s.find(',', pos);
+                if (comma == std::string::npos) comma = s.size();
+                std::string tok = s.substr(pos, comma - pos);
+                try { keepSet.insert((UINT)std::stoi(tok)); } catch (...) {}
+                pos = comma + 1;
+            }
+        }
+        m_objects.erase(
+            std::remove_if(m_objects.begin(), m_objects.end(),
+                [&](const ClusterObject& o) { return keepSet.find(o.instanceID) == keepSet.end(); }),
+            m_objects.end());
+        SampleLog::LogF(L"[isolation] BISECT_KEEP_IID='%hs' -> kept %zu objects:\n",
+                        envBuf, m_objects.size());
+
+        // BISECT_DUP_TARGET=N : append N additional COPIES of the
+        // remaining target object (offset on x by 1.5 per copy).  Lets
+        // us test "minimum additional clusters needed to trigger" by
+        // pairing the cube with copies of itself (6 clusters each).
+        // Default 0 = no copies.
+        char dupBuf[32] = {};
+        DWORD dupLen = GetEnvironmentVariableA("BISECT_DUP_TARGET", dupBuf, sizeof(dupBuf));
+        UINT nDup = 0;
+        if (dupLen > 0) try { nDup = (UINT)std::stoi(dupBuf); } catch (...) {}
+        if (nDup > 0 && !m_objects.empty())
+        {
+            ClusterObject seed = m_objects.front();
+            for (UINT k = 0; k < nDup; ++k)
+            {
+                ClusterObject copy = seed;
+                copy.worldPos.x += 1.5f * float(k + 1);
+                copy.instanceID  = 100u + k;    // unique
+                m_objects.push_back(std::move(copy));
+            }
+            SampleLog::LogF(L"[isolation] BISECT_DUP_TARGET=%u: now %zu objects\n",
+                            nDup, m_objects.size());
+        }
+
+        for (const auto& o : m_objects)
+            SampleLog::LogF(L"  instanceID=%u clusters=%zu\n",
+                            o.instanceID, o.mesh.clusters.size());
+    }
+
     // Determine per-cluster offsets in the global cluster array (used by the
     // BLAS-from-CLAS builds to slice the global CLAS-address array per-object).
     UINT runningOffset = 0;
@@ -749,6 +871,67 @@ void D3D12RaytracingClusteredGeometry::EncodeCompressedClusters()
             totalCompressedBytes   += enc.TotalBytes();
             totalUncompressedBytes += c.positions.size() * sizeof(ProceduralGeometry::float3);
             obj.encoded.push_back(std::move(enc));
+        }
+
+        // DEBUG (COMPRESSED1 isolation): for the cube, dump per-cluster
+        // header + raw bytes + source/decoded positions so we can verify
+        // the encoder output against the spec by eye.  WARP renders this
+        // correctly using the same bytes, so if encoder matches spec
+        // -> the NVIDIA-driver decoder is the bug.
+        if (obj.instanceID == 5 /*cube*/)
+        {
+            SampleLog::LogF(L"\n=== [COMPRESSED1 diag] cube (instanceID=5): %u clusters ===\n",
+                            (UINT)obj.encoded.size());
+            for (size_t ci = 0; ci < obj.encoded.size(); ++ci)
+            {
+                const auto& enc = obj.encoded[ci];
+                const auto& src = obj.mesh.clusters[ci].positions;
+                const UINT exp_b = (UINT)DECODE_D3D12_COMPRESSED1_EXPONENT(enc.header);
+                const int  xA = (int)DECODE_D3D12_COMPRESSED1_X_ANCHOR(enc.header);
+                const int  yA = (int)DECODE_D3D12_COMPRESSED1_Y_ANCHOR(enc.header);
+                const int  zA = (int)DECODE_D3D12_COMPRESSED1_Z_ANCHOR(enc.header);
+                const UINT xB = (UINT)DECODE_D3D12_COMPRESSED1_X_BITS(enc.header) + 1u;
+                const UINT yB = (UINT)DECODE_D3D12_COMPRESSED1_Y_BITS(enc.header) + 1u;
+                const UINT zB = (UINT)DECODE_D3D12_COMPRESSED1_Z_BITS(enc.header) + 1u;
+                const double unit = std::ldexp(1.0, (int)exp_b - 127);
+                SampleLog::LogF(
+                    L"  cluster[%u]  verts=%u  header f0=0x%08X f1=0x%08X f2=0x%08X\n"
+                    L"               exp(biased)=%u (unit=%g)  anchor=(%d,%d,%d)  bits=(%u,%u,%u)\n"
+                    L"               bitstream %zu bytes, total %zu bytes\n",
+                    (UINT)ci, enc.vertexCount,
+                    (UINT)enc.header.field0, (UINT)enc.header.field1, (UINT)enc.header.field2,
+                    exp_b, unit, xA, yA, zA, xB, yB, zB,
+                    enc.bitstream.size(), enc.TotalBytes());
+
+                // Hex dump: full header (12 B) then bitstream
+                wchar_t hex[3*32 + 1] = {};
+                const uint8_t* hp = reinterpret_cast<const uint8_t*>(&enc.header);
+                int pos = 0;
+                for (int b = 0; b < 12; ++b)  { swprintf_s(hex + pos, 4, L"%02X ", hp[b]);     pos += 3; }
+                SampleLog::LogF(L"               hdr bytes:  %s\n", hex);
+                pos = 0;
+                const size_t streamBytes = std::min<size_t>(enc.bitstream.size(), 32);
+                for (size_t b = 0; b < streamBytes; ++b) { swprintf_s(hex + pos, 4, L"%02X ", enc.bitstream[b]); pos += 3; }
+                SampleLog::LogF(L"               stream(%zub): %s\n", streamBytes, hex);
+
+                auto dec = Compressed1::Decode(enc);
+                for (size_t vi = 0; vi < src.size(); ++vi)
+                {
+                    const auto& s = src[vi];
+                    const auto& d = dec[vi];
+                    // Reconstruct the per-axis quantized integer = anchor + delta
+                    // (== what the spec's `I` is); helpful for verifying by hand
+                    // that "I = round(src/unit)" matches the dump's delta + anchor.
+                    const long long Ix = (long long)std::llround((double)s.x / unit);
+                    const long long Iy = (long long)std::llround((double)s.y / unit);
+                    const long long Iz = (long long)std::llround((double)s.z / unit);
+                    SampleLog::LogF(
+                        L"               v[%zu] src=(%+.6f,%+.6f,%+.6f) dec=(%+.6f,%+.6f,%+.6f) "
+                        L"I=(%lld,%lld,%lld) delta=(%lld,%lld,%lld)\n",
+                        vi, s.x, s.y, s.z, d.x, d.y, d.z,
+                        Ix, Iy, Iz, Ix - xA, Iy - yA, Iz - zA);
+                }
+            }
         }
     }
     SampleLog::LogF(L"[compressed1] %u clusters @ %u bits/comp -> %zu bytes (vs %zu uncompressed = %.2fx); "
@@ -1341,6 +1524,17 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
             return obj.encoded[i].TotalBytes();
     };
 
+    // DEBUG (NVIDIA COMPRESSED1 isolation): conformance test uses
+    // D3D12_INDEX_FORMAT_UINT16 unconditionally for cluster indices,
+    // sample previously used UINT8 (uint8_t cluster.indices arrays).
+    // The size scaling is applied here so each cluster's IB region is
+    // 2 bytes per index (matches IBStride=2 in FillClasFromTrianglesArgs.hlsl)
+    // and the upload loop below widens uint8_t -> uint16_t before memcpy.
+    auto ibSizeForCluster = [&](const ClusterObject& obj, size_t i) -> size_t
+    {
+        return obj.mesh.clusters[i].indices.size() * sizeof(uint16_t);
+    };
+
     struct Slot { size_t vbOffset, vbSize, ibOffset, ibSize; };
     std::vector<Slot> slots(m_totalClusterCount);
     size_t cursor = 0;
@@ -1355,7 +1549,7 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
         cursor += slots[gIdx].vbSize;
         cursor = alignTo(cursor, kAlign);
         slots[gIdx].ibOffset = cursor;
-        slots[gIdx].ibSize   = src.indices.size();
+        slots[gIdx].ibSize   = ibSizeForCluster(obj, i);
         cursor += slots[gIdx].ibSize;
     }
     // Layout the per-cluster vertex+index slots in the upload buffer.  The
@@ -1404,24 +1598,119 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
                        enc.bitstream.data(), enc.bitstream.size());
         }
         if (!src.indices.empty())
-            memcpy(mapped + slots[gIdx].ibOffset, src.indices.data(), src.indices.size());
+        {
+            // Widen uint8 cluster indices to uint16 for the
+            // experimental UINT16 IndexFormat path (NVIDIA COMPRESSED1
+            // isolation -- conformance test never uses UINT8 for
+            // cluster indices and may have an undocumented
+            // UINT8+COMPRESSED1 driver bug).
+            uint16_t* dst16 = reinterpret_cast<uint16_t*>(mapped + slots[gIdx].ibOffset);
+            for (size_t k = 0; k < src.indices.size(); ++k)
+                dst16[k] = static_cast<uint16_t>(src.indices[k]);
+        }
     }
     m_clusterInputBuffer->Unmap(0, nullptr);
 
     // ------------------------------------------------------------------
     // Per-cluster metadata for the FillClasFromTrianglesArgs CS.
-    // 28 bytes/cluster: see ClasArgsMeta layout in FillClasFromTrianglesArgs.hlsl.
-    //   { clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag, matRegionIdx }
+    // 36 bytes/cluster: see ClasArgsMeta layout in FillClasFromTrianglesArgs.hlsl.
+    //   { clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag,
+    //     matRegionIdx, vbGvaLo, vbGvaHi }
     // matRegionIdx becomes BaseGeometryIndex in the CLAS (upper 24 bits
     // of BaseGeometryIndexAndFlags), so GeometryIndex() in the closest-
     // hit returns this per-cluster value -- the same identifier the
     // traditional path's per-material-region geom-desc layout produces.
+    //
+    // vbGvaLo/Hi: per-cluster absolute GPU VA for the VertexBuffer.
+    // In default (kPerClusterVbExperiment==false OR not COMPRESSED1) it
+    // is just (baseGpuVa + vbOff) so the CS sees the same value
+    // whether it adds the offset itself or trusts the meta -- the
+    // hypothesis-test path leaves the CS using GVA-from-meta
+    // unconditionally to minimise control-flow changes.
     // ------------------------------------------------------------------
     {
         struct ClasArgsMeta {
             UINT clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag, matRegionIdx;
+            UINT vbGvaLo, vbGvaHi;
         };
-        static_assert(sizeof(ClasArgsMeta) == 28, "must match the HLSL load offsets");
+        static_assert(sizeof(ClasArgsMeta) == 36, "must match the HLSL load offsets");
+
+        // (Optional) per-cluster dedicated VB resources for the
+        // COMPRESSED1 NVIDIA-bug hypothesis test.  Each holds ONLY one
+        // cluster's compressed vertex blob; GVA = resource start.
+        m_perClusterVbResources.clear();
+        const bool kUsePerClusterVbResources =
+            DebugIsolate::kPerClusterVbExperiment && !useFloat;
+        if (kUsePerClusterVbResources)
+        {
+            // DEFAULT heap (matches conformance MakeBufferAndInitialize
+            // path -- conformance MakeBufferAndInitialize at
+            // c:\experimental\src\D3D12Conf\Raytracing\IndirectBuild.cpp:405
+            // calls MakeBuffer with D3D12_HEAP_TYPE_DEFAULT then uploads
+            // via a staging buffer.  Hypothesis: NVIDIA driver may have
+            // a COMPRESSED1 decode bug specifically when the per-cluster
+            // VertexBuffer GVA points into an UPLOAD-heap resource (the
+            // sample's default).  Earlier same experiment with UPLOAD
+            // heap did not fix the corruption -- testing DEFAULT now.
+            auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+            auto uploadHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            m_perClusterVbResources.resize(m_totalClusterCount);
+
+            // Per-cluster: create DEFAULT-heap resource (COPY_DEST), then
+            // upload via a per-cluster staging UPLOAD resource + CopyBufferRegion.
+            // The command list is reset+executed by the caller; we issue
+            // copies against the current open list and rely on the existing
+            // ExecuteCommandList flow.
+            std::vector<ComPtr<ID3D12Resource>> stagings(m_totalClusterCount);
+            UINT g2 = 0;
+            for (const auto& obj : m_objects)
+            for (size_t i = 0; i < obj.mesh.clusters.size(); ++i, ++g2)
+            {
+                const auto& enc = obj.encoded[i];
+                const UINT64 sz = (UINT64)enc.TotalBytes();
+                // Default-heap destination
+                auto bdDst = CD3DX12_RESOURCE_DESC::Buffer(sz);
+                ThrowIfFailed(device->CreateCommittedResource(
+                    &defaultHeap, D3D12_HEAP_FLAG_NONE, &bdDst,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&m_perClusterVbResources[g2])));
+                m_perClusterVbResources[g2]->SetName(L"Per-cluster COMPRESSED1 VB (DEFAULT heap experiment)");
+                // Upload-heap staging
+                auto bdSrc = CD3DX12_RESOURCE_DESC::Buffer(sz);
+                ThrowIfFailed(device->CreateCommittedResource(
+                    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bdSrc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&stagings[g2])));
+                uint8_t* p = nullptr;
+                CD3DX12_RANGE noR(0, 0);
+                ThrowIfFailed(stagings[g2]->Map(0, &noR, reinterpret_cast<void**>(&p)));
+                memcpy(p, &enc.header, sizeof(enc.header));
+                if (!enc.bitstream.empty())
+                    memcpy(p + sizeof(enc.header), enc.bitstream.data(), enc.bitstream.size());
+                stagings[g2]->Unmap(0, nullptr);
+                // Copy + transition to NON_PIXEL_SHADER_RESOURCE.
+                auto cl = m_deviceResources->GetCommandList();
+                cl->CopyBufferRegion(m_perClusterVbResources[g2].Get(), 0,
+                                     stagings[g2].Get(), 0, sz);
+                auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                    m_perClusterVbResources[g2].Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                cl->ResourceBarrier(1, &barrier);
+            }
+            // Stagings stay alive in the local vector until function end --
+            // they get destroyed once the upload's command list has been
+            // submitted and waited on (the static-build path's
+            // WaitForGpu ensures GPU is done before returning, so this
+            // vector goes out of scope safely afterwards).
+            SampleLog::LogF(L"[per-cluster-vb experiment] allocated %u dedicated COMPRESSED1 VB resources (DEFAULT heap)\n",
+                            m_totalClusterCount);
+            // Keep stagings alive at function scope until ExecuteCommandList
+            // happens.  Move into the resources vector as a sidecar (we
+            // don't strictly need them after this function returns, but
+            // pinning until end-of-function is the simplest correct thing).
+            m_perClusterVbStagings = std::move(stagings);
+        }
 
         std::vector<ClasArgsMeta> meta(m_totalClusterCount);
         gIdx = 0;
@@ -1440,6 +1729,15 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
                 ? (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE
                 : 0u;
             meta[gIdx].matRegionIdx = src.matRegionIdx;
+            // Per-cluster VB GVA: experimental path uses dedicated
+            // resource (GVA = resource start), default uses
+            // baseSharedBuffer + per-cluster offset.
+            const D3D12_GPU_VIRTUAL_ADDRESS vbGva =
+                kUsePerClusterVbResources
+                    ? m_perClusterVbResources[gIdx]->GetGPUVirtualAddress()
+                    : (baseGPUVA + (D3D12_GPU_VIRTUAL_ADDRESS)slots[gIdx].vbOffset);
+            meta[gIdx].vbGvaLo = (UINT)(vbGva & 0xFFFFFFFFu);
+            meta[gIdx].vbGvaHi = (UINT)(vbGva >> 32);
         }
         AllocateUploadBuffer(device, meta.data(),
                              meta.size() * sizeof(ClasArgsMeta),
@@ -1554,7 +1852,11 @@ static void BuildSharedClusterTrianglesInputs(
     outLimits = {};
     outLimits.MaxArgCount                                   = N;
     outLimits.MaxGeometryIndexValue                         = 0;
-    outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
+    // DEBUG: conformance test uses 256 here.  Sample previously used 1
+    // (every cluster has only ONE geom-index slot since the per-cluster
+    // GeometryIndexAndFlagsArray is null).  Testing whether NVIDIA's
+    // optimization path for count=1 has a COMPRESSED1 bug.
+    outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 256;
     outLimits.MaxTriangleCountPerCluster                    = maxTris;
     outLimits.MaxVertexCountPerCluster                      = maxVerts;
     outLimits.MaxTotalTriangleCount                         = totalTris;
@@ -1574,7 +1876,7 @@ static void BuildSharedClusterTrianglesInputs(
     outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
                                                                : D3D12_VERTEX_FORMAT_COMPRESSED1;
-    outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
+    outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT16;
     outClasDesc.GeometryIndexAndFlagsIndexFormat    = D3D12_INDEX_FORMAT_NONE;
     outClasDesc.OpacityMicromapIndexFormat          = D3D12_INDEX_FORMAT_NONE;
     // The last field is a union: in COMPRESSED1 mode it's
@@ -3576,7 +3878,20 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         BuildAnimatedTraditionalAS();
     }
 
-    m_animatedObjectEnabled = true;
+    // DEBUG (COMPRESSED1 isolation): force animated object disabled so
+    // its template build / per-frame INSTANTIATE pipeline doesn't run.
+    // The cube isolation path leaves the cube as the ONLY visible
+    // geometry and skips animated entirely.
+    if (DebugIsolate::kIsolateTarget != DebugIsolate::kIsolateNone &&
+        DebugIsolate::kIsolateTarget != DebugIsolate::kIsolateAnimated)
+    {
+        m_animatedObjectEnabled = false;
+        SampleLog::LogF(L"[isolation] m_animatedObjectEnabled forced to FALSE\n");
+    }
+    else
+    {
+        m_animatedObjectEnabled = true;
+    }
 }
 
 // =====================================================================================
@@ -4304,7 +4619,17 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID  = obj.instanceID;
-        instances[i].InstanceMask= 0xFF;
+        // DEBUG ISOLATION (DebugIsolate::kIsolateTarget):
+        //   kIsolateNone -> every instance visible (normal scene)
+        //   otherwise    -> only the target instance (+ optionally the floor)
+        //                   has a non-zero mask; everything else is invisible
+        //                   to primary rays.
+        if (DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateNone ||
+            obj.instanceID == DebugIsolate::kIsolateTarget ||
+            (DebugIsolate::kKeepFloor && obj.instanceID == DebugIsolate::kIsolateFloor))
+            instances[i].InstanceMask= 0xFF;
+        else
+            instances[i].InstanceMask= 0x00;
         // Hit-group contribution.  For multi-region objects we route
         // by the FIRST region's material kind (geometryIndex 0 lands
         // there with MultiplierForGeometryContributionToHitGroupIndex=2),
@@ -4360,7 +4685,12 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(a.worldPos.x, a.worldPos.y, a.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[N_static].Transform), m);
         instances[N_static].InstanceID  = a.instanceID;
-        instances[N_static].InstanceMask= 0xFF;
+        // DEBUG ISOLATION: see static loop above for semantics.
+        if (DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateNone ||
+            DebugIsolate::kIsolateTarget == DebugIsolate::kIsolateAnimated)
+            instances[N_static].InstanceMask= 0xFF;
+        else
+            instances[N_static].InstanceMask= 0x00;
         // Animated object has no ClusterObject scene config yet; treat by
         // material only (currently refractive glass -> GlassHitGroup).
         const auto& aMat = m_materials[a.instanceID];

@@ -920,6 +920,94 @@ bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
 }
 
 // ---------------------------------------------------------------------------------
+// Lazily generate the LOD-chain meshes used by tessellation-based
+// distance LOD for cloneable sources.  Idempotent.  Each chain:
+//
+//   index 0 = full source resolution (matches scene-source params)
+//   index N = each subsequent level halves both grid dimensions
+//             while keeping tile sizes constant; cluster count drops
+//             quartically with LOD level, tris-per-cluster stays at
+//             the source's value (~256 for sphere0, ~128 for torus/
+//             klein) -- per-cluster CLAS overhead stays proportional
+//             so we don't waste cluster slots on a handful of tris.
+//
+// Source params are hardcoded to match SceneData::BuildSceneDefinition
+// (sphere0_chrome / torus_amber_glass / klein_clear_glass).  If those
+// scene params change, this needs to follow.  Future cleanup: read
+// from SceneData by name instead of hardcoding.
+// ---------------------------------------------------------------------------------
+void D3D12RaytracingClusteredGeometry::EnsureCloneSourceLodMeshes()
+{
+    if (!m_cloneSourceLodMeshes.empty()) return;
+
+    constexpr int kMaxLodLevels = 4;
+
+    // SPHERE0 chrome.  Source: r=0.85, numLat=64, numLong=128, tile 8x16.
+    // Source has 64 clusters * 256 tris = 16K tris.
+    // LOD 0: 64x128/8x16 -> 64 clusters x 256 tris
+    // LOD 1: 32x64 /8x16 -> 16 clusters x 256 tris  (still tile-divisible)
+    // LOD 2: 16x32 /8x16 ->  4 clusters x 256 tris
+    // LOD 3:  8x16 /8x16 ->  1 cluster  x 256 tris
+    {
+        std::vector<ProceduralGeometry::Mesh> chain;
+        for (int lod = 0; lod < kMaxLodLevels; ++lod)
+        {
+            const int nLat  = 64  >> lod;
+            const int nLong = 128 >> lod;
+            const int tLat  = 8;
+            const int tLong = 16;
+            if (nLat < tLat || nLong < tLong) break;
+            chain.push_back(ProceduralGeometry::GenerateUVSphereSpatialTiles(
+                0.85f, nLat, nLong, tLat, tLong, 0));
+        }
+        m_cloneSourceLodMeshes[0] = std::move(chain);
+    }
+
+    // TORUS amber glass.  Source: major=0.55 minor=0.18, ring=64 side=32, tile 8x8.
+    // LOD 0: 64x32/8x8 -> 32 clusters x 128 tris
+    // LOD 1: 32x16/8x8 ->  8 clusters x 128 tris
+    // LOD 2: 16x8 /8x8 ->  2 clusters x 128 tris
+    // LOD 3:  8x8 /8x8 ->  1 cluster  x 128 tris
+    {
+        std::vector<ProceduralGeometry::Mesh> chain;
+        for (int lod = 0; lod < kMaxLodLevels; ++lod)
+        {
+            const int nRing = 64 >> lod;
+            const int nSide = 32 >> lod;
+            const int tRing = 8;
+            const int tSide = 8;
+            if (nRing < tRing || nSide < tSide) break;
+            chain.push_back(ProceduralGeometry::GenerateTorusSpatialTiles(
+                0.55f, 0.18f, nRing, nSide, tRing, tSide, 0));
+        }
+        m_cloneSourceLodMeshes[4] = std::move(chain);
+    }
+
+    // KLEIN clear glass.  Source: scale=0.65, numU=64 numV=32, tile 8x8.
+    // (Klein bottle generator follows the same numU x numV grid logic.)
+    {
+        std::vector<ProceduralGeometry::Mesh> chain;
+        for (int lod = 0; lod < kMaxLodLevels; ++lod)
+        {
+            const int nU = 64 >> lod;
+            const int nV = 32 >> lod;
+            const int tU = 8;
+            const int tV = 8;
+            if (nU < tU || nV < tV) break;
+            chain.push_back(ProceduralGeometry::GenerateKleinBottleSpatialTiles(
+                0.65f, nU, nV, tU, tV, 0));
+        }
+        m_cloneSourceLodMeshes[8] = std::move(chain);
+    }
+
+    SampleLog::LogF(L"[clone-lod] generated %zu chains: sphere0=%zu, torus=%zu, klein=%zu\n",
+                    m_cloneSourceLodMeshes.size(),
+                    m_cloneSourceLodMeshes.count(0) ? m_cloneSourceLodMeshes[0].size() : 0,
+                    m_cloneSourceLodMeshes.count(4) ? m_cloneSourceLodMeshes[4].size() : 0,
+                    m_cloneSourceLodMeshes.count(8) ? m_cloneSourceLodMeshes[8].size() : 0);
+}
+
+// ---------------------------------------------------------------------------------
 // [N] workload-scaling clone generator.  Called at the top of
 // RebuildStaticAccelerationStructures BEFORE the per-object resource
 // reset + build pipeline runs, so the build code naturally builds
@@ -1063,33 +1151,28 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // check while still being an interesting stress test.  Below 1K
     // the overhead isn't worth it; clones get full source detail.
     //
-    // We only drop CLUSTER COUNT (not tris-per-cluster).  Truncating
-    // trailing clusters leaves a coherent "missing slice" (sphere/
-    // torus/klein generators emit in spatial-tile order so the
-    // remaining clusters cover a contiguous spatial region); the
-    // viewer reads it as a partial mesh.  Truncating tris WITHIN a
-    // surviving cluster leaves random-looking pinholes throughout
-    // the mesh -- visually worse and not worth the marginal extra
-    // memory savings.
+    // Implementation: tessellation-based LOD via pre-generated mesh
+    // chains.  See EnsureCloneSourceLodMeshes() for the chain spec
+    // (each level halves both grid dimensions, keeps tile size
+    // constant -> cluster count drops quartically, tris-per-cluster
+    // stays at source value).  The result is a complete-but-lower-
+    // poly mesh (no missing chunks) -- the right way to do LOD on
+    // procedural geometry per user feedback.
     //
     // LOD curve: a fixed "full detail zone" at the start (first 25%
-    // of the radial range) keeps the near-camera ring at lodFactor=1
+    // of the radial range) keeps the near-camera ring at lodLevel=0
     // so close-up clones look identical to the source.  Past that
-    // zone, lodFactor falls linearly toward kLodFar=0.30 at the
-    // outermost ring -- still 30% of source clusters so the outer
-    // clones keep recognizable shape even though they're missing
-    // chunks.  Combined with the radial spread pushing outer clones
-    // to greater world distance (where pixel size is small), the
-    // truncation is hard to read as "broken" vs "low detail".
+    // zone, lodLevel ramps linearly through the available chain.
     const bool  kLodEnabled = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
                               (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
-    const float kLodNear           = 1.00f;
-    const float kLodFar            = 0.30f;
     const float kLodFullDetailFrac = 0.25f;  // first 25% of radial range = full detail
     // Pre-compute maxRadius matching the spiral formula so we can
-    // normalize the radius-to-LOD factor.
+    // normalize the radius-to-LOD-bucket lookup.
     const float kMaxRadius     = kInnerRadius + sqrtf((float)std::max(N_extra, 1u)) * kRadialSpacing;
     const float kLodRadialSpan = std::max(0.001f, kMaxRadius - kInnerRadius);
+
+    if (kLodEnabled)
+        EnsureCloneSourceLodMeshes();
 
     // Cycle-deterministic RNG so re-toggling to the same N produces the
     // same scene (helpful when comparing perf snapshots between cycles).
@@ -1155,46 +1238,46 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         clone.tradBlasResultBytes  = 0;
         clone.tradBlasScratchBytes = 0;
 
-        // Distance LOD: at the higher tiers, drop CLUSTER COUNT as a
-        // function of radius -- trailing spatial tiles fall away first.
-        // The first kLodFullDetailFrac of the radial range stays at
-        // lodFactor=1 (no truncation) so near-camera clones are
-        // visually indistinguishable from the source; past that zone,
-        // lodFactor falls linearly to kLodFar at the outermost ring.
-        //
-        // Tris-per-cluster reduction was tried alongside and creates
-        // visible random pinholes throughout each cluster -- looks
-        // distinctly "broken" rather than "low detail" -- so we keep
-        // each surviving cluster's IB intact and accept a smaller
-        // per-clone memory delta vs the combined approach.
-        if (kLodEnabled && !clone.mesh.clusters.empty())
+        // Distance LOD: at the higher tiers, swap the clone's mesh for
+        // a pre-generated lower-tessellation variant of the source.
+        // Tessellation regen produces a complete (closed) lower-poly
+        // mesh -- no missing chunks like the old "drop trailing
+        // clusters" approach.  Cluster count drops quartically with
+        // LOD level; tris-per-cluster stays at the source's value
+        // (~256 sphere, ~128 torus/klein), so per-cluster CLAS
+        // overhead stays proportional and we don't waste cluster
+        // slots on a handful of tris at extreme LOD.
+        if (kLodEnabled)
         {
-            const float tRaw = std::clamp(
-                (radius - kInnerRadius) / kLodRadialSpan, 0.0f, 1.0f);
-            // Remap so [0..kLodFullDetailFrac] -> 0 and
-            //         [kLodFullDetailFrac..1] -> [0..1].
-            const float tEff = (tRaw <= kLodFullDetailFrac)
-                ? 0.0f
-                : (tRaw - kLodFullDetailFrac) / (1.0f - kLodFullDetailFrac);
-            const float lodFactor = kLodNear + (kLodFar - kLodNear) * tEff;
-            const UINT  srcN      = (UINT)clone.mesh.clusters.size();
-            const UINT  lodN      = std::max(1u, (UINT)std::ceil((float)srcN * lodFactor));
-            if (lodN < srcN)
+            auto it = m_cloneSourceLodMeshes.find(m_objects[srcIdx].instanceID);
+            if (it != m_cloneSourceLodMeshes.end() && !it->second.empty())
             {
-                clone.mesh.clusters.resize(lodN);
-                if (clone.encoded.size() > lodN)
-                    clone.encoded.resize(lodN);
-                // Recount mesh totals so downstream stats (and the
-                // BLAS prebuild's MaxTotalTriangleCount inference) are
-                // correct for the LOD'd cluster set.
-                UINT totalTri = 0, totalVert = 0;
-                for (const auto& c : clone.mesh.clusters)
+                const float tRaw = std::clamp(
+                    (radius - kInnerRadius) / kLodRadialSpan, 0.0f, 1.0f);
+                // Remap so [0..kLodFullDetailFrac] -> 0 and
+                //         [kLodFullDetailFrac..1] -> [0..1].
+                const float tEff = (tRaw <= kLodFullDetailFrac)
+                    ? 0.0f
+                    : (tRaw - kLodFullDetailFrac) / (1.0f - kLodFullDetailFrac);
+                // Map tEff in [0,1] to integer LOD level in
+                // [0, chainSize-1] -- linear bucketing.  An exponential
+                // mapping would push lower LODs further out, but the
+                // outer-ring spiral spacing already does that.
+                const int chainSize  = (int)it->second.size();
+                int       lodLevel   = (int)std::floor(tEff * (float)chainSize);
+                if (lodLevel >= chainSize) lodLevel = chainSize - 1;
+                if (lodLevel > 0)
                 {
-                    totalTri  += (UINT)(c.indices.size() / 3);
-                    totalVert += (UINT)c.positions.size();
+                    // Swap to the lower-LOD mesh.  Drop the COMPRESSED1
+                    // encoded blob too (the source's encoded data is
+                    // for the full-tess mesh; an LOD'd clone using
+                    // FLOAT32_3 vertex path doesn't read it and the
+                    // COMPRESSED1 vertex path on a LOD'd clone would
+                    // upload mismatched data -- known limitation,
+                    // FLOAT32_3 path is the default).
+                    clone.mesh = it->second[lodLevel];
+                    clone.encoded.clear();
                 }
-                clone.mesh.totalTriangles = totalTri;
-                clone.mesh.totalVertices  = totalVert;
             }
         }
 

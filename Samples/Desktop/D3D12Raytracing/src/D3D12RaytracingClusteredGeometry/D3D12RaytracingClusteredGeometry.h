@@ -22,6 +22,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace GlobalRootSig {
     enum {
@@ -720,6 +721,24 @@ private:
     };
     std::vector<AnimatedCloneInstance>      m_animatedClones;
 
+    // Pre-generated LOD-chain meshes for the cloneable source types.
+    // Keyed by source instanceID (0=sphere0, 4=torus, 8=klein).  Each
+    // vector entry is a tessellation level: index 0 = full source
+    // resolution, index N = low-poly.  Each level halves both grid
+    // dimensions while keeping tile sizes constant -- cluster count
+    // drops quartically with LOD level, tris-per-cluster stays at the
+    // source's value (cluster overhead stays proportional, total work
+    // drops fast).  Generated once per [N] toggle and reused across
+    // every clone that lands at the same (source, LOD level) bucket.
+    //
+    // Tessellation-regen LOD reads as "low-poly" rather than "broken"
+    // (no missing chunks, just lower surface resolution) -- the right
+    // way to do per-cluster tri-count reduction on procedural geometry,
+    // per user feedback "for lower tris per cluster you just tessellate
+    // less."  Per-cluster minimum tri count is held at ~64 to avoid
+    // per-CLAS metadata overhead dominating at extreme LOD.
+    std::unordered_map<UINT, std::vector<ProceduralGeometry::Mesh>> m_cloneSourceLodMeshes;
+
     // ---------- Raytracing pipeline + shader tables ----------
     ComPtr<ID3D12StateObject>            m_dxrStateObject;
     ComPtr<ID3D12RootSignature>          m_globalRootSignature;
@@ -1133,6 +1152,11 @@ private:
     // loop + build pipeline so clones flow through the same code as
     // sources and end up with their own CLAS arrays + BLASes.
     void RegenerateWorkloadCloneInstances();
+    // Lazily populate m_cloneSourceLodMeshes -- pre-generates a chain
+    // of progressively-lower-tessellation meshes per cloneable source.
+    // Idempotent: returns immediately if the cache is non-empty.
+    // Called from RegenerateWorkloadCloneInstances when LOD is active.
+    void EnsureCloneSourceLodMeshes();
     void UploadClusterInputs();
     void BuildClasIndirect();              // dispatches to one of the three below
     void BuildClasImplicit();              // ClasAllocMode::Implicit

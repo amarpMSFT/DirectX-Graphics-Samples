@@ -1,14 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  D3D12RaytracingClusteredGeometry sample.
-
-  This project intentionally diverges from the sibling raytracing samples in that it
-  does NOT use the Microsoft.Direct3D.D3D12 / Microsoft.Direct3D.DXC NuGet packages.
-  Both runtime + compiler components are sourced from a local experimental D3D12
-  build via ExperimentalD3D12.props (see that file for what it expects).
-
-  Once a real Agility SDK NuGet package shipping DXR2 is available, switch this
-  project back to the standard pattern (see D3D12RaytracingOpacityMicromaps.vcxproj).
+  D3D12RaytracingClusteredGeometry - min repro for the DXR2 COMPRESSED1
+  vertex-format bug. Single Main.cpp; runtime + compiler hooked up via
+  ExperimentalD3D12.props.
 -->
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
@@ -47,105 +41,44 @@
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-
-  <!-- Pull in the experimental D3D12 runtime + DXC compiler hookup. -->
   <Import Project="ExperimentalD3D12.props" />
 
-  <ImportGroup Label="PropertySheets">
-    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-  </ImportGroup>
-
   <PropertyGroup>
-    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
-    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
     <OutDir>bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>obj\$(Platform)\$(Configuration)\</IntDir>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
   </PropertyGroup>
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <PrecompiledHeader>Use</PrecompiledHeader>
-      <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
-      <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>..\;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- d3dx12.h lives in the parent src\ directory (shared across samples). -->
+      <AdditionalIncludeDirectories>..\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
       <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
-      <FunctionLevelLinking Condition="'$(Configuration)'=='Release'">true</FunctionLevelLinking>
-      <IntrinsicFunctions Condition="'$(Configuration)'=='Release'">true</IntrinsicFunctions>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
-      <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <!-- Delay-load d3d12 so we can run on machines without it for graceful error
-           reporting (matches sibling samples). -->
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Delay-load so we get a graceful error on machines without d3d12. -->
       <DelayLoadDLLs>d3d12.dll</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
 
-  <!-- Source / header files. -->
   <ItemGroup>
-    <ClCompile Include="DeviceResources.cpp" />
-    <ClCompile Include="Win32Application.cpp" />
-    <ClCompile Include="DXSample.cpp" />
-    <ClCompile Include="D3D12RaytracingClusteredGeometry.cpp" />
-    <ClCompile Include="stdafx.cpp">
-      <PrecompiledHeader>Create</PrecompiledHeader>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="DeviceResources.h" />
-    <ClInclude Include="DirectXRaytracingHelper.h" />
-    <ClInclude Include="DXSample.h" />
-    <ClInclude Include="DXSampleHelper.h" />
-    <ClInclude Include="HlslCompat.h" />
-    <ClInclude Include="ProceduralGeometry.h" />
-    <ClInclude Include="Compressed1.h" />
-    <ClInclude Include="SampleLog.h" />
-    <ClInclude Include="StepTimer.h" />
-    <ClInclude Include="Win32Application.h" />
-    <ClInclude Include="SceneCommon.h" />
-    <ClInclude Include="stdafx.h" />
+    <ClCompile Include="Main.cpp" />
   </ItemGroup>
 
-  <!-- HLSL shader compiled with the experimental dxc.exe to a C-array header.
-       The default FxCompile task in the Microsoft.Cpp.targets calls fxc.exe and
-       cannot target lib_6_10. We use a CustomBuild step instead, which is what
-       the Microsoft.Direct3D.DXC NuGet does internally too. -->
   <ItemGroup>
-</ItemGroup>
-
-  <!-- Loose files visible in IDE. -->
-  <ItemGroup>
-    <None Include="packages.config" />
-    <None Include="readme.md" />
     <None Include="ExperimentalD3D12.props" />
-    <!-- DirectXTK sprite-font asset for the on-screen overlay (see RenderUI()).
-         CopyToOutputDirectory ensures it lands next to the exe; SpriteFont
-         opens it at runtime by relative filename. -->
-    <None Include="SegoeUI_24.spritefont">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <None Include="readme.md" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-
-  <!-- DirectXTK12 (SpriteBatch + SpriteFont) for on-screen overlay text.
-       packages.config drives nuget restore; this Import is the build-time
-       hook that actually wires the lib + headers into the project. -->
-  <ImportGroup Label="ExtensionTargets">
-    <Import Project="..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets" Condition="Exists('..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets')" />
-  </ImportGroup>
-  <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
-    <PropertyGroup>
-      <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
-    </PropertyGroup>
-    <Error Condition="!Exists('..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\..\..\..\..\Packages\directxtk12_desktop_2019.2024.10.29.1\build\native\directxtk12_desktop_2019.targets'))" />
-  </Target>
 </Project>

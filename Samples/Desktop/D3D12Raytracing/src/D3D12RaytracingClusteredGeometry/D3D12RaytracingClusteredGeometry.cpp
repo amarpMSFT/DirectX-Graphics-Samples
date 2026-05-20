@@ -1129,24 +1129,27 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // active) so the lower-detail outer clones land at LARGER world
     // distances -- the smaller pixel footprint hides the LOD's
     // cluster-count drop the way a real LOD chain hides its
-    // mesh-decimation artifacts behind perspective.  Per user
-    // feedback "move them further in the distance given their LOD"
-    // -- distant clones recede more aggressively now that LOD makes
-    // them cheaper AND smaller on screen.
-    //   100:  spacing 0.7  (LOD active, mild spread; outer ~= 11)
-    //   1K:   spacing 1.0  (mid spread;    outer ~= 36)
-    //   10K:  spacing 1.5  (deep field;    outer ~= 154)
-    float kRadialSpacing = 0.7f;
-    if      (m_extraInstancesMode == ExtraInstancesMode::Thousand)    kRadialSpacing = 1.0f;
-    else if (m_extraInstancesMode == ExtraInstancesMode::TenThousand) kRadialSpacing = 1.5f;
+    // mesh-decimation artifacts behind perspective.
+    //
+    // CONSTANT spacing across tiers (per user feedback "the extra
+    // 100 instances should stay the same when 1000 are drawn -- just
+    // more in the distance") so the spiral's position for clone i
+    // depends ONLY on i, not on the active N.  Toggling 100 -> 1K
+    // -> 10K extends the spiral outward without reshuffling the
+    // existing clones.
+    const float kRadialSpacing  = 1.5f;
     // Height curve.  Inner ring sunk well below the floor (kInnerY)
-    // so the spiral rises out of depth.  Sqrt-based rise per user
-    // request "make them start lower and ramp more".
-    //     N=100  outer  (maxRadius ~11):  -2.8 + sqrt(6.5)  * 1.9 ~= +2.0
-    //     N=1K   outer  (maxRadius ~36):  -2.8 + sqrt(31)   * 1.9 ~= +7.8
-    //     N=10K  outer  (maxRadius ~155): -2.8 + sqrt(150)  * 1.9 ~= +20.5
-    const float kInnerY         = -2.80f;
-    const float kHeightSqrtMul  =  1.90f;
+    // so the spiral rises out of depth.  Steep sqrt-of-radial-step
+    // ramp gives the "stadium seating" look the user asked for:
+    // each ring lands visibly higher than the prior, so distant
+    // clones aren't all occluded by near ones.
+    //     i=0:    y = -3.5
+    //     i=10:   y ~= +2.6   (rise of ~6 across first 10 clones)
+    //     i=100:  y ~= +8.1   (rise tapers as sqrt does)
+    //     i=1K:   y ~= +17.1
+    //     i=10K:  y ~= +33.2  (outer ring is high but framed against sky)
+    const float kInnerY         = -3.50f;
+    const float kHeightSqrtMul  =  3.00f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  On whenever there are extra clones, NOT just at
@@ -1167,16 +1170,24 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // normalize the radius-to-LOD-bucket lookup.
     const float kMaxRadius     = kInnerRadius + sqrtf((float)std::max(N_extra, 1u)) * kRadialSpacing;
     const float kLodRadialSpan = std::max(0.001f, kMaxRadius - kInnerRadius);
-
     if (kLodEnabled)
         EnsureCloneSourceLodMeshes();
 
-    // Cycle-deterministic RNG so re-toggling to the same N produces the
-    // same scene (helpful when comparing perf snapshots between cycles).
-    std::mt19937 rng(0xC10E5EEDu ^ N_extra);
+    // Per-clone deterministic RNG seeded from i.  Each clone i gets its
+    // OWN std::mt19937 keyed by a hash of i; this guarantees the random
+    // payload (material slot, rotation, scale) for clone i is identical
+    // regardless of N, regardless of whether any other random consumer
+    // was added in between (e.g. adding a new randomized field per
+    // clone won't shift earlier clones).  Property: toggling
+    // 100 -> 1K -> 10K extends the spiral by placing 900 / 9000 new
+    // clones at indices >= the previous N WITHOUT changing the
+    // positions, materials, rotations, or scales of any of the
+    // previously-existing clones.
+    constexpr UINT kCloneRngBaseSeed = 0xC10E5EEDu;
     std::uniform_int_distribution<UINT> matSlotDist(0u, (UINT)m_materials.size() - 1u);
     std::uniform_real_distribution<float> rotDist(0.0f, 6.2831853f);
     std::uniform_real_distribution<float> scaleDist(0.6f, 1.4f);
+
 
     m_objects.reserve(m_sourceObjectCount + N_extra);   // upper bound (anim clones go to m_animatedClones, not here)
     for (UINT i = 0; i < N_extra; ++i)
@@ -1195,9 +1206,19 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
             heightY,
             radius * sinf(angle)
         };
-        const DirectX::XMFLOAT3 randRot = { rotDist(rng), rotDist(rng), rotDist(rng) };
-        const float             randScale = scaleDist(rng);
-        const UINT              randMatSlot = matSlotDist(rng);
+        // Per-clone RNG keyed by i.  Hash-mix the index with the base
+        // seed using a Wang-style mixer so neighboring i's produce
+        // visually-uncorrelated random values (a raw `seed ^ i` would
+        // give nearly-identical RNG sequences for adjacent clones).
+        UINT mixed = (UINT)i + kCloneRngBaseSeed;
+        mixed = ((mixed >> 16) ^ mixed) * 0x119DE1F3u;
+        mixed = ((mixed >> 16) ^ mixed) * 0x119DE1F3u;
+        mixed =  (mixed >> 16) ^ mixed;
+        std::mt19937 perCloneRng(mixed);
+        const DirectX::XMFLOAT3 randRot = { rotDist(perCloneRng), rotDist(perCloneRng), rotDist(perCloneRng) };
+        const float             randScale = scaleDist(perCloneRng);
+        const UINT              randMatSlot = matSlotDist(perCloneRng);
+
 
         if (cycleSlot == kAnimCycleSlot)
         {

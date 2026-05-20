@@ -240,8 +240,6 @@ private:
     // as m_framesRendered.  See OnRender for usage.
     UINT                                 m_logPfEveryFrames   = 0;
     UINT                                 m_logRawPfEveryFrames = 0;
-    UINT                                 m_exitAfterFrames    = 0;
-    // Scheduled actions: each entry = (frame index, action key).  Action keys
     // are short strings matched in OnRender; supported = "alloc-implicit" /
     // "alloc-getsizes" / "alloc-compact" / "rebuild-none" / "rebuild-blas" /
     // "rebuild-clas-blas" / "log" / "exit".  Multiple --at args allowed,
@@ -996,10 +994,7 @@ private:
 
     // Screenshot capture (--screenshot N path.png).
     int          m_screenshotFrame     = -1;
-    double       m_screenshotAtSeconds = -1.0;
-    std::wstring m_screenshotPath;
     UINT         m_framesRendered = 0;
-    bool         m_screenshotTaken = false;
 
     // ---------- Initialization helpers ----------
     void CreateDeviceDependentResources();
@@ -1087,11 +1082,7 @@ void CreateDescriptorHeapAndRaytracingOutput();
 
     UINT AllocateDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu);
     void DoRender();
-    void CaptureBackBufferToFile(const std::wstring& path);
-    static HRESULT SaveBGRAToPng(const std::wstring& path, UINT width, UINT height,
-                                 const uint8_t* data, UINT rowPitchBytes);
-
-    // Shader entry-point names (must match Raytracing.hlsl).
+// Shader entry-point names (must match Raytracing.hlsl).
     // Shader entry-point names (must match Raytracing.hlsl). Two ray indices:
     //   0 = primary ray  (Miss + ClusterHitGroup)
     //   1 = shadow ray   (ShadowMiss + ShadowHitGroup -- the shadow hit group's
@@ -1100,13 +1091,8 @@ void CreateDescriptorHeapAndRaytracingOutput();
     //                     hit-group record per ray-contribution index)
     static const wchar_t* c_raygenName;
     static const wchar_t* c_opaqueClosestHitName;
-    static const wchar_t* c_glassClosestHitName;
-    static const wchar_t* c_glassAnyHitName;
     static const wchar_t* c_missName;
-    static const wchar_t* c_shadowMissName;
     static const wchar_t* c_opaqueHitGroupName;
-    static const wchar_t* c_glassHitGroupName;
-    static const wchar_t* c_shadowHitGroupName;
 };
 
 

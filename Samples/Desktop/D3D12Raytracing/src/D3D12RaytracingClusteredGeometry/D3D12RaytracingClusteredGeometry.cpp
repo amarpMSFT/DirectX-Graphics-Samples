@@ -31,20 +31,9 @@ using Microsoft::WRL::ComPtr;
 
 // ==== Shader entry-point names (must match Raytracing.hlsl) ====
 const wchar_t* D3D12RaytracingClusteredGeometry::c_raygenName            = L"RayGen";
-// Two specialised closesthit shaders + two primary hit groups:
-//   OpaqueHitGroup binds OpaqueHit, NO any-hit (any-hit dispatch is
-//   skipped entirely for opaque-only instances - significantly cheaper
-//   for chrome / pure-matte traversals).
-//   GlassHitGroup binds GlassHit + GlassAnyHit (anyhit handles
-//   stochastic translucency; closesthit handles Fresnel + refraction).
 const wchar_t* D3D12RaytracingClusteredGeometry::c_opaqueClosestHitName  = L"OpaqueHit";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_glassClosestHitName   = L"GlassHit";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_glassAnyHitName       = L"GlassAnyHit";
 const wchar_t* D3D12RaytracingClusteredGeometry::c_missName              = L"Miss";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowMissName        = L"ShadowMiss";
 const wchar_t* D3D12RaytracingClusteredGeometry::c_opaqueHitGroupName    = L"OpaqueHitGroup";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_glassHitGroupName     = L"GlassHitGroup";
-const wchar_t* D3D12RaytracingClusteredGeometry::c_shadowHitGroupName    = L"ShadowHitGroup";
 
 // =====================================================================================
 // Construction + command-line + lifecycle
@@ -57,32 +46,15 @@ D3D12RaytracingClusteredGeometry::D3D12RaytracingClusteredGeometry(UINT width, U
 
 void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc)
 {
-    // Minimal CLI for COMPRESSED1 repro.  Only --vertex-format and
-    // --screenshot-at / --exit-after-frames remain.  All other flags
-    // (alloc mode, geometry mode, rebuild mode, log-pf-every, --at
-    // scheduled actions, aa-samples, compressed-bits, cluster-tint,
-    // position-truncate, trad-alloc) stripped together with the code
-    // paths they used to drive.
+    // Minimal CLI for COMPRESSED1 repro: only --vertex-format remains.
+    // The bug is visible interactively -- just run the exe and look.
     DXSample::ParseCommandLineArgs(argv, argc);
     for (int i = 1; i < argc; i++)
     {
-        if (_wcsicmp(argv[i], L"--screenshot-at") == 0 && i + 2 < argc)
-        {
-            // --screenshot-at <seconds> <path>: capture once warmed up.
-            m_screenshotAtSeconds = _wtof(argv[i + 1]);
-            m_screenshotPath      = argv[i + 2];
-            i += 2;
-        }
-        else if (_wcsicmp(argv[i], L"--vertex-format") == 0 && i + 1 < argc)
+        if (_wcsicmp(argv[i], L"--vertex-format") == 0 && i + 1 < argc)
         {
             if      (_wcsicmp(argv[i+1], L"float")      == 0) m_vertexMode = VertexMode::Float32_3;
             else if (_wcsicmp(argv[i+1], L"compressed") == 0) m_vertexMode = VertexMode::Compressed1;
-            i += 1;
-        }
-        else if (_wcsicmp(argv[i], L"--exit-after-frames") == 0 && i + 1 < argc)
-        {
-            int n = _wtoi(argv[i+1]);
-            m_exitAfterFrames = (UINT)std::max(0, n);
             i += 1;
         }
     }
@@ -648,12 +620,9 @@ commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
 // ---------------------------------------------------------------------------------
 bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
 {
-    if (m_screenshotAtSeconds >= 0.0 || m_screenshotFrame >= 0 || m_exitAfterFrames > 0)
-        return false;
+    // Don't auto-maximise on software adapters (per-frame cost is multi-second on WARP).
     const wchar_t* desc = m_deviceResources->GetAdapterDescription();
-    const bool isSoftware = (wcsstr(desc, L"WARP") != nullptr) ||
-                            (wcsstr(desc, L"Basic Render") != nullptr);
-    return !isSoftware;
+    return !(wcsstr(desc, L"WARP") || wcsstr(desc, L"Basic Render"));
 }
 
 // ---------------------------------------------------------------------------------
@@ -1715,70 +1684,27 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     lib->SetDXILLibrary(&libdxil);
     lib->DefineExport(c_raygenName);
     lib->DefineExport(c_opaqueClosestHitName);
-    lib->DefineExport(c_glassClosestHitName);
-    lib->DefineExport(c_glassAnyHitName);
     lib->DefineExport(c_missName);
-    lib->DefineExport(c_shadowMissName);
 
-    // ---- OPAQUE primary hit group --------------------------------------
-    // Bound to instances whose material chain (baseline + every per-cluster
-    // checker override) keeps refractivity = 0 and translucency = 0.
-    // Currently: only sphere0 (chrome).
-    //
-    // NO any-hit shader binding - any-hit dispatch is skipped entirely
-    // by the runtime for traversals on this hit group.  Combined with the
-    // FORCE_OPAQUE TLAS instance flag this is the cheapest possible
-    // closesthit path: every triangle hit goes straight to OpaqueHit.
+    // Single OPAQUE hit group: just a closesthit; no any-hit (TLAS uses
+    // FLAG_FORCE_OPAQUE so any-hit dispatch is skipped at traversal time
+    // even if we'd bound one).  No shadow / glass hit groups -- the
+    // minimal shader fires only primary rays.
     auto opaqueHG = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
     opaqueHG->SetClosestHitShaderImport(c_opaqueClosestHitName);
     opaqueHG->SetHitGroupExport(c_opaqueHitGroupName);
     opaqueHG->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-    // ---- GLASS primary hit group ---------------------------------------
-    // Bound to any instance whose material chain includes refraction OR
-    // translucency at the baseline OR via per-cluster checker overrides.
-    // Currently: spheres 1/2/3, torus, cube, floor, animated, Klein.
-    //
-    // any-hit = GlassAnyHit (stochastic translucency reject).  Closest-
-    // hit = GlassHit (full Fresnel + refraction + reflection composition).
-    auto glassHG = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    glassHG->SetClosestHitShaderImport(c_glassClosestHitName);
-    glassHG->SetAnyHitShaderImport(c_glassAnyHitName);
-    glassHG->SetHitGroupExport(c_glassHitGroupName);
-    glassHG->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
-
-    // Shadow hit group: empty (no closest-hit, no any-hit). Shadow rays use
-    // SKIP_CLOSEST_HIT_SHADER + FORCE_OPAQUE so neither shader can run on a
-    // hit. The hit group still has to exist for ray-contribution-index 1.
-    auto shadowHitGroup = pipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    shadowHitGroup->SetHitGroupExport(c_shadowHitGroupName);
-    shadowHitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
-
-    // Payload: max(Payload(float4), ShadowPayload(bool)) -> 16 bytes is enough.
     auto shaderConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + 2 * sizeof(uint), /*attribs*/ 2 * sizeof(float));   // Payload = float4 color + uint depth + uint inGlass
+    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + 2 * sizeof(uint),
+                         /*attribs*/ 2 * sizeof(float));
     auto globalRS = pipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     globalRS->SetRootSignature(m_globalRootSignature.Get());
 
-    // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for the shader to traverse a
-    // BLAS built from CLAS. Without it, hits on a Cluster BLAS are undefined.
+    // ALLOW_CLUSTERED_GEOMETRY is the DXR2 opt-in for tracing a BLAS built
+    // from CLAS.  MaxRecursionDepth = 1 (raygen + 1 trace = primary rays only).
     auto pipelineConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG1_SUBOBJECT>();
-    // MaxRecursionDepth = 8: budget for cascading-refraction paths now that
-    // EVERY object in the scene is a glass variant.  A primary ray that
-    // pierces several glass volumes in sequence can chain refractions to
-    // depth 4-5 before bottoming out, plus 1 shadow ray per surface hit.
-    // Worst-case path:
-    //   raygen TraceRay     -> recursion 1 (primary closesthit on glass A)
-    //   refract-in glass A   -> recursion 2 (back-face of A)
-    //   refract-out into air -> recursion 3 (front-face of glass B)
-    //   refract-in glass B   -> recursion 4 (back-face of B)
-    //   refract-out          -> recursion 5 (next surface)
-    //   reflection bounce    -> recursion 6 (mirror-reflect off some glass)
-    //   shadow ray           -> recursion 7 (LEAF; SKIP_CLOSEST_HIT)
-    //   safety               -> recursion 8 (unused headroom)
-    // The closesthit gates refraction at myDepth <= 4 to stay well under
-    // this budget while still letting 4+ glass volumes compose visually.
-    pipelineConfig->Config(16, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
+    pipelineConfig->Config(1, D3D12_RAYTRACING_PIPELINE_FLAG_ALLOW_CLUSTERED_GEOMETRY);
 
     SampleLog::Write(L"  >>> CreateStateObject\n");
     HRESULT hrCSO = m_dxrDevice->CreateStateObject(pipeline, IID_PPV_ARGS(&m_dxrStateObject));
@@ -1789,61 +1715,21 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     SampleLog::Write(L"  >>> Build shader tables\n");
     ComPtr<ID3D12StateObjectProperties> props;
     ThrowIfFailed(m_dxrStateObject->QueryInterface(IID_PPV_ARGS(&props)));
-    void* rgID            = props->GetShaderIdentifier(c_raygenName);
-    void* missID          = props->GetShaderIdentifier(c_missName);
-    void* shadowMissID    = props->GetShaderIdentifier(c_shadowMissName);
-    void* opaqueHgID      = props->GetShaderIdentifier(c_opaqueHitGroupName);
-    void* glassHgID       = props->GetShaderIdentifier(c_glassHitGroupName);
-    void* shadowHgID      = props->GetShaderIdentifier(c_shadowHitGroupName);
-    const UINT idSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+    void* rgID        = props->GetShaderIdentifier(c_raygenName);
+    void* missID      = props->GetShaderIdentifier(c_missName);
+    void* opaqueHgID  = props->GetShaderIdentifier(c_opaqueHitGroupName);
+    const UINT idSize     = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     const UINT recordSize = Align(idSize, D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT);
 
-    // Single-record table (raygen).
     auto makeTable1 = [&](void* shaderID, ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
     {
         std::vector<uint8_t> data(recordSize, 0);
         memcpy(data.data(), shaderID, idSize);
         AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
     };
-    // Two-record table (miss).
-    auto makeTable2 = [&](void* shaderID0, void* shaderID1,
-                          ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
-    {
-        std::vector<uint8_t> data(recordSize * 2, 0);
-        memcpy(data.data() + 0,          shaderID0, idSize);
-        memcpy(data.data() + recordSize, shaderID1, idSize);
-        AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
-    };
-    // ---- HIT-GROUP shader table layout ----
-    // 4 records, 2 contiguous (primary + shadow) blocks per material kind:
-    //
-    //   [0] OpaqueHitGroup    <-- primary for OPAQUE instances (InstanceContrib=0)
-    //   [1] ShadowHitGroup    <-- shadow  for OPAQUE instances (RayContrib=1)
-    //   [2] GlassHitGroup     <-- primary for GLASS  instances (InstanceContrib=2)
-    //   [3] ShadowHitGroup    <-- shadow  for GLASS  instances (RayContrib=1)
-    //
-    // Per-instance InstanceContributionToHitGroupIndex picks the block;
-    // shadow rays add RayContributionToHitGroupIndex=1 within the block.
-    // The shadow records share the same dummy hit-group identifier but
-    // physically live at two distinct table indices so the same RayContrib=1
-    // offset works from either block start.
-    auto makeTable4 = [&](void* r0, void* r1, void* r2, void* r3,
-                          ComPtr<ID3D12Resource>& outTable, const wchar_t* name)
-    {
-        std::vector<uint8_t> data(recordSize * 4, 0);
-        memcpy(data.data() + 0 * recordSize, r0, idSize);
-        memcpy(data.data() + 1 * recordSize, r1, idSize);
-        memcpy(data.data() + 2 * recordSize, r2, idSize);
-        memcpy(data.data() + 3 * recordSize, r3, idSize);
-        AllocateUploadBuffer(device, data.data(), data.size(), &outTable, name);
-    };
-
-    makeTable1(rgID,                    m_rayGenShaderTable,   L"raygen shader table");
-    makeTable2(missID, shadowMissID,    m_missShaderTable,     L"miss shader table (primary + shadow)");
-    makeTable4(opaqueHgID, shadowHgID,
-               glassHgID,  shadowHgID,
-               m_hitGroupShaderTable,
-               L"hit-group shader table (opaque-primary, shadow, glass-primary, shadow)");
+    makeTable1(rgID,       m_rayGenShaderTable,   L"raygen shader table");
+    makeTable1(missID,     m_missShaderTable,     L"miss shader table");
+    makeTable1(opaqueHgID, m_hitGroupShaderTable, L"hit-group shader table (opaque primary)");
 }
 // ---------------------------------------------------------------------------------
 // DirectXTK SpriteBatch + SpriteFont setup.  Creates the GraphicsMemory ring
@@ -2181,31 +2067,8 @@ void D3D12RaytracingClusteredGeometry::OnUpdate()
 void D3D12RaytracingClusteredGeometry::OnRender()
 {
     if (!m_deviceResources->IsWindowVisible()) return;
-
-    // For --screenshot-at <seconds>, advance the animation clock straight to
-    // the requested timestamp on the first rendered frame.
-    if (m_screenshotAtSeconds >= 0 && !m_screenshotTaken && m_framesRendered == 0)
-    {
-        m_animSeconds = m_screenshotAtSeconds;
-        UpdateSceneConstantBuffer();
-    }
-
     DoRender();
     ++m_framesRendered;
-
-    if (m_exitAfterFrames > 0 && m_framesRendered >= m_exitAfterFrames)
-    {
-        PostQuitMessage(0);
-        return;
-    }
-
-    // Time-based screenshot capture: wait ~80 frames for swap chain warm-up.
-    if (m_screenshotAtSeconds >= 0 && m_framesRendered >= 80 && !m_screenshotTaken)
-    {
-        m_screenshotTaken = true;
-        CaptureBackBufferToFile(m_screenshotPath);
-        PostQuitMessage(0);
-    }
 }
 
 void D3D12RaytracingClusteredGeometry::DoRender()
@@ -2437,108 +2300,9 @@ void D3D12RaytracingClusteredGeometry::OnDeviceRestored()
 // =====================================================================================
 // Screenshot capture
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::CaptureBackBufferToFile(const std::wstring& path)
-{
-    auto device       = m_deviceResources->GetD3DDevice();
-    auto commandQueue = m_deviceResources->GetCommandQueue();
 
-    UINT capturedBackBufferIndex = m_deviceResources->GetPreviousFrameIndex();
-    auto swapChain = m_deviceResources->GetSwapChain();
-    ComPtr<ID3D12Resource> backBuffer;
-    ThrowIfFailed(swapChain->GetBuffer(capturedBackBufferIndex, IID_PPV_ARGS(&backBuffer)));
 
-    auto rtDesc = backBuffer->GetDesc();
-    const UINT width  = (UINT)rtDesc.Width;
-    const UINT height = (UINT)rtDesc.Height;
 
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-    UINT64 totalBytes = 0; UINT rowCount = 0; UINT64 rowSizeInBytes = 0;
-    device->GetCopyableFootprints(&rtDesc, 0, 1, 0, &footprint, &rowCount, &rowSizeInBytes, &totalBytes);
-
-    auto heapPropsRB = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-    auto bufDesc     = CD3DX12_RESOURCE_DESC::Buffer(totalBytes);
-    ComPtr<ID3D12Resource> readback;
-    ThrowIfFailed(device->CreateCommittedResource(&heapPropsRB, D3D12_HEAP_FLAG_NONE,
-        &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
-
-    ComPtr<ID3D12CommandAllocator> alloc;
-    ComPtr<ID3D12GraphicsCommandList> cl;
-    ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)));
-    ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&cl)));
-    {
-        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.Get(),
-            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cl->ResourceBarrier(1, &toCopy);
-        D3D12_TEXTURE_COPY_LOCATION dst = {};
-        dst.pResource = readback.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = footprint;
-        D3D12_TEXTURE_COPY_LOCATION src = {};
-        src.pResource = backBuffer.Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
-        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(backBuffer.Get(),
-            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
-        cl->ResourceBarrier(1, &toPresent);
-    }
-    ThrowIfFailed(cl->Close());
-    ID3D12CommandList* cls[] = { cl.Get() };
-    commandQueue->ExecuteCommandLists(1, cls);
-    m_deviceResources->WaitForGpu();
-
-    void* mappedRaw = nullptr;
-    D3D12_RANGE readRange = { 0, (SIZE_T)totalBytes };
-    ThrowIfFailed(readback->Map(0, &readRange, &mappedRaw));
-    HRESULT hrSave = SaveBGRAToPng(path, width, height,
-        (const uint8_t*)mappedRaw + footprint.Offset, footprint.Footprint.RowPitch);
-    D3D12_RANGE writeRange = { 0, 0 };
-    readback->Unmap(0, &writeRange);
-
-    SampleLog::LogF(L"[screenshot] %s %ux%u -> %s\n",
-        SUCCEEDED(hrSave) ? L"wrote" : L"FAILED to write", width, height, path.c_str());
-}
-
-HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path,
-                                                       UINT width, UINT height,
-                                                       const uint8_t* data,
-                                                       UINT rowPitchBytes)
-{
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    bool initedCom = SUCCEEDED(hr);
-    auto cleanup = [&](HRESULT result) -> HRESULT { if (initedCom) CoUninitialize(); return result; };
-    ComPtr<IWICImagingFactory> factory;
-    if (FAILED(hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) return cleanup(hr);
-    ComPtr<IWICStream> stream;
-    if (FAILED(hr = factory->CreateStream(&stream))) return cleanup(hr);
-    if (FAILED(hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) return cleanup(hr);
-    ComPtr<IWICBitmapEncoder> encoder;
-    if (FAILED(hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder))) return cleanup(hr);
-    if (FAILED(hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) return cleanup(hr);
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2> props;
-    if (FAILED(hr = encoder->CreateNewFrame(&frame, &props))) return cleanup(hr);
-    if (FAILED(hr = frame->Initialize(props.Get()))) return cleanup(hr);
-    if (FAILED(hr = frame->SetSize(width, height))) return cleanup(hr);
-    WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;
-    if (FAILED(hr = frame->SetPixelFormat(&pf))) return cleanup(hr);
-    const UINT tightStride = width * 4;
-    if (rowPitchBytes == tightStride)
-    {
-        if (FAILED(hr = frame->WritePixels(height, tightStride, tightStride * height,
-                                           const_cast<BYTE*>(data)))) return cleanup(hr);
-    }
-    else
-    {
-        std::vector<uint8_t> packed((size_t)tightStride * height);
-        for (UINT y = 0; y < height; ++y)
-            memcpy(packed.data() + (size_t)y * tightStride,
-                   data + (size_t)y * rowPitchBytes, tightStride);
-        if (FAILED(hr = frame->WritePixels(height, tightStride, tightStride * height,
-                                           packed.data()))) return cleanup(hr);
-    }
-    if (FAILED(hr = frame->Commit())) return cleanup(hr);
-    if (FAILED(hr = encoder->Commit())) return cleanup(hr);
-    return cleanup(S_OK);
-}
 
 
 // OnKeyDown is a virtual override from DXSample base.  Headless repro

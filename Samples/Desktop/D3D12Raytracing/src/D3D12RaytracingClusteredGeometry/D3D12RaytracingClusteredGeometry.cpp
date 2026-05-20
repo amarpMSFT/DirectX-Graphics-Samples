@@ -4396,6 +4396,16 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                 (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
                     ? ac.blasGPUVA
                     : animBlasGVA;
+            // ⚠ DIAGNOSTIC: log every anim clone's TLAS row
+            SampleLog::LogF(L"[tlas-anim-clone] row=%u pos=(%.2f,%.2f,%.2f) scale=%.2f "
+                            L"mask=0x%02X flags=0x%X contrib=%u accelStruct=0x%llX (ac.blasGPUVA=0x%llX animBlasGVA=0x%llX)\n",
+                            row, ac.worldPos.x, ac.worldPos.y, ac.worldPos.z, ac.worldScale,
+                            (unsigned)instances[row].InstanceMask,
+                            (unsigned)instances[row].Flags,
+                            instances[row].InstanceContributionToHitGroupIndex,
+                            (unsigned long long)instances[row].AccelerationStructure,
+                            (unsigned long long)ac.blasGPUVA,
+                            (unsigned long long)animBlasGVA);
             (isGlass ? nGlass : nOpaque)++;
         }
     }

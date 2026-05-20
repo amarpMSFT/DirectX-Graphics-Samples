@@ -408,17 +408,15 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         if (cycleSlot == kAnimCycleSlot)
         {
             // Animated clone: lives in the SAME spiral as the static
-            // clones (every 5th slot in the cycle is the anim variant).
-            // Same spiralPos, same per-clone random scale, no random
-            // rotation (so the wave deformation reads the same way on
-            // every clone, matching the source ball's silhouette).
+            // clones (every 5th slot in the cycle is the anim variant
+            // -- exactly as if it were "part of the static sequence",
+            // just animated).  Same spiralPos formula, same per-clone
+            // random scale, no random rotation (so the wave deformation
+            // reads the same way on every clone, matching the source).
             //
-            // Material: sentinel 0xFFFFFFFFu => inherit source's per-
-            // cluster checker (material slot 7 chrome+glass) so each
-            // clone looks just like the central animated ball, just at
-            // a different position.  Anim clones thus appear as
-            // ~20-of-100 spheres in the spiral that visibly wave the
-            // same way as the central source ball.
+            // Sentinel material override => inherit source's per-cluster
+            // chrome+glass checker so each clone looks just like the
+            // central animated ball, at a different spiral position.
             AnimatedCloneInstance ac;
             ac.worldPos             = spiralPos;
             ac.worldRotEuler        = DirectX::XMFLOAT3(0.f, 0.f, 0.f);

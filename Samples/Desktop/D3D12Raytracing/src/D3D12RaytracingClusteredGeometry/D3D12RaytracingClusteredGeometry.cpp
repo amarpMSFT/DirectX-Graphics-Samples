@@ -132,96 +132,13 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     ThrowIfFailed(commandList->QueryInterface(IID_PPV_ARGS(&m_dxr2CommandList)),
         L"ERROR: ID3D12CommandListRaytracing2 not available.\n");
 
-    // Register an info-queue callback so D3D12 debug-layer messages get
-    // mirrored into our SampleLog file before any break-on-severity fires.
-    // Without this, the debug layer calls __debugbreak() and (if no debugger
-    // is attached) the process exits with STATUS_BREAKPOINT (0xC0000005-ish)
-    // without us ever seeing WHY - which makes WARP and other layered failures
-    // very hard to diagnose. The callback runs in-process before the break.
-    //
-    // Also mute id=1328 (CREATERESOURCE_STATE_IGNORED) - this is a benign
-    // D3D12 quirk: buffer resources are always created in COMMON state
-    // regardless of pInitialState, and the debug layer reminds you per
-    // CreateCommittedResource. Filtering it via SetMessageFilter() leaves
-    // every other warning category active, so we still see real bugs.
-    {
-        ComPtr<ID3D12InfoQueue> infoQueue0;
-        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue0))))
-        {
-            D3D12_MESSAGE_ID denied[] = {
-                D3D12_MESSAGE_ID_CREATERESOURCE_STATE_IGNORED, // 1328
-            };
-            D3D12_INFO_QUEUE_FILTER filter = {};
-            filter.DenyList.NumIDs  = _countof(denied);
-            filter.DenyList.pIDList = denied;
-            HRESULT hrFilter = infoQueue0->AddStorageFilterEntries(&filter);
-            SampleLog::LogF(L"InfoQueue: muted id=1328 hr=0x%08X\n", (unsigned)hrFilter);
-        }
-
-        ComPtr<ID3D12InfoQueue1> infoQueue1;
-        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue1))))
-        {
-            DWORD cookie = 0;
-            HRESULT hrReg = infoQueue1->RegisterMessageCallback(
-                [](D3D12_MESSAGE_CATEGORY /*cat*/,
-                   D3D12_MESSAGE_SEVERITY sev,
-                   D3D12_MESSAGE_ID id,
-                   LPCSTR desc, void* /*ctx*/)
-                {
-                    // Mute the persistent benign id=1328 in the callback path
-                    // too (storage-filter doesn't reach the callback).
-                    if (id == D3D12_MESSAGE_ID_CREATERESOURCE_STATE_IGNORED) return;
-                    const wchar_t* sevStr =
-                        sev == D3D12_MESSAGE_SEVERITY_CORRUPTION ? L"CORRUPTION" :
-                        sev == D3D12_MESSAGE_SEVERITY_ERROR      ? L"ERROR" :
-                        sev == D3D12_MESSAGE_SEVERITY_WARNING    ? L"WARNING" :
-                        sev == D3D12_MESSAGE_SEVERITY_INFO       ? L"INFO" :
-                                                                   L"MESSAGE";
-                    // Convert UTF8 description to wide for SampleLog.
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, desc, -1, nullptr, 0);
-                    std::wstring wdesc(wlen > 0 ? wlen - 1 : 0, L'\0');
-                    if (wlen > 0)
-                        MultiByteToWideChar(CP_UTF8, 0, desc, -1, wdesc.data(), wlen);
-                    SampleLog::LogF(L"[D3D12 %s id=%d] %s\n", sevStr, (int)id, wdesc.c_str());
-                },
-                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
-                nullptr, &cookie);
-            SampleLog::LogF(L"InfoQueue1 callback registered: hr=0x%08X cookie=%u\n",
-                            (unsigned)hrReg, (unsigned)cookie);
-        }
-        else
-        {
-            SampleLog::Write(L"InfoQueue1 not available - D3D12 messages won't be mirrored to log\n");
-        }
-    }
-
     QueryDXR2Support();
-    SampleLog::Write(L">>> BuildScene\n");
     BuildScene();
-    SampleLog::Write(L">>> BuildMaterials\n");
-// CreateAnimationComputePipeline must run BEFORE BuildAccelerationStructures
-    // because the latter invokes UpdateAnimatedObjectPerFrame on the init path,
-    // which dispatches the AnimateBall compute shader -- needs the PSO + RS.
-    SampleLog::Write(L">>> CreateAnimationComputePipeline\n");
-SampleLog::Write(L">>> CreateFillInstantiateArgsPipeline\n");
-SampleLog::Write(L">>> CreateFillMoveArgsPipeline\n");
-SampleLog::Write(L">>> CreateFillBlasArgsPipeline\n");
     CreateFillBlasArgsPipeline();
-    SampleLog::Write(L">>> CreateFillClasTriArgsPipeline\n");
     CreateFillClasTriArgsPipeline();
-    SampleLog::Write(L">>> CreateFillTemplateArgsPipeline\n");
-SampleLog::Write(L">>> BuildAccelerationStructures\n");
     BuildAccelerationStructures();
-    SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
-    SampleLog::Write(L">>> BuildTradCidLookup\n");
-    SampleLog::Write(L">>> BuildPerInstGeomMaterialTable\n");
-SampleLog::Write(L">>> BuildClusterMetadata\n");
-    SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
     CreateRaytracingPipelineAndShaderTables();
-    SampleLog::Write(L">>> CreateDescriptorHeapAndRaytracingOutput\n");
     CreateDescriptorHeapAndRaytracingOutput();
-    SampleLog::Write(L">>> CreateUIFont\n");
-SampleLog::Write(L">>> CreateDeviceDependentResources DONE\n");
 }
 
 void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
@@ -822,9 +739,7 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
 {
-    SampleLog::LogF(L"[CLAS alloc-mode] %s; position-truncate-bits=%u (FLOAT32_3 only)\n",
-                    ClasAllocModeName(), m_positionTruncateBits);
-    m_clasMemStats = ClasMemStats{};        // reset stats for this run
+    m_clasMemStats = ClasMemStats{};
     BuildClasImplicit();
 }
 
@@ -2071,106 +1986,15 @@ void D3D12RaytracingClusteredGeometry::OnSizeChanged(UINT width, UINT height, bo
 
 void D3D12RaytracingClusteredGeometry::OnDestroy()
 {
-    SampleLog::Write(L"OnDestroy: starting shutdown\n");
-    if (m_animatedObjectEnabled && m_pfFramesCaptured >= kPerFrameRingSlots)
-    {
-        SampleLog::LogF(L"[per-frame wall-clock, EMA] INSTANTIATE=%.4f ms  BLAS=%.4f ms  TLAS=%.4f ms  total=%.4f ms\n",
-                        m_pfInstantiateMs, m_pfBlasRebuildMs, m_pfTlasRebuildMs,
-                        m_pfInstantiateMs + m_pfBlasRebuildMs + m_pfTlasRebuildMs);
-    }
-
-    if (m_deviceResources)
-    {
-        // Make sure the GPU is idle before tearing down resources it still
-        // references (BLASes, scratch, etc).
-        m_deviceResources->WaitForGpu();
-    }
-
-    // Explicit unmap of the persistently-mapped CB. Letting the implicit
-    // ComPtr destructor handle this CAN make swap chain / dxgi shutdown hang
-    // intermittently on the experimental runtime.
+    if (m_deviceResources) m_deviceResources->WaitForGpu();
     if (m_sceneCB && m_sceneCBMapped)
     {
         m_sceneCB->Unmap(0, nullptr);
         m_sceneCBMapped = nullptr;
     }
-
-    // Animated object: release all its GPU resources.  Args buffers are
-    // now DEFAULT-heap UAVs (GPU-filled), no maps to release.
-    {
-        auto& a = m_animatedObject;
-        a.templateInputBuffer.Reset();
-        a.templateMetaBuffer.Reset();
-        a.templateArgsBuffer.Reset();
-        a.templateResultBuffer.Reset();
-        a.templateScratchBuffer.Reset();
-        a.templateAddressArray.Reset();
-        a.restPositionsBuffer.Reset();
-        a.perFrameVertexBuffer.Reset();
-        a.perFrameInstArgsBuffer.Reset();
-        a.vertexOffsetArray.Reset();
-        a.perFrameClasResultBuffer.Reset();
-        a.perFrameClasScratchBuffer.Reset();
-        a.perFrameClasAddressArray.Reset();
-        a.blasStorage.Reset();
-        a.blasScratchBuffer.Reset();
-        a.blasArgsBuffer.Reset();
-        a.blasArgsMeta.Reset();
-        a.blasResultAddrBuffer.Reset();
-        m_animatedObjectEnabled = false;
-    }
-
-    // Drop our refs to D3D12 objects in dependency order so destruction is
-    // deterministic. (Without this the order is the member-decl order, which
-    // would release the device first - DXGI doesn't love that.)
-    m_objects.clear();
-    m_clusterInputBuffer.Reset();
-    m_clasArgsMetaBuffer.Reset();
-    m_clasArgsBuffer.Reset();
-    m_clasResultBuffer.Reset();
-    m_clasScratchBuffer.Reset();
-    m_clasAddressArray.Reset();
-    m_clasSizeArray.Reset();
-    m_clasMoveArgsBuffer.Reset();
-    m_blasScratchBuffer.Reset();
-    m_blasArgsBuffer.Reset();
-    m_blasArgsMeta.Reset();
-    m_blasResultAddrBuffer.Reset();
-    m_tlasBuffer.Reset();
-    m_tlasScratchBuffer.Reset();
-    m_tlasInstanceDescs.Reset();
-    m_dxrStateObject.Reset();
-    m_globalRootSignature.Reset();
-    m_rayGenShaderTable.Reset();
-    m_missShaderTable.Reset();
-    m_hitGroupShaderTable.Reset();
-    m_animComputePSO.Reset();
-    m_animComputeRS.Reset();
-    m_fillInstArgsPSO.Reset();
-    m_fillInstArgsRS.Reset();
-    m_fillMoveArgsPSO.Reset();
-    m_fillMoveArgsRS.Reset();
-    m_fillBlasArgsPSO.Reset();
-    m_fillBlasArgsRS.Reset();
-    m_fillClasTriArgsPSO.Reset();
-    m_fillClasTriArgsRS.Reset();
-    m_fillTemplateArgsPSO.Reset();
-    m_fillTemplateArgsRS.Reset();
-    m_descriptorHeap.Reset();
-    m_raytracingOutput.Reset();
-    m_sceneCB.Reset();
-    // DirectXTK UI resources (must be torn down before the device that
-    // owns their backing GPU resources is released).
-    m_uiFont.reset();
-    m_spriteBatch.reset();
-    m_overlayPanelTexture.Reset();
-    m_graphicsMemory.reset();
-    m_dxr2CommandList.Reset();
-    m_dxr2Device.Reset();
-    m_dxrCommandList.Reset();
-    m_dxrDevice.Reset();
-
-    SampleLog::Write(L"OnDestroy: done\n");
+    // ComPtrs reset in declaration order (which is dependency-ordered in the
+    // header: leaf resources first, root device last) when the object goes out
+    // of scope.  Nothing else worth explicitly releasing for the minimal repro.
 }
 
 

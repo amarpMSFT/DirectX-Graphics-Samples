@@ -188,7 +188,6 @@ private:
     // glass region routes to GlassHitGroup (any-hit runs for
     // stochastic translucency) -- no per-pixel branch needed.  This
     // is the canonical DXR way to express multi-material objects.
-    ComPtr<ID3D12Resource>               m_perInstGeomMaterialBuffer;
     // Max geometries per instance the shader is willing to look up.
     // Padding for the flat per-(InstIdx, GeomIdx) layout.  Bump if a
     // future object grows past it.
@@ -219,7 +218,6 @@ private:
     // initial AS build.  Implicit mode is still selectable via --clas-alloc
     // implicit / cycling with [A] for users who want the "no post-process,
     // worst-case alloc" baseline to compare against.
-    ClasAllocMode                        m_clasAllocMode = ClasAllocMode::Implicit;  // forced for COMPRESSED1 min repro (Compact path stubbed out)
 
     // ---------- Static-AS per-frame rebuild mode (cycled via [R]) ----------
     // Simulates LOD-driven AS churn by forcing rebuilds every frame even
@@ -238,14 +236,11 @@ private:
     // Headless measurement helpers (set via --log-pf-every / --exit-after-frames /
     // --at <frame>:<action>).  Zero = disabled.  Frame counter already exists
     // as m_framesRendered.  See OnRender for usage.
-    UINT                                 m_logPfEveryFrames   = 0;
-    UINT                                 m_logRawPfEveryFrames = 0;
     // are short strings matched in OnRender; supported = "alloc-implicit" /
     // "alloc-getsizes" / "alloc-compact" / "rebuild-none" / "rebuild-blas" /
     // "rebuild-clas-blas" / "log" / "exit".  Multiple --at args allowed,
     // executed in frame order (stable).
     struct ScheduledAction { UINT frame; std::wstring action; };
-    std::vector<ScheduledAction>         m_scheduledActions;
     const wchar_t*                       StaticRebuildModeName() const
     {
         switch (m_staticRebuildMode)
@@ -407,16 +402,6 @@ private:
     // change triggers RebuildStaticAccelerationStructures (re-encodes the
     // per-cluster compressed blobs first, then rebuilds CLAS/BLAS/TLAS).
     UINT                                 m_compressedBitsPerComponent = 12;
-    const wchar_t*                       ClasAllocModeName() const
-    {
-        switch (m_clasAllocMode)
-        {
-        case ClasAllocMode::Implicit: return L"implicit-dest (worst-case alloc)";
-        case ClasAllocMode::GetSizes: return L"explicit-dest (exact-fit alloc, 2-pass)";
-        case ClasAllocMode::Compact:  return L"implicit-dest + post-build compact";
-        }
-        return L"?";
-    }
     // Stats captured by BuildClasIndirect, reported via RenderUI overlay + log.
     struct ClasMemStats
     {
@@ -450,11 +435,9 @@ private:
     // baseSharedBuffer+offset.  Used to test whether the NVIDIA
     // COMPRESSED1 rendering corruption goes away when each cluster's
     // VertexBuffer GVA starts at its resource's offset 0.
-    std::vector<ComPtr<ID3D12Resource>>  m_perClusterVbResources;
     // Upload-heap stagings used to fill m_perClusterVbResources via
     // CopyBufferRegion (DEFAULT-heap destination).  Kept alive across
     // function returns until the GPU finishes the copy.
-    std::vector<ComPtr<ID3D12Resource>>  m_perClusterVbStagings;
     // GPU-written args for the static BUILD_CLAS_FROM_TRIANGLES op.
     // FillClasFromTrianglesArgs CS reads m_clasArgsMetaBuffer + a few root
     // constants and writes here; the RTAS op then reads here as its
@@ -682,7 +665,6 @@ private:
     // against any scene colour underneath.  Allocated in CreateUIFont,
     // lives in the shared descriptor heap.
     Microsoft::WRL::ComPtr<ID3D12Resource>   m_overlayPanelTexture;
-    D3D12_GPU_DESCRIPTOR_HANDLE              m_overlayPanelTextureGpu = {};
     // Adaptive overlay sizing -- the overlay TARGETS kScale=0.625 (the
     // size you see at 4K) but if that scale would overflow the back
     // buffer width (typically on 1280x720), kScale is dropped just
@@ -704,8 +686,6 @@ private:
     // renders at <= kTargetScale (won't flash overflow before the
     // measurement catches up); on 4K they're way under the available
     // width so kScale snaps to kTargetScale immediately.
-    float                                    m_overlayContentUnscaledWidth  = 2100.0f;
-    float                                    m_overlayCol1MaxRightUnscaled  = 1180.0f;
     // Height counterpart -- max bottom edge of any text emitted this
     // frame, max-monotonic in unscaled atlas units, used to clamp
     // kScale to fit the back buffer HEIGHT as well as width.  Handles
@@ -715,7 +695,6 @@ private:
     // (720) -- on bigger heights it's irrelevant (the width constraint
     // dominates), on smaller heights it kicks in immediately so we
     // don't flash overflow.
-    float                                    m_overlayContentUnscaledHeight = 1080.0f;
 
     // ---------- Scene constant buffer ----------
     ComPtr<ID3D12Resource>               m_sceneCB;
@@ -725,8 +704,6 @@ private:
     // m_materials[InstanceID] = MaterialDesc.  Indexed by InstanceID() in
     // HLSL via a structured-buffer SRV at root parameter MaterialsSRVSlot.
     // Populated in BuildMaterials() and uploaded once at init time.
-    std::array<MaterialDesc, NUM_MATERIAL_SLOTS> m_materials = {};
-    ComPtr<ID3D12Resource>               m_materialsBuffer;
 // ---------- Per-vertex normal side channel (smooth shading) ----------
     // DXR2 cluster geometry only carries positions in the CLAS vertex buffer,
     // so per-vertex normals and the cluster index buffer have to travel
@@ -760,12 +737,6 @@ private:
     // For the animated sphere we reuse its BASE normals (computed once at
     // gen time) - the per-frame morph deformation is small enough that the
     // static normals stay visually plausible without per-frame re-upload.
-    ComPtr<ID3D12Resource>               m_clusterNormalsBuffer;
-    ComPtr<ID3D12Resource>               m_clusterIndicesBuffer;
-    ComPtr<ID3D12Resource>               m_clusterOffsetsBuffer;
-    UINT                                 m_clusterNormalsCount = 0;
-    UINT                                 m_clusterIndicesCount = 0;
-    UINT                                 m_clusterOffsetsCount = 0;
 // Traditional-BLAS cid recovery: builds the per-triangle cid table
     // + per-(InstanceIdx, GeometryIdx) tri-base table that the
     // traditional path's closest-hit uses to map (GeometryIndex(),
@@ -777,17 +748,12 @@ private:
 // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -
     // see the big design comment on ClusterMeta in RaytracingHlslCompat.h.
-    ComPtr<ID3D12Resource>               m_clusterMetaBuffer;
-    UINT                                 m_clusterMetaCount = 0;
 // ---------- Timestamp queries for AS build wall-clocks ----------
     // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).
     // Per-frame uses a separate heap + readback with 3 ring-buffer slots so
     // the CPU reads timestamps written ~3 frames ago (safely past GPU
     // completion) without stalling.
-    ComPtr<ID3D12QueryHeap>              m_buildQueryHeap;
     ComPtr<ID3D12Resource>               m_buildQueryReadback;
-    ComPtr<ID3D12QueryHeap>              m_pfQueryHeap;
-    ComPtr<ID3D12Resource>               m_pfQueryReadback;
     static const UINT                    kBuildTimestampCount    = 8;
     // 5 op pairs per frame: INSTANTIATE / BLAS-from-CLAS (animated) /
     // TLAS rebuild / static-BLAS rebuild / static-CLAS rebuild.  The
@@ -798,8 +764,6 @@ private:
     static const UINT                    kPerFrameTsPerSlot      = 10;
     static const UINT                    kPerFrameRingSlots      = 3;
     UINT64                               m_timestampFrequency = 0;
-    double                               m_clasBuildMs        = 0.0;
-    double                               m_blasBuildMs        = 0.0;
     double                               m_tlasBuildMs        = 0.0;
     double                               m_totalBuildMs       = 0.0;
     // Per-frame (EMA-smoothed) - split out so the precision / vertex-format
@@ -807,9 +771,6 @@ private:
     double                               m_pfInstantiateMs    = 0.0;  // INSTANTIATE_CLUSTER_TEMPLATES alone
     double                               m_pfBlasRebuildMs    = 0.0;  // BUILD_BLAS_FROM_CLAS alone (animated)
     double                               m_pfTlasRebuildMs    = 0.0;  // TLAS rebuild
-    double                               m_pfStaticBlasMs     = 0.0;  // [R] mode 1+2: re-run static BLAS
-    double                               m_pfStaticClasMs     = 0.0;  // [R] mode 2: re-run static CLAS
-    UINT                                 m_pfWriteSlot        = 0;
     UINT                                 m_pfFramesCaptured   = 0;
     UINT64                               m_totalClasBytes     = 0;
     UINT64                               m_totalBlasBytes     = 0;
@@ -884,7 +845,6 @@ private:
     // overwrites m_overlayStats.  m_overlayStatsHasPrev gates the colouring
     // off for the very first capture (no previous to compare against).
     OverlayStats m_overlayStatsPrev;
-    bool         m_overlayStatsHasPrev = false;
     // Per-mode "last snapshot taken while in this mode".  These exist so
     // mode-specific stats (cluster-only CLAS bytes, trad-only BLAS bytes,
     // etc.) get an intra-mode delta on a [T] cross-mode toggle instead of
@@ -894,10 +854,6 @@ private:
     // with the cross-mode comparison the user wants ("how much memory
     // does trad cost vs cluster, side-by-side") -- see deltaColourMatch
     // / deltaColourCross usage in the overlay renderer.
-    OverlayStats m_overlayStatsLastInCluster;
-    OverlayStats m_overlayStatsLastInTrad;
-    bool         m_overlayStatsHasLastInCluster = false;
-    bool         m_overlayStatsHasLastInTrad    = false;
     // Delta-colour expiry timestamp.  CaptureOverlayStatsSnapshot resets this
     // to (now + 5s) so the red/green tinting auto-fades back to subtle after
     // a quiet period -- prevents the screen permanently glowing red/green
@@ -935,8 +891,6 @@ private:
     // Explicit CLI override is possible via --pf-snap-count N (added
     // for headless measurement runs that want a longer averaging window).
     INT                                  m_pfSnapTargetCount      = 0;   // 0 = auto, resolved in OnInit
-    INT                                  m_pfSnapSkipFramesLeft   = 0;
-    INT                                  m_pfSnapSamplesCollected = 0;
     struct PfSnapAccum {
         double instMs       = 0.0;
         double blasMs       = 0.0;
@@ -944,7 +898,6 @@ private:
         double staticBlasMs = 0.0;
         double staticClasMs = 0.0;
     };
-    PfSnapAccum                          m_pfSnapAccum;
     // True from the moment a config-change toggle fires (CaptureOverlayStatsSnapshot)
     // until the first post-toggle per-frame snap window completes (~kPerFrameRingSlots
     // + kSnapshotSampleCount frames = ~1.1 s at 60 FPS).  The overlay uses this to
@@ -952,7 +905,6 @@ private:
     // settle, so the user isn't staring at the OLD mode's millisecond figures and
     // wondering "did the toggle do anything?".  Set in CaptureOverlayStatsSnapshot
     // (skipped on init), cleared in the snap-window-completes branch.
-    bool                                 m_pfTimingSettlingAfterToggle = false;
 
     // ---------- App state ----------
     StepTimer m_timer;

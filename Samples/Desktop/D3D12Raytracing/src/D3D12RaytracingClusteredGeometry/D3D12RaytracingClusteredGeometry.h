@@ -139,7 +139,7 @@ public:
 
     // Read-only accessor consumed by the BuildSharedClusterTrianglesInputs
     // free function in the .cpp - keeps the helper's signature short.
-    UINT PositionTruncateBits() const { return m_positionTruncateBits; }
+
 private:
     static const UINT FrameCount = 3;
 
@@ -237,16 +237,7 @@ private:
     // "rebuild-clas-blas" / "log" / "exit".  Multiple --at args allowed,
     // executed in frame order (stable).
     struct ScheduledAction { UINT frame; std::wstring action; };
-    const wchar_t*                       StaticRebuildModeName() const
-    {
-        switch (m_staticRebuildMode)
-        {
-        case StaticRebuildMode::None:        return L"off";
-        case StaticRebuildMode::BlasOnly:    return L"BLAS only";
-        case StaticRebuildMode::ClasAndBlas: return L"CLAS + BLAS";
-        }
-        return L"?";
-    }
+
 
     // ---------- Geometry path ([T] toggle) ----------
     // Lets the demo flip between the cluster-based DXR2 pipeline (default)
@@ -260,16 +251,7 @@ private:
     //                  triangle data (DXR1 path)
     enum class GeometryMode { Clusters, Traditional };
     GeometryMode                         m_geometryMode = GeometryMode::Clusters;
-    const wchar_t*                       GeometryModeName() const
-    {
-        switch (m_geometryMode)
-        {
-        case GeometryMode::Clusters:    return L"clustered";
-        case GeometryMode::Traditional: return L"traditional";
-        }
-        return L"?";
-    }
-    bool IsTraditional() const { return m_geometryMode == GeometryMode::Traditional; }
+
 
     // ---------- Animated-BLAS update strategy (Traditional mode only,
     //            cycled via [F]) ----------
@@ -297,15 +279,7 @@ private:
     //               every adapter I've measured.
     enum class TraditionalAllocMode { Implicit, Compact };
     TraditionalAnimMode                  m_traditionalAnimMode  = TraditionalAnimMode::Rebuild;
-    const wchar_t*                       TraditionalAnimModeName() const
-    {
-        switch (m_traditionalAnimMode)
-        {
-        case TraditionalAnimMode::Rebuild: return L"rebuild";
-        case TraditionalAnimMode::Refit:   return L"refit";
-        }
-        return L"?";
-    }
+
 
     // ---------- Position-truncate bits (FLOAT32_3 mode only) ----------
     // Per-vertex float positions can have their LOW N mantissa bits zeroed
@@ -346,7 +320,6 @@ private:
     //   Explicit override via --aa-samples N takes precedence over the
     //   auto-default and skips the OnInit resolve below.
     // Pass-through to the raygen shader is via SceneConstantBuffer.miscParams.z.
-    UINT                                 m_aaSamplesPerPixel = 0;
 
     // CLUSTER-RAINBOW VISUALISATION KNOB.  miscParams.w in the scene CB.
     // Multiplies the cosine-palette per-cluster tint into the material
@@ -357,7 +330,6 @@ private:
     // material colours.  Set to 0 via --cluster-tint 0 for pure material
     // rendering, 1 for the original "cluster rainbow dominates everything"
     // look.
-    float                                m_clusterTint = 0.65f;
 
     // ---------- Runtime knobs exposed via the on-screen overlay ----------
     // Bounce-depth slider.  Stored as a single int that maps to a (refl, refr)
@@ -369,17 +341,9 @@ private:
     //   slider  3 ..  5:  refr stays at 5, refl ramps 3 -> 5     (gap 2..0)
     // Pipeline's MaxRecursionDepth is 16; deepest reachable here is refr=5
     // plus shadow-ray leaf, well within budget.
-    int                                  m_bounceSlider = 3;        // [-2, 5]
     static constexpr int                 kBounceSliderMin = -2;
     static constexpr int                 kBounceSliderMax =  5;
-    UINT ReflectionBounces() const
-    {
-        return (UINT)std::clamp(m_bounceSlider,            0,  5);
-    }
-    UINT RefractionBounces() const
-    {
-        return (UINT)std::clamp(m_bounceSlider + 2,        0,  5);
-    }
+
 
     // Per-component precision for COMPRESSED1 vertex format.  Default 12
     // bits matches the original constexpr that lived in the .cpp; the
@@ -799,13 +763,6 @@ private:
     // with the cross-mode comparison the user wants ("how much memory
     // does trad cost vs cluster, side-by-side") -- see deltaColourMatch
     // / deltaColourCross usage in the overlay renderer.
-    // Delta-colour expiry timestamp.  CaptureOverlayStatsSnapshot resets this
-    // to (now + 5s) so the red/green tinting auto-fades back to subtle after
-    // a quiet period -- prevents the screen permanently glowing red/green
-    // after a sequence of toggles.  Uses std::chrono::steady_clock so it's
-    // wall-clock (animation-pause independent).
-    std::chrono::steady_clock::time_point m_overlayStatsDeltaUntil =
-        std::chrono::steady_clock::time_point::min();
     // Per-frame timing snapshot: rolling fixed-window mean of N raw samples,
     // continuously refreshed (~1 s at 60 FPS).  Numbers in the overlay
     // update live so users can see current GPU cost evolving; the red/green
@@ -835,7 +792,6 @@ private:
     //   hardware adapter                        -> 60 samples (~1 s -- same as before)
     // Explicit CLI override is possible via --pf-snap-count N (added
     // for headless measurement runs that want a longer averaging window).
-    INT                                  m_pfSnapTargetCount      = 0;   // 0 = auto, resolved in OnInit
     struct PfSnapAccum {
         double instMs       = 0.0;
         double blasMs       = 0.0;

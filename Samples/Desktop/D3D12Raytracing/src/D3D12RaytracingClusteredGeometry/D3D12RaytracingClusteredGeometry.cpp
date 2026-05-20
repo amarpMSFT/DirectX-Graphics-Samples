@@ -60,60 +60,21 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
 
 void D3D12RaytracingClusteredGeometry::OnInit()
 {
-    // ---- DXR2 experimental-features opt-in ----
-    // The runtime requires D3D12RaytracingExperiment to be enabled BEFORE any
-    // D3D12CreateDevice call in this process. Without it, ClustersAndPTLAS
-    // GetRTASOperationPrebuildInfo() calls silently return zero sizes even when
-    // the cap reports YES. (D3D12ExperimentalShaderModels is needed for the
-    // SM 6.10 raygen/closesthit shaders.)
-    {
-        UUID experimentalFeatures[] = { D3D12ExperimentalShaderModels, D3D12RaytracingExperiment };
-        HRESULT hrExp = D3D12EnableExperimentalFeatures(_countof(experimentalFeatures),
-                                                        experimentalFeatures, nullptr, nullptr);
-        SampleLog::LogF(L"OnInit: D3D12EnableExperimentalFeatures -> hr=0x%08X (%s)\n",
-                        (unsigned)hrExp, SUCCEEDED(hrExp) ? L"OK" : L"FAIL");
-        ThrowIfFailed(hrExp,
-            L"D3D12EnableExperimentalFeatures failed. Is Windows Developer Mode enabled?\n");
-    }
+    // Enable experimental features BEFORE creating any device.
+    UUID experimentalFeatures[] = { D3D12ExperimentalShaderModels, D3D12RaytracingExperiment };
+    ThrowIfFailed(D3D12EnableExperimentalFeatures(_countof(experimentalFeatures),
+                                                   experimentalFeatures, nullptr, nullptr),
+        L"D3D12EnableExperimentalFeatures failed.  Is Windows Developer Mode enabled?\n");
 
-    SampleLog::Write(L"OnInit: creating DeviceResources\n");
-    // 5th arg = device-resources options.  0 here means VSYNC ON
-    // (Present(1, 0) inside DeviceResources::Present).  Tearing is visible at
-    // low framerates without vsync -- this scene's clusters can dip to <60
-    // fps under heavy reflection/refraction bounces, so we lock to refresh.
-    // If you want VRR / unlocked framerate to measure perf, swap this to
-    // DeviceResources::c_RequireTearingSupport (Present(0, ALLOW_TEARING)).
     m_deviceResources = std::make_unique<DeviceResources>(
-        DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_UNKNOWN,
-        FrameCount,
-        D3D_FEATURE_LEVEL_11_0,
-        /*options*/0,
-        m_adapterIDoverride);
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
+        FrameCount, D3D_FEATURE_LEVEL_11_0, /*options*/0, m_adapterIDoverride);
     m_deviceResources->RegisterDeviceNotify(this);
     m_deviceResources->SetWindow(Win32Application::GetHwnd(), m_width, m_height);
     m_deviceResources->InitializeDXGIAdapter();
-
-    SampleLog::Write(L"OnInit: checking DXR support\n");
-    {
-        ComPtr<ID3D12Device> testDevice;
-        HRESULT hrCreate = D3D12CreateDevice(m_deviceResources->GetAdapter(),
-                                             D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&testDevice));
-        SampleLog::LogF(L"  D3D12CreateDevice(adapter, FL11_0) -> hr=0x%08X (%s)\n",
-                        (unsigned)hrCreate, SUCCEEDED(hrCreate) ? L"OK" : L"FAIL");
-        ThrowIfFailed(hrCreate);
-        D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5 = {};
-        HRESULT hrFeat = testDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5));
-        SampleLog::LogF(L"  CheckFeatureSupport(OPTIONS5) hr=0x%08X, RaytracingTier=0x%X\n",
-                        (unsigned)hrFeat, (unsigned)opts5.RaytracingTier);
-        ThrowIfFalse(SUCCEEDED(hrFeat) && opts5.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED,
-            L"ERROR: DirectX Raytracing tier 1.0+ is required.\n\n");
-    }
-
     m_deviceResources->CreateDeviceResources();
     m_deviceResources->CreateWindowSizeDependentResources();
     CreateDeviceDependentResources();
-    SampleLog::Write(L"OnInit: complete\n");
 }
 
 void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
@@ -1488,60 +1449,23 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
 {
     if (!m_sceneCBMapped) return;
 
-    // Slowly orbit around the scene center.  Two independent cycles so the
-    // camera traces a Lissajous-style path that doesn't repeat for tens of
-    // minutes:
-    //   - YAW (pan):   2 pi / 30 s   per cycle  -- full revolution every 30 s.
-    //   - DOLLY (z):   2 pi / 19 s   per cycle  -- radius pulses INWARD only.
-    // 30 and 19 are coprime (19 is prime), so the eye never re-visits the
-    // same (yaw, radius) tuple within a reasonable session.  The dolly uses a
-    // (1 - cos)/2 envelope rather than a bare sin so the camera NEVER goes
-    // farther back than the rest position -- it only swings closer to the
-    // scene, framing interior cluster detail at the inner peak.  Range:
-    // [kBaseRadius - kDollyAmp, kBaseRadius].
-    const double t           = m_animSeconds;
-    const float  angle       = float(t * (2.0 * M_PI / 30.0));
-    constexpr float kBaseRadius  = 6.5f;     // outermost orbit distance (= rest position)
-    constexpr float kDollyAmp    = 3.0f;     // inward swing magnitude; radius sweeps 3.5..6.5
-    constexpr float kDollyPeriod = 19.0f;    // seconds; coprime with 30s pan period (full in-and-out every 19 s)
-    const float  dollyPhase  = float(t * (2.0 * M_PI / kDollyPeriod));
-    const float  radius      = kBaseRadius
-                             - kDollyAmp * 0.5f * (1.0f - std::cos(dollyPhase));
-    const float  height      = 1.5f;                                 // eye lifted (was 0.8) - higher vantage
+    // Simple orbit around the scene origin: yaw 2*PI / 30 s, fixed radius,
+    // fixed eye height.  All shaders need is the camera basis + aspect ratio
+    // + tan(half-FOV).
+    const float angle  = float(m_animSeconds * (2.0 * M_PI / 30.0));
+    const float radius = 6.5f;
+    const float height = 1.5f;
     XMVECTOR eye = XMVectorSet(radius * std::sin(angle), height,
-                               -radius * std::cos(angle), 1.0f);
-    XMVECTOR at  = XMVectorSet(0.5f, 0.0f, 0.0f, 1.0f);   // look-at LOWERED (was 1.2) - camera now pitches DOWN noticeably -> floor reads as the dominant surface, sky shrinks to a band at the top, slab gets seen more from above
+                              -radius * std::cos(angle), 1.0f);
+    XMVECTOR at  = XMVectorSet(0.5f, 0.0f, 0.0f, 1.0f);
     XMVECTOR up  = XMVectorSet(0, 1, 0, 0);
-
     XMMATRIX view = XMMatrixLookAtLH(eye, at, up);
-    XMMATRIX viewToWorld = XMMatrixInverse(nullptr, view);
 
     SceneConstantBuffer cb = {};
-    // NB: XMMATRIX is row-major, HLSL constant-buffer matrices default to
-    // column-major packing. Storing the XM matrix directly (without transpose)
-    // makes HLSL see XM_M^T, and `mul(M, v_col)` in HLSL then computes
-    // XM_M^T * v_col, which is the correct view->world transform of a column
-    // direction vector. Transposing here AND using `mul(M, v)` in HLSL would
-    // double-flip the convention and put the camera basis in the wrong place
-    // (cardinal-axis orbit positions end up pointing AWAY from the scene).
-    cb.viewToWorld = viewToWorld;
+    cb.viewToWorld     = XMMatrixInverse(nullptr, view);
     XMStoreFloat4(&cb.cameraPosition, eye);
-    cb.miscParams.x = (float)m_width / (float)m_height;
-    cb.miscParams.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60deg vertical FOV
-    cb.miscParams.z = (float)m_aaSamplesPerPixel;                  // raygen sample count (1/2/4)
-    cb.miscParams.w = m_clusterTint;                               // 0..1 cluster-rainbow tint blend
-
-    // Runtime knobs the shader reads each TraceRay.  See SceneConstantBuffer
-    // in RaytracingHlslCompat.h for the slot reservations.
-    cb.runtimeParams.x = ReflectionBounces();                      // computed from m_bounceSlider
-    cb.runtimeParams.y = RefractionBounces();                      // ditto (= refl or refl+2 with clamps)
-    cb.runtimeParams.z = IsTraditional() ? 1u : 0u;                // 1 -> closest-hit uses per-instance lookups instead of ClusterID
-    // Sun in upper-back-right. Direction TO the light, normalized. .w is the
-    // ambient floor: even fully-shadowed pixels get this fraction of base
-    // colour so the scene reads instead of going pitch black.
-    XMVECTOR sunDir = XMVector3Normalize(XMVectorSet(0.45f, 0.75f, 0.50f, 0.0f));
-    XMStoreFloat4(&cb.lightDir, sunDir);
-    cb.lightDir.w = 0.15f;                                          // ambient floor (0.15 - middle setting; tried 0.08 punchy, reverted)
+    cb.miscParams.x    = (float)m_width / (float)m_height;
+    cb.miscParams.y    = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);   // 60 degree vertical FOV
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
 }
 
@@ -1551,32 +1475,8 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
 void D3D12RaytracingClusteredGeometry::OnUpdate()
 {
     m_timer.Tick();
-    if (!m_animPaused)
-        m_animSeconds += m_timer.GetElapsedSeconds();
+    m_animSeconds += m_timer.GetElapsedSeconds();
     UpdateSceneConstantBuffer();
-
-    // Wall-clock frame-time measurement for the overlay's FPS / ms-per-frame
-    // line.  Independent of StepTimer's 100 ms cap (see m_frameTimeRing
-    // header comment).  Rolling average over m_frameTimeWindow samples so
-    // the displayed value doesn't jitter frame-to-frame (HW) and doesn't
-    // lag minutes behind state changes (WARP); window size auto-resolved
-    // in OnInit per adapter.  First frame has no prior timestamp so we
-    // just seed m_lastFrameWallTime; rolling buffer fills over the next
-    // N frames.
-    const auto now = std::chrono::steady_clock::now();
-    if (m_lastFrameWallTime.time_since_epoch().count() != 0 && m_frameTimeWindow > 0)
-    {
-        const double dt = std::chrono::duration<double>(now - m_lastFrameWallTime).count();
-        // Maintain rolling sum: subtract the slot we're about to overwrite,
-        // add the new dt.  Until the ring fills, the overwritten slot is
-        // 0 so we just accumulate.
-        m_frameTimeRingSum -= m_frameTimeRing[m_frameTimeRingIdx];
-        m_frameTimeRing[m_frameTimeRingIdx] = dt;
-        m_frameTimeRingSum += dt;
-        m_frameTimeRingIdx = (m_frameTimeRingIdx + 1) % m_frameTimeWindow;
-        if (m_frameTimeRingCount < m_frameTimeWindow) ++m_frameTimeRingCount;
-    }
-    m_lastFrameWallTime = now;
 }
 
 void D3D12RaytracingClusteredGeometry::OnRender()
@@ -1592,11 +1492,7 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     auto cl  = m_deviceResources->GetCommandList();
     auto cl4 = m_dxrCommandList.Get();
 
-    // ---- Per-frame AS work + timestamp queries -----------------------------
-    // Read back the slot that was written N-frames ago first (data is safely
-    // past GPU completion - we read the slot we're about to overwrite). Skip
-    // until we've captured at least kPerFrameRingSlots samples to avoid
-    // reading uninitialised heap data.
+    // Bind RT pipeline + global root sig + descriptor heap.
     cl4->SetComputeRootSignature(m_globalRootSignature.Get());
     ID3D12DescriptorHeap* heaps[] = { m_descriptorHeap.Get() };
     cl4->SetDescriptorHeaps(_countof(heaps), heaps);
@@ -1606,24 +1502,22 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     cl4->SetComputeRootConstantBufferView(GlobalRootSig::SceneCBVSlot, m_sceneCB->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
+    // DispatchRays at back-buffer resolution.  Shader tables: 1 record each
+    // (raygen / miss / hit), stride = identifier size.
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
     D3D12_DISPATCH_RAYS_DESC drd = {};
     drd.RayGenerationShaderRecord.StartAddress = m_rayGenShaderTable->GetGPUVirtualAddress();
     drd.RayGenerationShaderRecord.SizeInBytes  = m_rayGenShaderTable->GetDesc().Width;
     drd.MissShaderTable.StartAddress           = m_missShaderTable->GetGPUVirtualAddress();
     drd.MissShaderTable.SizeInBytes            = m_missShaderTable->GetDesc().Width;
-    // Stride = single record size (32 B), not whole-table width. The miss
-    // table now has TWO records (primary + shadow); each TraceRay's
-    // MissShaderIndex selects which one by stepping `stride` bytes in.
     drd.MissShaderTable.StrideInBytes          = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     drd.HitGroupTable.StartAddress             = m_hitGroupShaderTable->GetGPUVirtualAddress();
     drd.HitGroupTable.SizeInBytes              = m_hitGroupShaderTable->GetDesc().Width;
     drd.HitGroupTable.StrideInBytes            = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-    drd.Width  = (UINT)bbDesc.Width;
-    drd.Height = (UINT)bbDesc.Height;
-    drd.Depth  = 1;
+    drd.Width = (UINT)bbDesc.Width; drd.Height = (UINT)bbDesc.Height; drd.Depth = 1;
     cl4->DispatchRays(&drd);
 
+    // Copy raytracing output (UAV) -> back buffer (RT).
     D3D12_RESOURCE_BARRIER toCopy[2] = {
         CD3DX12_RESOURCE_BARRIER::Transition(m_raytracingOutput.Get(),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -1632,25 +1526,14 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     };
     cl->ResourceBarrier(_countof(toCopy), toCopy);
     cl->CopyResource(m_deviceResources->GetRenderTarget(), m_raytracingOutput.Get());
-    D3D12_RESOURCE_BARRIER toRtAndPresent[2] = {
+    D3D12_RESOURCE_BARRIER toRt[2] = {
         CD3DX12_RESOURCE_BARRIER::Transition(m_raytracingOutput.Get(),
             D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         CD3DX12_RESOURCE_BARRIER::Transition(m_deviceResources->GetRenderTarget(),
             D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
     };
-    cl->ResourceBarrier(_countof(toRtAndPresent), toRtAndPresent);
-
-    // Paint on-screen overlay text (stats, key bindings).  The back buffer is
-    // now in RENDER_TARGET; SpriteBatch binds it as an RTV, draws text, and
-    // we hand off to Present() which transitions to PRESENT internally.
-m_deviceResources->Present();
-
-    // DirectXTK: tag per-frame upload pages with the queue's current fence value
-    // AFTER the cmd list has been executed (Present did ExecuteCommandList).  This
-    // is the canonical placement -- calling Commit before Present would signal the
-    // fence on a queue position before our text-draw commands and the ring
-    // allocator could reclaim live upload pages.
-    if (m_graphicsMemory) m_graphicsMemory->Commit(m_deviceResources->GetCommandQueue());
+    cl->ResourceBarrier(_countof(toRt), toRt);
+    m_deviceResources->Present();
 }
 
 // =====================================================================================

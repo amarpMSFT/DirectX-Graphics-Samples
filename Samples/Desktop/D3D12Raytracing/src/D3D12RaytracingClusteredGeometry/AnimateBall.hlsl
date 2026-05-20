@@ -43,7 +43,12 @@ cbuffer Params : register(b0)
 // per-vertex radial scale = 1 + amp * (sin(freq*x + t*3) + ... ) / 3
 // (positions are sphere-centred at origin, so radial scaling is just
 // multiplicative.)
-static const float kWobbleAmp  = 0.08f;
+// Wave amp bumped from 0.08 -> 0.20 (i.e. ~20% radial deformation)
+// to make wave motion clearly visible on the [N] workload-scaling
+// anim clones too -- at 0.08 the deformation was sub-pixel on
+// distance-LOD'd anim clones at smaller scales and the user
+// reported "I don't see animated balls other than the central one".
+static const float kWobbleAmp  = 0.20f;
 static const float kWobbleFreq = 20.0f;
 
 [numthreads(64, 1, 1)]

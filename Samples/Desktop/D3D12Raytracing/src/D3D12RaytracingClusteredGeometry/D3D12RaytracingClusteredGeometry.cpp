@@ -2828,8 +2828,8 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     //    is mirrored here ONLY for this assert.  Keep the two in sync.
     // ------------------------------------------------------------------
     constexpr float kRestRadius    = 1.00f;       // central showpiece ball, bigger
-    constexpr float kEnvelopeScale = 1.18f;       // hint sphere radius = rest * 1.18
-    constexpr float kAnimWobbleAmp = 0.08f;       // MUST match AnimateBall.hlsl::kWobbleAmp
+    constexpr float kEnvelopeScale = 1.30f;       // hint sphere radius = rest * 1.30 (was 1.18 -- bumped to give headroom over kAnimWobbleAmp 0.20)
+    constexpr float kAnimWobbleAmp = 0.20f;       // MUST match AnimateBall.hlsl::kWobbleAmp (bumped from 0.08 so wave is visible on [N] clones at smaller scales / further distances)
     static_assert(1.0f + kAnimWobbleAmp < kEnvelopeScale,
         "kEnvelopeScale must leave headroom over the animation's max radial "
         "displacement (1 + kAnimWobbleAmp).  See AnimateBall.hlsl::kWobbleAmp -- "

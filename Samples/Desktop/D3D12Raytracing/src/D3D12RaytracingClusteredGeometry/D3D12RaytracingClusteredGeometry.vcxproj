@@ -99,6 +99,7 @@
     <ClCompile Include="DXSample.cpp" />
     <ClCompile Include="D3D12RaytracingClusteredGeometry.cpp" />
     <ClCompile Include="OverlayUI.cpp" />
+    <ClCompile Include="ScenePopulation.cpp" />
     <ClCompile Include="MaterialData.cpp" />
     <ClCompile Include="SceneData.cpp" />
     <ClCompile Include="stdafx.cpp">

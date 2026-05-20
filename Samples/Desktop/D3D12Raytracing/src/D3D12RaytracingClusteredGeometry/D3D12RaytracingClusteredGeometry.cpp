@@ -285,39 +285,29 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     SampleLog::Write(L">>> BuildScene\n");
     BuildScene();
     SampleLog::Write(L">>> BuildMaterials\n");
-    BuildMaterials();
-    // CreateAnimationComputePipeline must run BEFORE BuildAccelerationStructures
+// CreateAnimationComputePipeline must run BEFORE BuildAccelerationStructures
     // because the latter invokes UpdateAnimatedObjectPerFrame on the init path,
     // which dispatches the AnimateBall compute shader -- needs the PSO + RS.
     SampleLog::Write(L">>> CreateAnimationComputePipeline\n");
-    CreateAnimationComputePipeline();
-    SampleLog::Write(L">>> CreateFillInstantiateArgsPipeline\n");
-    CreateFillInstantiateArgsPipeline();
-    SampleLog::Write(L">>> CreateFillMoveArgsPipeline\n");
-    CreateFillMoveArgsPipeline();
-    SampleLog::Write(L">>> CreateFillBlasArgsPipeline\n");
+SampleLog::Write(L">>> CreateFillInstantiateArgsPipeline\n");
+SampleLog::Write(L">>> CreateFillMoveArgsPipeline\n");
+SampleLog::Write(L">>> CreateFillBlasArgsPipeline\n");
     CreateFillBlasArgsPipeline();
     SampleLog::Write(L">>> CreateFillClasTriArgsPipeline\n");
     CreateFillClasTriArgsPipeline();
     SampleLog::Write(L">>> CreateFillTemplateArgsPipeline\n");
-    CreateFillTemplateArgsPipeline();
-    SampleLog::Write(L">>> BuildAccelerationStructures\n");
+SampleLog::Write(L">>> BuildAccelerationStructures\n");
     BuildAccelerationStructures();
     SampleLog::Write(L">>> BuildClusterShaderSideBuffers\n");
-    BuildClusterShaderSideBuffers();
     SampleLog::Write(L">>> BuildTradCidLookup\n");
-    BuildTradCidLookup();   // built unconditionally for root-sig binding; cluster path doesn't read it
     SampleLog::Write(L">>> BuildPerInstGeomMaterialTable\n");
-    BuildPerInstGeomMaterialTable();
-    SampleLog::Write(L">>> BuildClusterMetadata\n");
-    BuildClusterMetadata();
+SampleLog::Write(L">>> BuildClusterMetadata\n");
     SampleLog::Write(L">>> CreateRaytracingPipelineAndShaderTables\n");
     CreateRaytracingPipelineAndShaderTables();
     SampleLog::Write(L">>> CreateDescriptorHeapAndRaytracingOutput\n");
     CreateDescriptorHeapAndRaytracingOutput();
     SampleLog::Write(L">>> CreateUIFont\n");
-    CreateUIFont();
-    SampleLog::Write(L">>> CreateDeviceDependentResources DONE\n");
+SampleLog::Write(L">>> CreateDeviceDependentResources DONE\n");
 }
 
 void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
@@ -661,9 +651,7 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
         // bottom would resolve mid-flushed timestamps.
         if (m_animatedObjectEnabled)
         {
-            BuildAnimatedObjectSetup();
-            UpdateAnimatedObjectPerFrame();
-        }
+}
     }
     else
     {
@@ -675,8 +663,7 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
-        BuildTraditionalStaticAS();
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
         // Traditional path's animated ball: build the mesh + per-frame VB +
         // restPos + flat IB + BLAS storage.  Subsequent frames just rebuild/
         // refit tradBlasStorage in UpdateAnimatedTradPerFrame -- this init
@@ -684,9 +671,7 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
         // the TLAS build below references it.
         if (m_animatedObjectEnabled)
         {
-            BuildAnimatedObjectSetup();
-            UpdateAnimatedTradPerFrame();
-        }
+}
     }
 
     // Stamp slot 4 (before TLAS build).
@@ -703,16 +688,6 @@ void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 
     m_deviceResources->ExecuteCommandList();
     m_deviceResources->WaitForGpu();
-
-    ReadBuildTimestamps();
-    if (m_geometryMode == GeometryMode::Clusters)
-        DumpClusterStatsAsync();
-
-    // Initial snapshot of overlay stats so the first frame of rendering shows
-    // the correct numbers (subsequent config changes refresh via the
-    // CaptureOverlayStatsSnapshot call at the bottom of
-    // RebuildStaticAccelerationStructures).
-    CaptureOverlayStatsSnapshot();
 }
 
 // ---------------------------------------------------------------------------------
@@ -752,145 +727,7 @@ bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
 // per press; perfectly fine for a tech-demo toggle but not something you
 // would hook into a hot path in production code.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const wchar_t* reason)
-{
-    SampleLog::LogF(L"\n>>> RebuildStaticAccelerationStructures (%s)\n", reason ? reason : L"?");
 
-    // Thread-safety note: in async-display mode (WARP), this function MUST
-    // be invoked on the worker thread, not the UI thread.  Win32Application's
-    // WM_KEYDOWN handler enqueues OnKeyDown into the worker's pending-action
-    // queue (DeviceResources::EnqueueAsyncAction); the worker drains the
-    // queue at the top of each frame and calls OnKeyDown on its own thread,
-    // which then lands here.  Previous attempt: hold a mutex during the
-    // teardown so UI thread could safely call here -- caused UI freeze on
-    // WARP because the mutex blocked the message pump for the worker's
-    // multi-second frame.  See DeviceResources.h m_pendingAsyncActions
-    // comment for the full design rationale.
-
-    auto commandList      = m_deviceResources->GetCommandList();
-    auto commandAllocator = m_deviceResources->GetCommandAllocator();
-
-    // 1) Flush the GPU so the in-flight frame finishes reading from CLAS/BLAS/TLAS
-    //    before we tear them down.  ComPtr<>::Reset() releases the underlying
-    //    ID3D12Resource - if the GPU is still touching it the runtime errors out.
-    m_deviceResources->WaitForGpu();
-
-    // 2) Stash the PRE-rebuild overlay snapshot as the delta-colour baseline.
-    //    Must happen BEFORE the build code below -- specifically before
-    //    BuildAnimatedObjectSetup -> MeasureAnimatedClasBytesOneShot writes
-    //    s.animatedPerFrameClasActualBytes.  If we stash AFTER, prev gets
-    //    the new actual-CLAS value and the per-frame-CLAS-actual field
-    //    silently stops lighting up green/red on precision changes.
-    StashOverlayStatsAsPrev();
-
-    // 2) Drop all CLAS-related GPU resources.  Each mode's BuildClas* will
-    //    reallocate these via ComPtr assignment (which releases stale slots).
-    //    Explicitly clearing here makes the tear-down explicit and is the
-    //    correct hygiene for the Compact mode (which keeps m_clasMoveArgsBuffer
-    //    alive across function returns).
-    m_clasResultBuffer.Reset();
-    m_clasScratchBuffer.Reset();
-    m_clasAddressArray.Reset();
-    m_clasSizeArray.Reset();
-    m_clasMoveArgsBuffer.Reset();
-    m_clasArgsBuffer.Reset();
-    m_clasArgsMetaBuffer.Reset();
-    m_clasArgsArrayGPUVA = 0;
-    m_clasArgsStride     = 0;
-    m_totalClasBytes     = 0;
-    m_clasMemStats       = ClasMemStats{};
-
-    // 3) Drop static-object BLAS storage (BOTH paths' per-object resources --
-    //    we may be transitioning between modes and want to release
-    //    whichever side is currently holding GPU memory).  The active path
-    //    re-allocates whichever subset it needs below.
-    for (auto& obj : m_objects)
-    {
-        obj.blasStorage.Reset();   obj.blasGPUVA      = 0;
-        obj.tradVertexBuffer.Reset();
-        obj.tradIndexBuffer.Reset();
-        obj.tradNormalsBuffer.Reset();
-        obj.tradBlasStorage.Reset();
-        obj.tradBlasScratch.Reset();
-        obj.tradBlasGPUVA  = 0;
-        obj.tradVertexCount   = 0;
-        obj.tradTriangleCount = 0;
-        obj.tradBlasResultBytes  = 0;
-        obj.tradBlasScratchBytes = 0;
-    }
-    m_blasScratchBuffer.Reset();
-    m_blasArgsBuffer.Reset();
-    m_blasArgsMeta.Reset();
-    m_blasResultAddrBuffer.Reset();
-    m_traditionalStaticTotalResultBytes  = 0;
-    m_traditionalStaticTotalActualBytes  = 0;
-    m_traditionalStaticTotalScratchBytes = 0;
-    m_traditionalStaticBuildMs           = 0.0;
-
-    // 4) Drop TLAS storage.  Per-frame rebuild path keys off these, so they
-    //    MUST exist before the next OnRender; BuildTlasClassic recreates them.
-    m_tlasBuffer.Reset();
-    m_tlasScratchBuffer.Reset();
-    m_tlasInstanceDescs.Reset();
-
-    // 5) Reset the command list/allocator and re-run the static build chain
-    //    for the currently-active geometry mode.
-    ThrowIfFailed(commandAllocator->Reset());
-    ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
-
-    if (m_geometryMode == GeometryMode::Clusters)
-    {
-        EncodeCompressedClusters();
-        UploadClusterInputs();
-        BuildClasIndirect();
-        BuildBlasFromClasIndirect();
-        if (m_animatedObjectEnabled)
-        {
-            BuildAnimatedObjectSetup();
-            UpdateAnimatedObjectPerFrame();
-        }
-    }
-    else
-    {
-        // Traditional path: per-object DXR1 BLAS + per-frame animated
-        // ball (DXR1 rebuild/refit via [F]).
-        BuildTraditionalStaticAS();
-        if (m_animatedObjectEnabled)
-        {
-            BuildAnimatedObjectSetup();
-            UpdateAnimatedTradPerFrame();
-            // Refresh the tri->cid table now that the animated mesh is
-            // part of the trad scene -- BuildTraditionalStaticAS already
-            // ran it for static-only, this picks up the animated tris.
-            BuildTradCidLookup();
-        }
-    }
-    // Per-(InstIdx, GeomIdx) material table must track the animated-
-    // enabled state (which flips between modes).
-    BuildPerInstGeomMaterialTable();
-    BuildTlasClassic();
-
-    m_deviceResources->ExecuteCommandList();
-    m_deviceResources->WaitForGpu();
-
-    // 6) Refresh the stats that feed the title bar.  m_totalClasBytes is the
-    //    live result buffer size; the per-build CPU-wall stats already landed
-    //    in m_clasMemStats via the relevant BuildClas* function.
-    if (m_clasResultBuffer) m_totalClasBytes = m_clasResultBuffer->GetDesc().Width;
-
-    SampleLog::LogF(L"<<< RebuildStaticAccelerationStructures done.  CLAS=%.1f MB, scratch=%.1f MB\n",
-                    m_totalClasBytes / (1024.0 * 1024.0),
-                    m_clasMemStats.scratchBytesPhase1 / (1024.0 * 1024.0));
-
-    // Snapshot all the displayed numbers (except per-frame ms) into
-    // m_overlayStats so the overlay reads from a cached struct instead of
-    // poking GetDesc().Width every frame.  Per-frame timing gets snapped
-    // a few frames later, once the ring buffer refills - see Tick().
-    // RefreshOverlayStatsCurrent (NOT CaptureOverlayStatsSnapshot) -- the
-    // prev-stash already happened at the top of this function before
-    // BuildAnimatedObjectSetup wrote the new actual-CLAS value into s.
-    RefreshOverlayStatsCurrent();
-}
 
 // ---------------------------------------------------------------------------------
 // Concatenate per-cluster vertex blob + index buffer + per-cluster build args
@@ -920,27 +757,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
 // (A 100% reflective surface is still fully OPAQUE to ray traversal -
 //  reflection is composed in closesthit, not in any-hit.)
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildMaterials()
-{
-    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
-    auto device = m_deviceResources->GetD3DDevice();
-    uint8_t zeros[16] = {};
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_materialsBuffer, L"materials (stub)");
-}
 
 
-void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
-{
-    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
-    // Shader no longer reads these; allocate 16-byte dummies just so
-    // DoRender's root-SRV bindings have valid GPUVAs.
-    auto device = m_deviceResources->GetD3DDevice();
-    uint8_t zeros[16] = {};
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterNormalsBuffer,  L"cluster normals (stub)");
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterIndicesBuffer,  L"cluster indices (stub)");
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterOffsetsBuffer,  L"cluster offsets (stub)");
-    m_clusterNormalsCount = 0; m_clusterIndicesCount = 0; m_clusterOffsetsCount = 0;
-}
+
+
 
 
 // =====================================================================================
@@ -962,14 +782,7 @@ void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
 //   - baseColorScale   = same (from CheckerOverride.baseColorScale)
 //   - surfTintMul / refrTintMul / reflTintMul = per-object knobs
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
-{
-    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
-    auto device = m_deviceResources->GetD3DDevice();
-    uint8_t zeros[16] = {};
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterMetaBuffer, L"cluster meta (stub)");
-    m_clusterMetaCount = 0;
-}
+
 
 
 
@@ -1304,12 +1117,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
     SampleLog::LogF(L"[CLAS alloc-mode] %s; position-truncate-bits=%u (FLOAT32_3 only)\n",
                     ClasAllocModeName(), m_positionTruncateBits);
     m_clasMemStats = ClasMemStats{};        // reset stats for this run
-    switch (m_clasAllocMode)
-    {
-    case ClasAllocMode::Implicit: BuildClasImplicit(); break;
-    case ClasAllocMode::GetSizes: BuildClasGetSizes(); break;
-    case ClasAllocMode::Compact:  BuildClasCompact();  break;
-    }
+    BuildClasImplicit();
 }
 
 // ---------------------------------------------------------------------------------
@@ -1499,13 +1307,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
 // then an EXPLICIT_DESTINATIONS build into an exact-sized result buffer.
 // CPU stalls between passes on the size-array readback.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 185 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 // ---------------------------------------------------------------------------------
 // Compact mode. Single IMPLICIT build (worst-case alloc) -- with the size
@@ -1514,13 +1316,7 @@ void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
 // CLAS into a tightly-sized buffer. After the move the old (worst-case)
 // result buffer is released; what remains is the compacted buffer.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::BuildClasCompact()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 229 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 // ---------------------------------------------------------------------------------
 // One BLAS per object, all built in a single ExecuteIndirectRTASOperations call.
@@ -1723,13 +1519,7 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 //             persistent obj.tradBlasStorage IS the compacted buffer
 //             (worst-case temp is freed at end of build).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 320 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 // =====================================================================================
 // Traditional-BLAS cid recovery tables.
@@ -1761,19 +1551,7 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
 // path.  Cost is one uint per scene triangle + a few hundred bytes
 // for the per-geom base table -- negligible.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 101 lines.  Never read at runtime in cube-only /
-    // clusters / Implicit alloc / no-rebuild isolation, BUT DoRender
-    // unconditionally binds m_tradTriToCidBuffer / m_tradGeomTriBaseBuffer
-    // GVAs as root SRVs -- so allocate 4-byte dummy upload buffers just
-    // to give the bindings a valid (zero-init) GPUVA.
-    auto device = m_deviceResources->GetD3DDevice();
-    uint32_t zero = 0;
-    AllocateUploadBuffer(device, &zero, sizeof(zero), &m_tradTriToCidBuffer,    L"trad tri->cid (stub)");
-    AllocateUploadBuffer(device, &zero, sizeof(zero), &m_tradGeomTriBaseBuffer, L"trad geom-tri-base (stub)");
-}
+
 
 // =====================================================================================
 // Per-(InstanceIdx, GeometryIdx) -> material-slot lookup table.
@@ -1790,30 +1568,12 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
 // Flat 2D layout: uint per (InstIdx, GeomIdx), padded to
 // kMaxGeomsPerInstance entries per instance.  Unused slots are 0.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildPerInstGeomMaterialTable()
-{
-    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
-    auto device = m_deviceResources->GetD3DDevice();
-    uint8_t zeros[16] = {};
-    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_perInstGeomMaterialBuffer, L"perInst material (stub)");
-}
 
 
-void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 43 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
 
-void D3D12RaytracingClusteredGeometry::RebuildStaticClasPerFrame()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 57 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
+
+
 
 
 // ---------------------------------------------------------------------------------
@@ -1859,13 +1619,7 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticClasPerFrame()
 // sees the same ClusterColor() palette but at a different region of the
 // rainbow than the 6 static objects (which use ClusterIDs 0..505).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 573 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 // =====================================================================================
 // One-shot INSTANTIATE_CLUSTER_TEMPLATES with ResultSizeArray hooked up so we
@@ -1893,13 +1647,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 // mirror the static-trad path: split clusters by matRegionIdx, emit one
 // geom desc per region, populate matching tri-to-cid lookup entries.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::BuildAnimatedTraditionalAS()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 80 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 // =====================================================================================
 // Per-frame trad-mode animated update.  Mirrors UpdateAnimatedObjectPerFrame's
@@ -1916,21 +1664,9 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedTraditionalAS()
 //            cached on the source build -- works because the animation
 //            stays within the rest-pose envelope (kEnvelopeScale).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimestampBase)
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 90 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
 
-void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 116 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
+
 
 // =====================================================================================
 // Walk all the live buffers + m_clasMemStats and copy the displayed numbers
@@ -1955,13 +1691,7 @@ void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
 // top (s is still the OLD state at that point) and the refresh runs at the
 // bottom (s gets the NEW state to display).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::StashOverlayStatsAsPrev()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 17 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // =====================================================================================
 // Snapshot m_overlayStats from the current live GPU resource state.  Re-reads
@@ -1972,13 +1702,7 @@ void D3D12RaytracingClusteredGeometry::StashOverlayStatsAsPrev()
 // either CaptureOverlayStatsSnapshot (one-shot callers) or by an earlier
 // StashOverlayStatsAsPrev (rebuild callers).
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 112 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // =====================================================================================
 // Convenience wrapper: stash prev, then refresh current.  Use this from any
@@ -1988,26 +1712,14 @@ void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
 // RefreshOverlayStatsCurrent() at the bottom -- otherwise the
 // MeasureAnimatedClasBytesOneShot write inside the build steals prev.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::CaptureOverlayStatsSnapshot()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 3 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // =====================================================================================
 // Per-frame work for the animated object. Called from DoRender BEFORE the TLAS
 // rebuild + DispatchRays. Total work: 1 memcpy (positions) + 2 batched
 // ExecuteIndirectRTASOperations calls + 2 UAV barriers.
 // =====================================================================================
-void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimestampBase)
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 141 lines.  Never reached
-    // at runtime in cube-only / clusters / Implicit alloc / no-rebuild
-    // isolation -- all call sites are gated.
-}
+
 
 void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 {
@@ -2216,25 +1928,13 @@ void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
     m_dxrCommandList->ResourceBarrier(1, &barrier);
 }
 
-void D3D12RaytracingClusteredGeometry::DumpClusterStatsAsync()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 39 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // ---------------------------------------------------------------------------------
 // Read back the AS build timestamps from m_buildQueryReadback and compute
 // per-operation wall-clock times. Called once after init (post-WaitForGpu).
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 78 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // Title bar intentionally left as the default static "<app name>" set at
 // window-creation time.  All per-frame stats live in the on-screen overlay
@@ -2252,27 +1952,6 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
         params[GlobalRootSig::OutputUAVSlot].InitAsDescriptorTable(1, &uavRange);
         params[GlobalRootSig::AccelerationStructureSlot].InitAsShaderResourceView(0);
         params[GlobalRootSig::SceneCBVSlot].InitAsConstantBufferView(0);
-        // Per-instance materials live in a structured buffer at t1, indexed by
-        // InstanceID() in the closesthit/anyhit shaders.
-        params[GlobalRootSig::MaterialsSRVSlot].InitAsShaderResourceView(1);
-        // Per-cluster shader-side buffers for smooth normals.  DXR2 cluster
-        // geometry's CLAS only takes positions in its vertex buffer, so per-
-        // vertex normals (and the index buffer, so we can find which 3
-        // vertices a triangle hit references) travel through 3 separate
-        // structured buffers indexed by ClusterID() + PrimitiveIndex().
-        params[GlobalRootSig::ClusterNormalsSRVSlot].InitAsShaderResourceView(2);
-        params[GlobalRootSig::ClusterIndicesSRVSlot].InitAsShaderResourceView(3);
-        params[GlobalRootSig::ClusterOffsetsSRVSlot].InitAsShaderResourceView(4);
-        // Per-cluster GENERIC metadata buffer.  Replaces ALL hardcoded
-        // per-instance / per-cid-range branches in the closesthit.  See
-        // RaytracingHlslCompat.h ClusterMeta.
-        params[GlobalRootSig::ClusterMetaSRVSlot].InitAsShaderResourceView(5);
-        // Tiny per-instance first-cluster-ID lookup (uint per TLAS
-        // instance) -- read only by the traditional-BLAS path so it can
-        // compute the same cid the cluster path's ClusterID() returns.
-        params[GlobalRootSig::TradTriToCidSRVSlot].InitAsShaderResourceView(6);
-        params[GlobalRootSig::TradGeomTriBaseSRVSlot].InitAsShaderResourceView(7);
-        params[GlobalRootSig::PerInstGeomMaterialSRVSlot].InitAsShaderResourceView(8);
         CD3DX12_ROOT_SIGNATURE_DESC desc(_countof(params), params);
         ComPtr<ID3DBlob> blob, err;
         ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
@@ -2456,11 +2135,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
 // MUST be called AFTER CreateDescriptorHeapAndRaytracingOutput so that the
 // shared descriptor heap exists when we ask it for slot 1.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::CreateUIFont()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Overlay UI is gutted; no SpriteFont / SpriteBatch needed.
-}
+
 
 // ---------------------------------------------------------------------------------
 // Compute pipeline for the per-frame GPU ball animation pass.
@@ -2474,13 +2149,7 @@ void D3D12RaytracingClusteredGeometry::CreateUIFont()
 // PSO is built from the dxc-compiled cs_6_6 bytecode embedded via
 // AnimateBall.hlsl.h.  Called once at init from CreateDeviceDependentResources.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::CreateAnimationComputePipeline()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 34 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // =====================================================================
 // Build the compute pipeline that GPU-fills the per-cluster
@@ -2497,13 +2166,7 @@ void D3D12RaytracingClusteredGeometry::CreateAnimationComputePipeline()
 // 4 root parameters total = 5 + 2 + 2 + 2 = 11 dwords, well under the
 // 64-DWORD root-sig budget.
 // =====================================================================
-void D3D12RaytracingClusteredGeometry::CreateFillInstantiateArgsPipeline()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 35 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 
 // =====================================================================
@@ -2579,13 +2242,7 @@ static void BuildArgsFillPipeline(
 }
 
 // FillMoveClusterArgs: b0 + u1 (src GVAs) + u0 (out args).
-void D3D12RaytracingClusteredGeometry::CreateFillMoveArgsPipeline()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 12 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 // FillBlasFromClasArgs: b0 + t0 (meta) + u0 (out args).
 void D3D12RaytracingClusteredGeometry::CreateFillBlasArgsPipeline()
@@ -2620,13 +2277,7 @@ void D3D12RaytracingClusteredGeometry::CreateFillClasTriArgsPipeline()
 }
 
 // FillClusterTemplateArgs: b0 (4 dwords) + t0 (meta) + u0 (out args).
-void D3D12RaytracingClusteredGeometry::CreateFillTemplateArgsPipeline()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 12 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 
 
@@ -2650,13 +2301,7 @@ void D3D12RaytracingClusteredGeometry::CreateFillTemplateArgsPipeline()
 // Pixel coordinates are top-left origin; we leave a 24-px inset from the
 // window's top-left corner.
 // ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::RenderUI()
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Original body had 944 lines.  Not on the
-    // critical path under cube-only isolation (overlay/stats/animated
-    // PSOs).
-}
+
 
 
 
@@ -2845,152 +2490,6 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     // past GPU completion - we read the slot we're about to overwrite). Skip
     // until we've captured at least kPerFrameRingSlots samples to avoid
     // reading uninitialised heap data.
-    if (m_animatedObjectEnabled)
-    {
-        if (m_pfFramesCaptured >= kPerFrameRingSlots)
-        {
-            // The slot we're about to write was last written N frames ago and
-            // resolved on the GPU before this frame was even submitted.
-            UINT readSlot = m_pfWriteSlot;
-            UINT64 ts[kPerFrameTsPerSlot] = {};
-            CD3DX12_RANGE readRange(readSlot * kPerFrameTsPerSlot * sizeof(UINT64),
-                                   (readSlot + 1) * kPerFrameTsPerSlot * sizeof(UINT64));
-            void* mapped = nullptr;
-            if (SUCCEEDED(m_pfQueryReadback->Map(0, &readRange, &mapped)))
-            {
-                memcpy(ts, (uint8_t*)mapped + readSlot * kPerFrameTsPerSlot * sizeof(UINT64),
-                       sizeof(ts));
-                D3D12_RANGE noWrite = { 0, 0 };
-                m_pfQueryReadback->Unmap(0, &noWrite);
-
-                const double freq = (double)m_timestampFrequency;
-                // Slot pairs: (0,1)=anim INSTANTIATE, (2,3)=anim BLAS,
-                // (4,5)=TLAS, (6,7)=static BLAS rebuild ([R]),
-                // (8,9)=static CLAS rebuild ([R] mode 2 + Implicit).
-                auto deltaMs = [&](UINT a, UINT b) {
-                    return (ts[b] >= ts[a]) ? (double)(ts[b] - ts[a]) * 1000.0 / freq : 0.0;
-                };
-                const double instMs       = deltaMs(0, 1);
-                const double blasMs       = deltaMs(2, 3);
-                const double tlasMs       = deltaMs(4, 5);
-                const double staticBlasMs = deltaMs(6, 7);
-                const double staticClasMs = deltaMs(8, 9);
-                // EMA, alpha=0.1 for a sub-second smoothing window.
-                constexpr double a = 0.1;
-                m_pfInstantiateMs = m_pfInstantiateMs * (1.0 - a) + instMs * a;
-                m_pfBlasRebuildMs = m_pfBlasRebuildMs * (1.0 - a) + blasMs * a;
-                m_pfTlasRebuildMs = m_pfTlasRebuildMs * (1.0 - a) + tlasMs * a;
-                m_pfStaticBlasMs  = m_pfStaticBlasMs  * (1.0 - a) + staticBlasMs * a;
-                m_pfStaticClasMs  = m_pfStaticClasMs  * (1.0 - a) + staticClasMs * a;
-
-                // Headless raw-per-frame log (--log-raw): dump the unfiltered
-                // timestamp deltas for this frame so we can see transients the
-                // EMA would smooth away.  Same gating as --log-pf-every but
-                // logs the raw values, not the EMA.  Also logs the current
-                // EMA + the latest snapshot value the overlay would show, so
-                // we can see if the snapshot diverges from the raw timing.
-                if (m_logRawPfEveryFrames > 0 &&
-                    (m_framesRendered % m_logRawPfEveryFrames) == 0)
-                {
-                    SampleLog::LogF(L"[pf-raw frame=%u alloc=%ls rebuild=%ls] "
-                                    L"raw=%.3fus ema=%.3fus snap=%.3fus  "
-                                    L"(anim raw=%.3f ema=%.3f, animBlas raw=%.3f, tlas raw=%.3f)\n",
-                                    m_framesRendered, ClasAllocModeName(), StaticRebuildModeName(),
-                                    staticBlasMs * 1000.0,
-                                    m_pfStaticBlasMs * 1000.0,
-                                    m_overlayStats.pfStaticBlasMs * 1000.0,
-                                    instMs * 1000.0, m_pfInstantiateMs * 1000.0,
-                                    blasMs * 1000.0, tlasMs * 1000.0);
-                }
-
-                // Rolling per-frame snapshot.  Accumulate samples into
-                // m_pfSnapAccum; when we have m_pfSnapTargetCount, mean
-                // them into m_overlayStats and start the next window.
-                // m_pfSnapSkipFramesLeft != 0 means a recent toggle and we
-                // need to flush stale ring-buffer entries first.  See the
-                // header comment on m_pfSnapAccum for the full mechanism.
-                if (m_pfSnapSkipFramesLeft > 0)
-                {
-                    --m_pfSnapSkipFramesLeft;
-                }
-                else
-                {
-                    m_pfSnapAccum.instMs       += instMs;
-                    m_pfSnapAccum.blasMs       += blasMs;
-                    m_pfSnapAccum.tlasMs       += tlasMs;
-                    m_pfSnapAccum.staticBlasMs += staticBlasMs;
-                    m_pfSnapAccum.staticClasMs += staticClasMs;
-                    ++m_pfSnapSamplesCollected;
-                    if (m_pfSnapSamplesCollected >= m_pfSnapTargetCount)
-                    {
-                        const double inv = 1.0 / m_pfSnapTargetCount;
-                        m_overlayStats.pfInstantiateMs = m_pfSnapAccum.instMs       * inv;
-                        m_overlayStats.pfBlasRebuildMs = m_pfSnapAccum.blasMs       * inv;
-                        m_overlayStats.pfTlasRebuildMs = m_pfSnapAccum.tlasMs       * inv;
-                        m_overlayStats.pfStaticBlasMs  = m_pfSnapAccum.staticBlasMs * inv;
-                        m_overlayStats.pfStaticClasMs  = m_pfSnapAccum.staticClasMs * inv;
-                        m_overlayStats.pfTimingValid   = true;
-                        // First post-toggle window completed -- live timings
-                        // now reflect the new mode, drop the "recalculating..."
-                        // placeholder.
-                        m_pfTimingSettlingAfterToggle  = false;
-                        m_pfSnapAccum            = PfSnapAccum{};
-                        m_pfSnapSamplesCollected = 0;
-                    }
-                }
-
-            }
-        }
-
-        // Record this frame's per-frame work.  Timestamp slot layout:
-        //   base+0..1  INSTANTIATE_CLUSTER_TEMPLATES (animated)
-        //   base+2..3  BUILD_BLAS_FROM_CLAS  (animated)
-        //   base+4..5  TLAS rebuild
-        //   base+6..7  static BLAS rebuild  ([R] mode 1 or 2; else no-op)
-        //   base+8..9  static CLAS rebuild  ([R] mode 2 + Implicit alloc; else no-op)
-        // Static CLAS must run BEFORE static BLAS (BLAS reads CLAS); static
-        // BLAS must run BEFORE TLAS (TLAS sees BLAS).  Timestamps emitted
-        // unconditionally so the resolve range is always valid -- when the
-        // mode says no work, the begin/end pair brackets nothing and the
-        // delta is ~0 (just GPU query overhead).
-        const UINT base = m_pfWriteSlot * kPerFrameTsPerSlot;
-        // Per-frame animated update: cluster path uses the
-        // INSTANTIATE_CLUSTER_TEMPLATES + BLAS_FROM_CLAS pipeline; trad
-        // path uses BuildRaytracingAccelerationStructure (rebuild or
-        // refit per [F]).  Both emit the same 4-timestamp layout
-        // (base+0..1 = AnimateBall.cs, base+2..3 = AS build) so the
-        // overlay split between "anim CS" and "anim build" works for
-        // both modes uniformly.
-        if (m_geometryMode == GeometryMode::Clusters)
-            UpdateAnimatedObjectPerFrame(base);
-        else
-            UpdateAnimatedTradPerFrame(base);
-
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 8);
-        if (m_staticRebuildMode == StaticRebuildMode::ClasAndBlas &&
-            m_geometryMode == GeometryMode::Clusters)
-            RebuildStaticClasPerFrame();
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 9);
-
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 6);
-        if (m_staticRebuildMode != StaticRebuildMode::None &&
-            m_geometryMode == GeometryMode::Clusters)
-            RebuildStaticBlasPerFrame();
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 7);
-
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 4);
-        RebuildTlasPerFrame();
-        cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 5);
-
-
-        cl->ResolveQueryData(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-            base, kPerFrameTsPerSlot, m_pfQueryReadback.Get(),
-            base * sizeof(UINT64));
-
-        m_pfWriteSlot = (m_pfWriteSlot + 1) % kPerFrameRingSlots;
-        if (m_pfFramesCaptured < kPerFrameRingSlots * 2)
-            ++m_pfFramesCaptured;
-    }
     cl4->SetComputeRootSignature(m_globalRootSignature.Get());
     ID3D12DescriptorHeap* heaps[] = { m_descriptorHeap.Get() };
     cl4->SetDescriptorHeaps(_countof(heaps), heaps);
@@ -2998,22 +2497,6 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     cl4->SetComputeRootShaderResourceView(GlobalRootSig::AccelerationStructureSlot,
         m_tlasBuffer->GetGPUVirtualAddress());
     cl4->SetComputeRootConstantBufferView(GlobalRootSig::SceneCBVSlot, m_sceneCB->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::MaterialsSRVSlot,
-        m_materialsBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterNormalsSRVSlot,
-        m_clusterNormalsBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterIndicesSRVSlot,
-        m_clusterIndicesBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterOffsetsSRVSlot,
-        m_clusterOffsetsBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::ClusterMetaSRVSlot,
-        m_clusterMetaBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradTriToCidSRVSlot,
-        m_tradTriToCidBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::TradGeomTriBaseSRVSlot,
-        m_tradGeomTriBaseBuffer->GetGPUVirtualAddress());
-    cl4->SetComputeRootShaderResourceView(GlobalRootSig::PerInstGeomMaterialSRVSlot,
-        m_perInstGeomMaterialBuffer->GetGPUVirtualAddress());
     cl4->SetPipelineState1(m_dxrStateObject.Get());
 
     auto bbDesc = m_deviceResources->GetRenderTarget()->GetDesc();
@@ -3053,9 +2536,7 @@ void D3D12RaytracingClusteredGeometry::DoRender()
     // Paint on-screen overlay text (stats, key bindings).  The back buffer is
     // now in RENDER_TARGET; SpriteBatch binds it as an RTV, draws text, and
     // we hand off to Present() which transitions to PRESENT internally.
-    RenderUI();
-
-    m_deviceResources->Present();
+m_deviceResources->Present();
 
     // DirectXTK: tag per-frame upload pages with the queue's current fence value
     // AFTER the cmd list has been executed (Present did ExecuteCommandList).  This
@@ -3212,12 +2693,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     SampleLog::Write(L"OnDestroy: done\n");
 }
 
-void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
-{
-    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
-    // Headless screenshot mode; no interactive key handling.
-    (void)key;
-}
+
 
 void D3D12RaytracingClusteredGeometry::OnDeviceLost()
 {
@@ -3335,3 +2811,7 @@ HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path
     return cleanup(S_OK);
 }
 
+
+// OnKeyDown is a virtual override from DXSample base.  Headless repro
+// has no interactive keys, so this is just a no-op stub.
+void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8) {}

@@ -28,25 +28,6 @@ namespace GlobalRootSig {
         OutputUAVSlot = 0,
         AccelerationStructureSlot,
         SceneCBVSlot,
-        MaterialsSRVSlot,           // Stage C: per-instance MaterialDesc[] indexed by InstanceID()
-        ClusterNormalsSRVSlot,      // Stage F: StructuredBuffer<float3> g_clusterNormals  (per-vertex)
-        ClusterIndicesSRVSlot,      // Stage F: StructuredBuffer<uint>   g_clusterIndices  (uint32 per index)
-        ClusterOffsetsSRVSlot,      // Stage F: StructuredBuffer<uint2>  g_clusterOffsets  (per-cluster
-                                    //                                                      vertOff, idxOff)
-        ClusterMetaSRVSlot,         // Refactor: ByteAddressBuffer of ClusterMeta[] - data-driven
-                                    //           per-cluster material/colour override metadata.
-        // Traditional-BLAS path: per-triangle cluster-ID lookup +
-        // per-(InstIdx, GeomIdx) tri-base table.  Lets the traditional
-        // closest-hit recover the same cid the cluster path gets from
-        // ClusterID(), even though geom descs now group multiple
-        // clusters into one material-region geometry.
-        TradTriToCidSRVSlot,
-        TradGeomTriBaseSRVSlot,
-        // Per-(InstIdx, GeomIdx) material-slot lookup.  Read by both
-        // paths -- replaces the InstanceID()-based g_materials lookup
-        // so multi-geometry instances can present different materials
-        // per geom (the mixed-material small sphere demo).
-        PerInstGeomMaterialSRVSlot,
         Count
     };
 }
@@ -748,9 +729,7 @@ private:
     // Populated in BuildMaterials() and uploaded once at init time.
     std::array<MaterialDesc, NUM_MATERIAL_SLOTS> m_materials = {};
     ComPtr<ID3D12Resource>               m_materialsBuffer;
-    void BuildMaterials();
-
-    // ---------- Per-vertex normal side channel (smooth shading) ----------
+// ---------- Per-vertex normal side channel (smooth shading) ----------
     // DXR2 cluster geometry only carries positions in the CLAS vertex buffer,
     // so per-vertex normals and the cluster index buffer have to travel
     // through a SEPARATE channel for the closesthit shader to interpolate
@@ -789,26 +768,20 @@ private:
     UINT                                 m_clusterNormalsCount = 0;
     UINT                                 m_clusterIndicesCount = 0;
     UINT                                 m_clusterOffsetsCount = 0;
-    void BuildClusterShaderSideBuffers();
-    // Traditional-BLAS cid recovery: builds the per-triangle cid table
+// Traditional-BLAS cid recovery: builds the per-triangle cid table
     // + per-(InstanceIdx, GeometryIdx) tri-base table that the
     // traditional path's closest-hit uses to map (GeometryIndex(),
     // PrimitiveIndex()) -> cid.  Called as part of the traditional
     // build path; rebuilt on any geometry-mode toggle.
-    void BuildTradCidLookup();
-    // Per-(InstIdx, GeomIdx) material-slot lookup.  Built unconditionally
+// Per-(InstIdx, GeomIdx) material-slot lookup.  Built unconditionally
     // at init so the binding's always valid; rebuilt when scene clusters
     // are re-emitted.  See m_perInstGeomMaterialBuffer.
-    void BuildPerInstGeomMaterialTable();
-
-    // Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
+// Per-cluster metadata buffer (ClusterMeta[], indexed by ClusterID()).
     // Drives ALL per-cluster material / colour decisions in the shader -
     // see the big design comment on ClusterMeta in RaytracingHlslCompat.h.
     ComPtr<ID3D12Resource>               m_clusterMetaBuffer;
     UINT                                 m_clusterMetaCount = 0;
-    void BuildClusterMetadata();
-
-    // ---------- Timestamp queries for AS build wall-clocks ----------
+// ---------- Timestamp queries for AS build wall-clocks ----------
     // Init-time slots 0..5 straddle the static CLAS / BLAS / TLAS builds (3 pairs).
     // Per-frame uses a separate heap + readback with 3 ring-buffer slots so
     // the CPU reads timestamps written ~3 frames ago (safely past GPU
@@ -1042,12 +1015,11 @@ private:
     // m_vertexMode + m_clasAllocMode.  Animated object's per-frame state is
     // left alone (independent CLAS pipeline).  Drives the runtime 'v' and 'a'
     // keyboard toggles in OnKeyDown.
-    void RebuildStaticAccelerationStructures(const wchar_t* reason);
-    void UploadClusterInputs();
+void UploadClusterInputs();
     void BuildClasIndirect();              // dispatches to one of the three below
     void BuildClasImplicit();              // ClasAllocMode::Implicit
-    void BuildClasGetSizes();              // ClasAllocMode::GetSizes
-    void BuildClasCompact();               // ClasAllocMode::Compact
+// ClasAllocMode::GetSizes
+// ClasAllocMode::Compact
     void BuildBlasFromClasIndirect();
     // Per-object traditional (DXR1) BLAS build for static objects.  Called
     // instead of BuildBlasFromClasIndirect when m_geometryMode ==
@@ -1056,15 +1028,12 @@ private:
     // BuildRaytracingAccelerationStructure for each object.
     // (Cluster path's m_clasArgsBuffer / m_clasMoveArgsBuffer / etc. are
     // simply not allocated in Traditional mode.)
-    void BuildTraditionalStaticAS();
-    void BuildTlasClassic();
+void BuildTlasClassic();
     void RebuildTlasPerFrame();
     // Per-frame static-AS rebuild paths (driven by m_staticRebuildMode = [R]).
     // Both re-issue their RTAS op against the existing static buffers (no
     // allocations).  Caller emits the surrounding EndQuery timestamps.
-    void RebuildStaticBlasPerFrame();
-    void RebuildStaticClasPerFrame();
-    void BuildAnimatedObjectSetup();          // generates mesh, builds templates ONCE
+// generates mesh, builds templates ONCE
     // Traditional-mode addendum to BuildAnimatedObjectSetup.  Runs after
     // the shared mesh + perFrameVertexBuffer setup (which both modes need
     // because AnimateBall.cs writes the same per-vertex animation buffer
@@ -1073,8 +1042,7 @@ private:
     // No GPU work is issued here -- the actual BuildRaytracingAccelerationStructure
     // for the trad BLAS runs every frame in UpdateAnimatedTradPerFrame
     // (rebuild or refit per m_traditionalAnimMode).
-    void BuildAnimatedTraditionalAS();
-    // Per-frame trad-mode update: AnimateBall.cs writes
+// Per-frame trad-mode update: AnimateBall.cs writes
     // perFrameVertexBuffer (UAV) just like in cluster mode, then we
     // BuildRaytracingAccelerationStructure on tradBlasStorage with
     // either PREFER_FAST_TRACE (full rebuild) or PERFORM_UPDATE
@@ -1082,8 +1050,7 @@ private:
     // per-frame timestamps at (pfTimestampBase+0..1) bracketing
     // AnimateBall.cs and (pfTimestampBase+2..3) bracketing the BLAS
     // build for the overlay, mirroring the cluster path's split.
-    void UpdateAnimatedTradPerFrame(UINT pfTimestampBase = UINT_MAX);
-    // Per-frame animated rebuild.  When pfTimestampBase != UINT_MAX the
+// Per-frame animated rebuild.  When pfTimestampBase != UINT_MAX the
     // function emits two timestamp pairs against m_pfQueryHeap at
     // (base+0,base+1) bracketing INSTANTIATE and (base+2,base+3) bracketing
     // BLAS-from-CLAS so the overlay can split out template-instantiation
@@ -1091,21 +1058,18 @@ private:
     // vertex format / precision).  Callers that don't need the breakdown
     // (e.g. RebuildStaticAccelerationStructures, which is a one-shot init
     // path) pass UINT_MAX to skip the emissions.
-    void UpdateAnimatedObjectPerFrame(UINT pfTimestampBase = UINT_MAX);
-    // One-shot per-cluster CLAS size readback for the animated INSTANTIATE op.
+// One-shot per-cluster CLAS size readback for the animated INSTANTIATE op.
     // Called at the end of BuildAnimatedObjectSetup (after the first INSTANTIATE
     // has run) - issues an INSTANTIATE with ResultSizeArray hooked up, copies
     // the size buffer to readback, waits, sums, writes the result into
     // m_overlayStats.animatedPerFrameClasActualBytes.  Synchronous + one-time
     // per config change - no per-frame cost.
-    void MeasureAnimatedClasBytesOneShot();
-    // Walk all buffers + m_clasMemStats and copy the displayed numbers into
+// Walk all buffers + m_clasMemStats and copy the displayed numbers into
     // m_overlayStats.  Called from RebuildStaticAccelerationStructures after
     // the static + animated paths are both finished.  Per-frame ms values are
     // NOT captured here - they're snapped a few frames later by Tick() once
     // the ring buffer has refilled with post-rebuild samples.
-    void CaptureOverlayStatsSnapshot();
-    // Two halves of CaptureOverlayStatsSnapshot, exposed so callers whose
+// Two halves of CaptureOverlayStatsSnapshot, exposed so callers whose
     // code path mutates m_overlayStats mid-rebuild (specifically
     // RebuildStaticAccelerationStructures, via MeasureAnimatedClasBytesOneShot
     // inside BuildAnimatedObjectSetup) can stash prev BEFORE the build and
@@ -1113,22 +1077,12 @@ private:
     // already-half-mutated prev -> delta colouring stops working for the
     // per-frame-CLAS-actual field.  See StashOverlayStatsAsPrev definition
     // comment for the full mechanism.
-    void StashOverlayStatsAsPrev();
-    void RefreshOverlayStatsCurrent();
-    void DumpClusterStatsAsync();
-    void ReadBuildTimestamps();
-    void CreateUIFont();
-    void RenderUI();
-    void CreateRaytracingPipelineAndShaderTables();
+void CreateRaytracingPipelineAndShaderTables();
     // Compile-once-at-init compute pipeline used by the per-frame GPU ball
     // deformation pass (see UpdateAnimatedObjectPerFrame).
-    void CreateAnimationComputePipeline();
-    void CreateFillInstantiateArgsPipeline();
-    void CreateFillMoveArgsPipeline();
-    void CreateFillBlasArgsPipeline();
+void CreateFillBlasArgsPipeline();
     void CreateFillClasTriArgsPipeline();
-    void CreateFillTemplateArgsPipeline();
-    void CreateDescriptorHeapAndRaytracingOutput();
+void CreateDescriptorHeapAndRaytracingOutput();
     void UpdateSceneConstantBuffer();
 
     UINT AllocateDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu);

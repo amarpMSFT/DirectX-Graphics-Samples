@@ -1128,28 +1128,25 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // Radial spacing widens at higher tiers (where distance LOD is
     // active) so the lower-detail outer clones land at LARGER world
     // distances -- the smaller pixel footprint hides the LOD's
-    // cluster-truncation holes the way a real LOD chain hides its
-    // mesh-decimation artifacts behind perspective.
-    //   100:  spacing 0.5  (no LOD, dense cluster of full-detail copies)
-    //   1K:   spacing 0.7  (LOD on, mild spread)
-    //   10K:  spacing 1.0  (LOD on, double the spread of 100-tier)
-    float kRadialSpacing = 0.5f;
-    if      (m_extraInstancesMode == ExtraInstancesMode::Thousand)    kRadialSpacing = 0.7f;
-    else if (m_extraInstancesMode == ExtraInstancesMode::TenThousand) kRadialSpacing = 1.0f;
-    // Height curve.  The inner ring starts BELOW the floor (sunken
-    // about 1 unit underground) and ramps up sqrt-wise with radius,
-    // so the spiral feels like it RISES OUT of depth.  The multiplier
-    // is tuned so the outermost clone at N=1K lands around y=+5 (same
-    // as the previous floor-anchored curve), while higher tiers get
-    // proportionally more rise:
-    //     N=1K:  outer ~= 4.89  (was 4.95, kept the same target)
-    //     N=10K: outer ~= 12.3  (was 11.3)
-    // The lower inner-ring start helps keep the spiral's foreground
-    // clones from cluttering the camera's eye-level original-scene
-    // shot, AND the steeper ramp means more of the inner-band rise
-    // happens before the outer-band slope flattens out.
-    const float kInnerY         = -1.70f;
-    const float kHeightSqrtMul  = 1.40f;
+    // cluster-count drop the way a real LOD chain hides its
+    // mesh-decimation artifacts behind perspective.  Per user
+    // feedback "move them further in the distance given their LOD"
+    // -- distant clones recede more aggressively now that LOD makes
+    // them cheaper AND smaller on screen.
+    //   100:  spacing 0.7  (LOD active, mild spread; outer ~= 11)
+    //   1K:   spacing 1.0  (mid spread;    outer ~= 36)
+    //   10K:  spacing 1.5  (deep field;    outer ~= 154)
+    float kRadialSpacing = 0.7f;
+    if      (m_extraInstancesMode == ExtraInstancesMode::Thousand)    kRadialSpacing = 1.0f;
+    else if (m_extraInstancesMode == ExtraInstancesMode::TenThousand) kRadialSpacing = 1.5f;
+    // Height curve.  Inner ring sunk well below the floor (kInnerY)
+    // so the spiral rises out of depth.  Sqrt-based rise per user
+    // request "make them start lower and ramp more".
+    //     N=100  outer  (maxRadius ~11):  -2.8 + sqrt(6.5)  * 1.9 ~= +2.0
+    //     N=1K   outer  (maxRadius ~36):  -2.8 + sqrt(31)   * 1.9 ~= +7.8
+    //     N=10K  outer  (maxRadius ~155): -2.8 + sqrt(150)  * 1.9 ~= +20.5
+    const float kInnerY         = -2.80f;
+    const float kHeightSqrtMul  =  1.90f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  On whenever there are extra clones, NOT just at
@@ -6864,13 +6861,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     {
         const UINT N_static_clones = (UINT)(m_objects.size() - m_sourceObjectCount);
         const UINT N_anim_clones   = (UINT)m_animatedClones.size();
-        const bool lodOn = (m_extraInstancesMode != ExtraInstancesMode::None);
         const wchar_t* label = (m_geometryMode == GeometryMode::Clusters)
-            ? L"   extra unique BLAS+CLAS: %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s"
-            : L"   extra unique BLASes:    %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s";
+            ? L"   extra unique BLAS+CLAS: %s   (%u static + %u animated [shared BLAS])   LOD reduces with distance"
+            : L"   extra unique BLASes:    %s   (%u static + %u animated [shared BLAS])   LOD reduces with distance";
         swprintf_s(kbuf, label,
-                   ExtraInstancesModeName(), N_static_clones, N_anim_clones,
-                   lodOn ? L"on" : L"off");
+                   ExtraInstancesModeName(), N_static_clones, N_anim_clones);
     }
     drawKeyLine(L"[N]", kbuf);
 

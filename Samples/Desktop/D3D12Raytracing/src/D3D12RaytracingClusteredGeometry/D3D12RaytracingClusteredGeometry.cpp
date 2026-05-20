@@ -139,11 +139,6 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     obj.worldScale    = 1.0f;
     obj.worldRotEuler = XMFLOAT3(0, 0, 0);
     obj.instanceID    = 5;
-    obj.checker       = CheckerConfig{};            // disabled (no per-cluster material override)
-    obj.surfTintMul   = 1.0f;
-    obj.refrTintMul   = 0.50f;
-    obj.reflTintMul   = 1.08f;
-    obj.nonOrientable = false;
     obj.globalClusterStart = 0;
     obj.clusterCount       = (UINT)obj.mesh.clusters.size();
 
@@ -1098,37 +1093,6 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(m_tlasBuffer.Get());
     m_dxrCommandList->ResourceBarrier(1, &barrier);
 }
-
-// ---------------------------------------------------------------------------------
-// TLAS rebuild for per-frame use. Same inputs (instance descs buffer) as the
-// initial build - only the TLAS BVH itself needs refreshing because the
-// animated BLAS contents have changed (its GVA is stable). Buffers are reused;
-// nothing reallocated. Single batched command + UAV barrier.
-// ---------------------------------------------------------------------------------
-void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
-{
-    if (!m_tlasBuffer || !m_tlasScratchBuffer || !m_tlasInstanceDescs) return;
-    const UINT N_total = (UINT)m_objects.size()
-        + (m_animatedObjectEnabled ? 1u : 0u);
-
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
-    tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-    tlasInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    tlasInputs.NumDescs       = N_total;
-    tlasInputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-    tlasInputs.InstanceDescs  = m_tlasInstanceDescs->GetGPUVirtualAddress();
-
-    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
-    buildDesc.Inputs                             = tlasInputs;
-    buildDesc.DestAccelerationStructureData      = m_tlasBuffer->GetGPUVirtualAddress();
-    buildDesc.ScratchAccelerationStructureData   = m_tlasScratchBuffer->GetGPUVirtualAddress();
-    m_dxrCommandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
-
-    auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(m_tlasBuffer.Get());
-    m_dxrCommandList->ResourceBarrier(1, &barrier);
-}
-
-
 
 // ---------------------------------------------------------------------------------
 // Read back the AS build timestamps from m_buildQueryReadback and compute

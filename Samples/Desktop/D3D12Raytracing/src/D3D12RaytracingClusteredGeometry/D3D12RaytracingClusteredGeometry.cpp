@@ -1284,86 +1284,24 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildMaterials()
 {
+    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
     auto device = m_deviceResources->GetD3DDevice();
-
-    // Pure copy from the data table.  The actual MaterialDesc values
-    // live in MaterialData.cpp - this engine code never touches the
-    // baseColor / refl / refr / ior numbers directly.
-    std::copy(MaterialData::kMaterials.begin(),
-              MaterialData::kMaterials.end(),
-              m_materials.begin());
-
-    AllocateUploadBuffer(device, m_materials.data(),
-                         m_materials.size() * sizeof(MaterialDesc),
-                         &m_materialsBuffer, L"Per-instance materials");
-
-    SampleLog::LogF(L"[materials] %u slots loaded from MaterialData::kMaterials\n",
-                    (unsigned)m_materials.size());
+    uint8_t zeros[16] = {};
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_materialsBuffer, L"materials (stub)");
 }
 
 
 void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
 {
+    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
+    // Shader no longer reads these; allocate 16-byte dummies just so
+    // DoRender's root-SRV bindings have valid GPUVAs.
     auto device = m_deviceResources->GetD3DDevice();
-
-    // Animated sphere clusters are reachable via templated INSTANTIATE with
-    // ClusterIdOffset = 800 (see BuildAnimatedObjectSetup), so the GPU-side
-    // ClusterID() seen on hits is template_id + 800.  Mirror that offset
-    // here when registering the animated mesh's clusters.
-    const UINT kAnimatedClusterIdOffset = 800;
-
-    // Pass 1: figure out the offset-table size.
-    UINT maxClusterID = 0;
-    for (const auto& obj : m_objects)
-        for (const auto& c : obj.mesh.clusters)
-            maxClusterID = std::max(maxClusterID, c.clusterID);
-    if (m_animatedObjectEnabled)
-        for (const auto& c : m_animatedObject.mesh.clusters)
-            maxClusterID = std::max(maxClusterID, c.clusterID + kAnimatedClusterIdOffset);
-
-    const UINT offsetTableSize = maxClusterID + 1;
-
-    std::vector<XMFLOAT4> normals;            // 16 bytes per normal (.w padding) to match HLSL's
-                                              // ByteAddressBuffer.Load3((off.x + i_k) * 16) stride.
-                                              // See Raytracing.hlsl declaration of g_clusterNormals.
-    std::vector<UINT>     indices;
-    std::vector<XMUINT2>  offsets(offsetTableSize, XMUINT2(0u, 0u));
-
-    // Helper: append one cluster's data and stamp its offset entry.
-    auto appendCluster = [&](const ProceduralGeometry::Cluster& c, UINT cidForOffsetTable)
-    {
-        offsets[cidForOffsetTable] = XMUINT2((UINT)normals.size(), (UINT)indices.size());
-        for (const auto& n : c.normals)
-            normals.push_back(XMFLOAT4(n.x, n.y, n.z, 0.0f));
-        for (uint8_t i : c.indices)
-            indices.push_back((UINT)i);
-    };
-
-    for (const auto& obj : m_objects)
-        for (const auto& c : obj.mesh.clusters)
-            appendCluster(c, c.clusterID);
-
-    if (m_animatedObjectEnabled)
-        for (const auto& c : m_animatedObject.mesh.clusters)
-            appendCluster(c, c.clusterID + kAnimatedClusterIdOffset);
-
-    AllocateUploadBuffer(device, normals.data(), normals.size() * sizeof(DirectX::XMFLOAT4),
-                         &m_clusterNormalsBuffer, L"Cluster vertex normals (per-vertex side channel)");
-    AllocateUploadBuffer(device, indices.data(), indices.size() * sizeof(UINT),
-                         &m_clusterIndicesBuffer, L"Cluster indices (uint32-widened side channel)");
-    AllocateUploadBuffer(device, offsets.data(), offsets.size() * sizeof(XMUINT2),
-                         &m_clusterOffsetsBuffer, L"Cluster vert/idx offset table");
-
-    m_clusterNormalsCount = (UINT)normals.size();
-    m_clusterIndicesCount = (UINT)indices.size();
-    m_clusterOffsetsCount = (UINT)offsets.size();
-
-    SampleLog::LogF(L"[normals] side channel: %u vertex normals, %u indices, %u offset slots (max cid=%u, ~%u KB total)\n",
-                    m_clusterNormalsCount, m_clusterIndicesCount, m_clusterOffsetsCount,
-                    maxClusterID,
-                    (UINT)((normals.size() * sizeof(XMFLOAT3) +
-                            indices.size() * sizeof(UINT) +
-                            offsets.size() * sizeof(XMUINT2)) / 1024));
+    uint8_t zeros[16] = {};
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterNormalsBuffer,  L"cluster normals (stub)");
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterIndicesBuffer,  L"cluster indices (stub)");
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterOffsetsBuffer,  L"cluster offsets (stub)");
+    m_clusterNormalsCount = 0; m_clusterIndicesCount = 0; m_clusterOffsetsCount = 0;
 }
 
 
@@ -1388,116 +1326,11 @@ void D3D12RaytracingClusteredGeometry::BuildClusterShaderSideBuffers()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
 {
+    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
     auto device = m_deviceResources->GetD3DDevice();
-
-    const UINT kAnimatedClusterIdOffset = 800;
-
-    // Pass 1: same size discovery as BuildClusterShaderSideBuffers.
-    UINT maxClusterID = 0;
-    for (const auto& obj : m_objects)
-        for (const auto& c : obj.mesh.clusters)
-            maxClusterID = std::max(maxClusterID, c.clusterID);
-    if (m_animatedObjectEnabled)
-        for (const auto& c : m_animatedObject.mesh.clusters)
-            maxClusterID = std::max(maxClusterID, c.clusterID + kAnimatedClusterIdOffset);
-
-    const UINT metaCount = maxClusterID + 1;
-    std::vector<ClusterMeta> meta(metaCount, ClusterMeta{});
-
-    // Initialize all slots with neutral defaults: no override, colorIndex=cid,
-    // baseColorScale=1, tint mul defaults that reproduce the legacy look.
-    for (UINT i = 0; i < metaCount; ++i)
-    {
-        meta[i].colorIndex     = i;
-        meta[i].flags          = 0u;
-        meta[i].overrideRefl   = -1.0f;
-        meta[i].overrideRefr   = -1.0f;
-        meta[i].overrideIor    = -1.0f;
-        meta[i].baseColorScale = 1.0f;
-        meta[i].surfTintMul    = 1.0f;
-        meta[i].refrTintMul    = 0.50f;
-        meta[i].reflTintMul    = 1.08f;   // = 0.70 / 0.65 (default clusterTint)
-    }
-
-    // Generic per-cluster fill - works on any object type that has a
-    // mesh + optional checker config + tint multipliers (since the
-    // animated sphere uses a different storage class than ClusterObject
-    // but otherwise carries the same per-cluster info on its mesh).
-    auto fillFromMesh = [&](const ProceduralGeometry::Mesh& mesh,
-                            UINT cidOffset,
-                            const CheckerConfig& checker,
-                            float surfTintMul, float refrTintMul, float reflTintMul,
-                            UINT defaultMaterialSlot,
-                            const std::vector<UINT>* perRegionMaterialSlot = nullptr)
-    {
-        for (const auto& c : mesh.clusters)
-        {
-            const UINT id = c.clusterID + cidOffset;
-            ClusterMeta& m = meta[id];
-
-            m.colorIndex     = c.matchedColorCid + cidOffset;
-            m.flags          = c.flags;
-            m.surfTintMul    = surfTintMul;
-            m.refrTintMul    = refrTintMul;
-            m.reflTintMul    = reflTintMul;
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-            // Per-cluster material slot for the cluster-path fallback
-            // (see RaytracingHlslCompat.h driver-workaround gate).  When
-            // the gate goes to 0 this whole field disappears and the
-            // cluster path joins the trad path on g_perInstGeomMaterial.
-            m.materialSlot   = (perRegionMaterialSlot && c.matRegionIdx < perRegionMaterialSlot->size())
-                                ? (*perRegionMaterialSlot)[c.matRegionIdx]
-                                : defaultMaterialSlot;
-#else
-            (void)perRegionMaterialSlot;
-            (void)defaultMaterialSlot;
-#endif
-
-            if (checker.enabled)
-            {
-                const bool isOdd = ((c.gridU + c.gridV) & 1u) != 0u;
-                const auto& side = isOdd ? checker.oddParity
-                                         : checker.evenParity;
-                m.overrideRefl   = side.overrideRefl;
-                m.overrideRefr   = side.overrideRefr;
-                m.overrideIor    = side.overrideIor;
-                m.baseColorScale = side.baseColorScale;
-            }
-        }
-    };
-
-    for (const auto& obj : m_objects)
-        fillFromMesh(obj.mesh, 0u, obj.checker,
-                     obj.surfTintMul, obj.refrTintMul, obj.reflTintMul,
-                     obj.instanceID,
-                     obj.perRegionMaterialSlot.empty() ? nullptr : &obj.perRegionMaterialSlot);
-    if (m_animatedObjectEnabled)
-    {
-        // Animated object: alternating cluster checker - even parity
-        // is OPAQUE SHINY (chrome-like; refl=0.95, refr=0), odd parity
-        // keeps the baseline refractive glass.  Plus cranked tint
-        // multipliers so the refractive clusters' cluster colours read
-        // prominently.
-        CheckerConfig checker;
-        checker.enabled = true;
-        checker.evenParity.overrideRefl = 0.95f;   // chrome-ish reflectivity
-        checker.evenParity.overrideRefr = 0.0f;    // opaque (no refraction)
-        checker.evenParity.baseColorScale = 1.0f;
-        checker.oddParity.overrideRefl  = 0.0f;    // translucent clusters: no reflection
-        checker.oddParity.overrideRefr  = -1.0f;   // keep baseline refractivity (0.78)
-        checker.oddParity.overrideIor   = -1.0f;   // keep baseline ior (2.4)
-        fillFromMesh(m_animatedObject.mesh, kAnimatedClusterIdOffset,
-                     checker, /*surf*/1.0f, /*refr*/0.75f, /*refl*/1.20f,
-                     m_animatedObject.instanceID);
-    }
-
-    AllocateUploadBuffer(device, meta.data(), meta.size() * sizeof(ClusterMeta),
-                         &m_clusterMetaBuffer, L"Per-cluster GENERIC metadata (ClusterMeta[])");
-    m_clusterMetaCount = (UINT)meta.size();
-
-    SampleLog::LogF(L"[clustermeta] %u entries (~%u KB)\n",
-                    m_clusterMetaCount,
-                    (UINT)((meta.size() * sizeof(ClusterMeta)) / 1024));
+    uint8_t zeros[16] = {};
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_clusterMetaBuffer, L"cluster meta (stub)");
+    m_clusterMetaCount = 0;
 }
 
 
@@ -2321,47 +2154,10 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildPerInstGeomMaterialTable()
 {
+    // ===== STUB: body shrunk for COMPRESSED1 minimal repro =====
     auto device = m_deviceResources->GetD3DDevice();
-
-    // Include the animated instance (when enabled) -- InstanceIndex()
-    // ranges 0..N_static for the animated case, so the table must be
-    // sized to cover it.  Animated has a single region using its
-    // own per-instance material slot.
-    const UINT animSlots = m_animatedObjectEnabled ? 1u : 0u;
-    const UINT N_inst    = (UINT)m_objects.size() + animSlots;
-    std::vector<UINT> table(N_inst * kMaxGeomsPerInstance, 0);
-    for (size_t oi = 0; oi < m_objects.size(); ++oi)
-    {
-        const auto& obj = m_objects[oi];
-        // Discover how many regions the object actually uses (== max
-        // matRegionIdx + 1).  Skipped if perRegionMaterialSlot is set,
-        // in which case its size IS the region count.
-        UINT regionCount = (UINT)obj.perRegionMaterialSlot.size();
-        if (regionCount == 0)
-        {
-            for (const auto& cl : obj.mesh.clusters)
-                regionCount = std::max(regionCount, cl.matRegionIdx + 1);
-            if (regionCount == 0) regionCount = 1;
-        }
-        for (UINT r = 0; r < std::min(regionCount, kMaxGeomsPerInstance); ++r)
-        {
-            const UINT slot = (r < (UINT)obj.perRegionMaterialSlot.size())
-                ? obj.perRegionMaterialSlot[r]
-                : obj.instanceID;
-            table[oi * kMaxGeomsPerInstance + r] = slot;
-        }
-    }
-    if (m_animatedObjectEnabled)
-    {
-        // Animated instance: single-region with the animated obj's material slot.
-        table[m_objects.size() * kMaxGeomsPerInstance + 0] = m_animatedObject.instanceID;
-    }
-    AllocateUploadBuffer(device, table.data(),
-                         table.size() * sizeof(UINT),
-                         &m_perInstGeomMaterialBuffer,
-                         L"Per-(InstIdx, GeomIdx) material-slot lookup");
-    SampleLog::LogF(L"[per-inst-geom-material] %zu entries (%zu bytes)\n",
-                    table.size(), table.size() * sizeof(UINT));
+    uint8_t zeros[16] = {};
+    AllocateUploadBuffer(device, zeros, sizeof(zeros), &m_perInstGeomMaterialBuffer, L"perInst material (stub)");
 }
 
 
@@ -3024,109 +2820,8 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
 // ---------------------------------------------------------------------------------
 void D3D12RaytracingClusteredGeometry::CreateUIFont()
 {
-    using namespace DirectX;
-    auto device = m_deviceResources->GetD3DDevice();
-
-    m_graphicsMemory = std::make_unique<GraphicsMemory>(device);
-
-    // SpriteBatch PSO needs to match the back-buffer format pair (RTV format
-    // + DSV format).  Depth buffer is present on this sample's DeviceResources
-    // but the overlay itself disables depth read/write via SpriteBatch's
-    // default state -- the format just has to match the bound DSV slot at
-    // draw time, even if we render with no depth.
-    ResourceUploadBatch resourceUpload(device);
-    resourceUpload.Begin();
-    {
-        RenderTargetState rtState(m_deviceResources->GetBackBufferFormat(),
-                                  m_deviceResources->GetDepthBufferFormat());
-        SpriteBatchPipelineStateDescription pd(rtState);
-        m_spriteBatch = std::make_unique<SpriteBatch>(device, resourceUpload, pd);
-    }
-    auto uploadFinished = resourceUpload.End(m_deviceResources->GetCommandQueue());
-    uploadFinished.wait();
-
-    // Reserve slot 1 of our shared descriptor heap for the font texture SRV.
-    // SpriteFont's constructor takes the CPU + GPU descriptor handles where
-    // it should write the SRV.
-    D3D12_CPU_DESCRIPTOR_HANDLE fontCpu;
-    UINT fontSlot = AllocateDescriptor(&fontCpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE fontGpu = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-        m_descriptorHeap->GetGPUDescriptorHandleForHeapStart(), fontSlot, m_descriptorSize);
-
-    {
-        ResourceUploadBatch fontUpload(device);
-        fontUpload.Begin();
-        m_uiFont = std::make_unique<SpriteFont>(device, fontUpload,
-            L"SegoeUI_24.spritefont",
-            fontCpu, fontGpu);
-        // Defensive: if we ever try to render a character that isn't in the
-        // sprite font (e.g. a non-ASCII codepoint baked into a log message
-        // by mistake), SpriteFont::DrawString throws std::runtime_error which
-        // propagates out of WndProc -> STATUS_FATAL_USER_CALLBACK_EXCEPTION.
-        // Setting a default glyph turns that crash into a visible '?' instead.
-        m_uiFont->SetDefaultCharacter(L'?');
-        auto finished = fontUpload.End(m_deviceResources->GetCommandQueue());
-        finished.wait();
-    }
-    SampleLog::LogF(L"[ui] SpriteFont loaded (descriptor heap slot %u); "
-                    L"line spacing = %.1f px\n",
-                    fontSlot, m_uiFont->GetLineSpacing());
-
-    // 1x1 white texture used by the overlay backing-rect pass below
-    // (see RenderUI's drawSeg/draw lambdas).  Created via the same
-    // ResourceUploadBatch pattern as the spritefont, dropped into the
-    // next descriptor heap slot, GPU handle stashed for SpriteBatch::Draw.
-    {
-        ResourceUploadBatch upload(device);
-        upload.Begin();
-
-        D3D12_RESOURCE_DESC texDesc = {};
-        texDesc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        texDesc.Width              = 1;
-        texDesc.Height             = 1;
-        texDesc.DepthOrArraySize   = 1;
-        texDesc.MipLevels          = 1;
-        texDesc.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
-        texDesc.SampleDesc.Count   = 1;
-        texDesc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        texDesc.Flags              = D3D12_RESOURCE_FLAG_NONE;
-
-        auto defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-        ThrowIfFailed(device->CreateCommittedResource(
-            &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-            IID_PPV_ARGS(&m_overlayPanelTexture)));
-        m_overlayPanelTexture->SetName(L"Overlay 1x1 white (per-line dark backing source)");
-
-        // One white pixel: R=255 G=255 B=255 A=255.  SpriteBatch tints
-        // it with the dark+alpha colour we want when drawing the rect.
-        const uint8_t whitePixel[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
-        D3D12_SUBRESOURCE_DATA sub = {};
-        sub.pData      = whitePixel;
-        sub.RowPitch   = sizeof(whitePixel);
-        sub.SlicePitch = sizeof(whitePixel);
-
-        upload.Upload(m_overlayPanelTexture.Get(), 0, &sub, 1);
-        upload.Transition(m_overlayPanelTexture.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        auto done = upload.End(m_deviceResources->GetCommandQueue());
-        done.wait();
-
-        // SRV in the next free heap slot; SpriteBatch::Draw consumes a
-        // GPU handle.
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
-        UINT slot = AllocateDescriptor(&cpu);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
-        srvDesc.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels     = 1;
-        device->CreateShaderResourceView(m_overlayPanelTexture.Get(), &srvDesc, cpu);
-        m_overlayPanelTextureGpu = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            m_descriptorHeap->GetGPUDescriptorHandleForHeapStart(), slot, m_descriptorSize);
-        SampleLog::LogF(L"[ui] overlay-panel 1x1 texture (descriptor slot %u)\n", slot);
-    }
+    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
+    // Overlay UI is gutted; no SpriteFont / SpriteBatch needed.
 }
 
 // ---------------------------------------------------------------------------------
@@ -3974,154 +3669,9 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
 
 void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
 {
-    // ----- A/V/P primary toggles -----
-    if (key == 'P' || key == 'p')
-    {
-        m_animPaused = !m_animPaused;
-        SampleLog::LogF(L"[input] animation %s\n", m_animPaused ? L"PAUSED" : L"resumed");
-    }
-    else if (key == 'A' || key == 'a')
-    {
-        // [A] cycles the alloc strategy for whichever path is active:
-        //   Clustered BLAS: CLAS alloc mode (Implicit -> GetSizes -> Compact -> ...)
-        //   Traditional BLAS: BLAS alloc mode (Compact <-> Implicit)
-        // Either triggers a full GPU flush + rebuild of the static AS pipeline.
-        if (m_geometryMode == GeometryMode::Clusters)
-        {
-            switch (m_clasAllocMode)
-            {
-            case ClasAllocMode::Implicit: m_clasAllocMode = ClasAllocMode::GetSizes; break;
-            case ClasAllocMode::GetSizes: m_clasAllocMode = ClasAllocMode::Compact;  break;
-            case ClasAllocMode::Compact:  m_clasAllocMode = ClasAllocMode::Implicit; break;
-            }
-            SampleLog::LogF(L"[input] CLAS alloc mode -> %s\n", ClasAllocModeName());
-        }
-        else
-        {
-            m_traditionalAllocMode = (m_traditionalAllocMode == TraditionalAllocMode::Compact)
-                                     ? TraditionalAllocMode::Implicit
-                                     : TraditionalAllocMode::Compact;
-            SampleLog::LogF(L"[input] traditional BLAS alloc mode -> %s\n", TraditionalAllocModeName());
-        }
-        RebuildStaticAccelerationStructures(L"alloc-mode toggle");
-    }
-    else if (key == 'V' || key == 'v')
-    {
-        // Cycle vertex format: FLOAT32_3 <-> COMPRESSED1.
-        // NOTE: COMPRESSED1 currently exposes an NVIDIA driver bug (see the
-        // long comment in BuildScene above); on RTX hardware the second
-        // cycle may render geometry artifacts on some clusters.  WARP
-        // ("d3dconfig device force-warp=true") renders both paths cleanly.
-        m_vertexMode = (m_vertexMode == VertexMode::Float32_3)
-                     ? VertexMode::Compressed1
-                     : VertexMode::Float32_3;
-        SampleLog::LogF(L"[input] vertex format -> %s\n",
-                        m_vertexMode == VertexMode::Compressed1 ? L"COMPRESSED1" : L"FLOAT32_3");
-        RebuildStaticAccelerationStructures(L"vertex-format toggle");
-    }
-    else if (key == 'R' || key == 'r')
-    {
-        // Cycle [R] static-rebuild mode: None -> BlasOnly -> ClasAndBlas -> ...
-        // Per-frame work only; doesn't touch buffers (no GPU flush, no
-        // RebuildStaticAccelerationStructures).  The next OnRender picks
-        // up the new mode via m_staticRebuildMode and emits the
-        // corresponding RTAS ops.  Snap overlay stats so the new mode's
-        // per-frame timing values get armed for capture.
-        // [R] is cluster-mode-only -- no-op in traditional mode.
-        if (m_geometryMode != GeometryMode::Clusters) return;
-        switch (m_staticRebuildMode)
-        {
-        case StaticRebuildMode::None:        m_staticRebuildMode = StaticRebuildMode::BlasOnly;    break;
-        case StaticRebuildMode::BlasOnly:    m_staticRebuildMode = StaticRebuildMode::ClasAndBlas; break;
-        case StaticRebuildMode::ClasAndBlas: m_staticRebuildMode = StaticRebuildMode::None;        break;
-        }
-        SampleLog::LogF(L"[input] static rebuild mode -> %s\n", StaticRebuildModeName());
-        CaptureOverlayStatsSnapshot();
-    }
-    else if (key == 'T' || key == 't')
-    {
-        // Cycle [T] geometry mode: Clusters <-> Traditional.  Triggers a
-        // full static-AS rebuild (heavy, like [A]).  Locked off if the
-        // adapter doesn't support clusters (we're already pinned to
-        // Traditional and stay there).
-        if (!m_clustersAndPtlasSupported) return;
-        m_geometryMode = (m_geometryMode == GeometryMode::Clusters)
-                         ? GeometryMode::Traditional
-                         : GeometryMode::Clusters;
-        SampleLog::LogF(L"[input] geometry mode -> %s\n", GeometryModeName());
-        RebuildStaticAccelerationStructures(L"geometry-mode toggle");
-    }
-    else if (key == 'F' || key == 'f')
-    {
-        // [F] toggles animated-BLAS update strategy in traditional mode.
-        // No effect in cluster mode (the cluster INSTANTIATE+BLAS-from-CLAS
-        // pipeline doesn't have a refit/rebuild dichotomy).  No GPU
-        // rebuild needed; the next per-frame animated update picks up the
-        // new flag.
-        if (m_geometryMode == GeometryMode::Clusters) return;
-        m_traditionalAnimMode = (m_traditionalAnimMode == TraditionalAnimMode::Rebuild)
-                                ? TraditionalAnimMode::Refit
-                                : TraditionalAnimMode::Rebuild;
-        SampleLog::LogF(L"[input] traditional animated mode -> %s\n", TraditionalAnimModeName());
-        CaptureOverlayStatsSnapshot();
-    }
-    // ----- ',' / '.' = bounce-depth slider.  See m_bounceSlider in the
-    //   header for the canonical mapping table.  Slider direction has a
-    //   single meaning at every position -- moving '.' bumps the higher
-    //   value first (refraction) and once it saturates at 5, starts
-    //   bumping the lower one (reflection).  Moving ',' is the mirror
-    //   image.  Going up and back down ALWAYS lands at the same (refl,
-    //   refr) pair the slider passed through on the way up -- so the
-    //   default +2 gap is restored automatically.  No rebuild needed.
-    else if (key == VK_OEM_COMMA)            // ','
-    {
-        if (m_bounceSlider <= kBounceSliderMin) return;
-        --m_bounceSlider;
-        SampleLog::LogF(L"[input] bounce slider %d -> refl %u  refr %u\n",
-                        m_bounceSlider, ReflectionBounces(), RefractionBounces());
-    }
-    else if (key == VK_OEM_PERIOD)           // '.'
-    {
-        if (m_bounceSlider >= kBounceSliderMax) return;
-        ++m_bounceSlider;
-        SampleLog::LogF(L"[input] bounce slider %d -> refl %u  refr %u\n",
-                        m_bounceSlider, ReflectionBounces(), RefractionBounces());
-    }
-    // ----- '[' / ']' = per-cluster precision slider.  Direction is the same
-    //   in both modes: '[' -> LESS precision, ']' -> MORE precision.
-    //   Internally:
-    //     FLOAT32_3   -> m_positionTruncateBits in [0, 23].  '[' increments
-    //                    (truncates more bits); ']' decrements (keeps more).
-    //                    23 is float32's mantissa width -- truncating more
-    //                    than that just zeros the whole mantissa.
-    //     COMPRESSED1 -> m_compressedBitsPerComponent in [1, 16].  '['
-    //                    decrements; ']' increments.  16 is the per-axis
-    //                    cap in the D3D12 COMPRESSED1 encoding; 1 is the
-    //                    minimum (0 would divide-by-zero in our encoder).
-    //   Either change triggers a full static-AS rebuild (CLAS is re-encoded
-    //   in the COMPRESSED1 case via EncodeCompressedClusters inside Rebuild).
-    else if (key == VK_OEM_4 || key == VK_OEM_6)
-    {
-        const bool wantLess = (key == VK_OEM_4);
-        if (m_vertexMode == VertexMode::Float32_3)
-        {
-            const UINT prev = m_positionTruncateBits;
-            if (wantLess)  m_positionTruncateBits = (prev >= 23u) ? prev : prev + 1u;
-            else           m_positionTruncateBits = (prev == 0u)  ? 0u  : prev - 1u;
-            if (m_positionTruncateBits == prev) return;
-            SampleLog::LogF(L"[input] position truncate bits -> %u  (%u bits kept)\n",
-                            m_positionTruncateBits, 32u - m_positionTruncateBits);
-        }
-        else
-        {
-            const UINT prev = m_compressedBitsPerComponent;
-            if (wantLess)  m_compressedBitsPerComponent = (prev <= 1u)  ? 1u  : prev - 1u;
-            else           m_compressedBitsPerComponent = (prev >= 16u) ? prev : prev + 1u;
-            if (m_compressedBitsPerComponent == prev) return;
-            SampleLog::LogF(L"[input] compressed1 bits/component -> %u\n", m_compressedBitsPerComponent);
-        }
-        RebuildStaticAccelerationStructures(L"precision slider");
-    }
+    // ===== STUB: body removed for COMPRESSED1 minimal repro =====
+    // Headless screenshot mode; no interactive key handling.
+    (void)key;
 }
 
 void D3D12RaytracingClusteredGeometry::OnDeviceLost()

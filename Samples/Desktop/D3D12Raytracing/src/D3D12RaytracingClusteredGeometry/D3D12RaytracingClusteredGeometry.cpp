@@ -1000,10 +1000,33 @@ void D3D12RaytracingClusteredGeometry::EnsureCloneSourceLodMeshes()
         m_cloneSourceLodMeshes[8] = std::move(chain);
     }
 
-    SampleLog::LogF(L"[clone-lod] generated %zu chains: sphere0=%zu, torus=%zu, klein=%zu\n",
+    // CUBE copper glass.  Source: halfExtent=0.45, faceSubdiv=11, tileSize=11.
+    // Each face is one cluster -> 6 clusters total at LOD 0.  Cube
+    // generator's faceSubdiv must divide evenly by tileSize, so we
+    // can't strictly halve in a clean chain.  Pick LOD pairs that
+    // approximate halving each step's triangle count while keeping
+    // a single cluster per face:
+    //   LOD 0: 11/11 -> 6 clusters x 242 tris (= source)
+    //   LOD 1:  6/6  -> 6 clusters x  72 tris
+    //   LOD 2:  4/4  -> 6 clusters x  32 tris
+    //   LOD 3:  2/2  -> 6 clusters x   8 tris
+    {
+        const int cubeFaceSubdivs[]   = { 11, 6, 4, 2 };
+        std::vector<ProceduralGeometry::Mesh> chain;
+        for (int lod = 0; lod < kMaxLodLevels && lod < (int)_countof(cubeFaceSubdivs); ++lod)
+        {
+            const int fs = cubeFaceSubdivs[lod];
+            chain.push_back(ProceduralGeometry::GenerateCubeSpatialTiles(
+                0.45f, fs, fs, 0));
+        }
+        m_cloneSourceLodMeshes[5] = std::move(chain);
+    }
+
+    SampleLog::LogF(L"[clone-lod] generated %zu chains: sphere0=%zu, torus=%zu, cube=%zu, klein=%zu\n",
                     m_cloneSourceLodMeshes.size(),
                     m_cloneSourceLodMeshes.count(0) ? m_cloneSourceLodMeshes[0].size() : 0,
                     m_cloneSourceLodMeshes.count(4) ? m_cloneSourceLodMeshes[4].size() : 0,
+                    m_cloneSourceLodMeshes.count(5) ? m_cloneSourceLodMeshes[5].size() : 0,
                     m_cloneSourceLodMeshes.count(8) ? m_cloneSourceLodMeshes[8].size() : 0);
 }
 
@@ -1066,16 +1089,14 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // Filter the source pool for cloning.  We DON'T clone the floor
     // (instanceID 6) -- it's a giant slab and cloning it would clutter
     // the spiral with overlapping floors that occlude everything else
-    // and intersect the camera path.  Pool restricted to the three
+    // and intersect the camera path.  Pool restricted to the four
     // "iconic" static shapes the user picked PLUS the animated source:
     //   * sphere0 chrome (instanceID 0)
-    //   * torus / "donut" (instanceID 4)
-    //   * klein bottle    (instanceID 8)
     //   * animated sphere (m_animatedObject -- handled separately
     //                      since it's not stored in m_objects)
-    // Cycle position 0..2 picks a static source by instanceID; cycle
-    // position 3 spawns an animated clone (every 4th clone is animated
-    // -> N=100 yields 25 anim clones, N=1K yields 250, N=10K yields 2500).
+    // Cycle position 0..3 picks a static source by instanceID; cycle
+    // position 4 spawns an animated clone (every 5th clone is animated
+    // -> N=100 yields 20 anim clones, N=1K yields 200, N=10K yields 2000).
     //
     // CURRENT model for animated clones (phase 1): each anim clone is
     // a TLAS instance pointing at the SOURCE's blasGPUVA -- they share
@@ -1086,7 +1107,7 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     //
     // Match by instanceID rather than vector index so this stays
     // robust to scene-data reordering.
-    const UINT kCloneSourceInstanceIDs[] = { 0u, 4u, 8u };
+    const UINT kCloneSourceInstanceIDs[] = { 0u, 4u, 5u, 8u };
     std::vector<UINT> srcIndices;
     srcIndices.reserve(_countof(kCloneSourceInstanceIDs));
     for (UINT keepID : kCloneSourceInstanceIDs)
@@ -1106,14 +1127,12 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
                         L"in m_objects; clone pool is empty -- N=%u ignored\n", N_extra);
         return;
     }
-    // Source-pool size INCLUDES the animated source as a "slot".  Cycle
-    // index == srcIndices.size() means "spawn an animated clone instead
-    // of a static clone".  If animated isn't available (disabled at
-    // runtime), drop it from the pool.
-    const bool   animInPool   = m_animatedObjectEnabled;
-    const UINT   srcStaticN   = (UINT)srcIndices.size();
-    const UINT   srcPoolSize  = srcStaticN + (animInPool ? 1u : 0u);
-    const UINT   kAnimCycleSlot = srcStaticN;  // last slot in the cycle
+    // Source-pool size INCLUDES the animated source as the LAST cycle
+    // slot.  If animated is disabled at runtime, drop it from the pool.
+    const bool   animInPool     = m_animatedObjectEnabled;
+    const UINT   srcStaticN     = (UINT)srcIndices.size();
+    const UINT   srcPoolSize    = srcStaticN + (animInPool ? 1u : 0u);
+    const UINT   kAnimCycleSlot = srcStaticN;
 
     // Reset the animated-clones list before refilling.
     m_animatedClones.clear();
@@ -1146,33 +1165,34 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     const float kRadialSpacing  = 1.0f;
     // Jitter scale per-clone to break the visible Vogel-spiral arms
     // (user feedback "can see curves of empty space radiating out").
-    // Random ±15% of spacing on radius + ±15% of golden angle on
-    // azimuth defeats the regularity without letting clones overlap.
     const float kSpiralJitterFrac = 0.30f;  // applied as ±0.5 * frac scale
-    // stadium-seating visibility -- distant clones got squeezed
-    // into a narrow horizon band by perspective AND had less world
-    // y-rise to compensate).  Linear keeps the per-radius-unit
-    // rise constant so the back rows have enough world height to
-    // project above the front rows after perspective compression.
+    // Height curve: HYBRID sqrt + linear in (radius - innerRadius).
+    // Pure-linear had near-flat per-clone dy in the first ~100
+    // (constant-density Vogel packs them close together in radius;
+    // tiny dR -> tiny dY -> visually reads as "inner rings moving
+    // down with distance" because perspective alone determines
+    // their screen position).  Hybrid sqrt+linear gives both
+    // ends what they need:
+    //   * sqrt term dominates at the inner band: the singular
+    //     derivative of sqrt at 0 gives a noticeable per-clone
+    //     ascent through the first ~100 clones.
+    //   * linear term dominates at the outer band: keeps the
+    //     back rings rising past where sqrt would taper out so
+    //     they project clearly above the near rings after
+    //     perspective compression.
     //
-    //     i=0:    y = -2.00   (clearly below floor, but not "deep
-    //                          hole" -- still within ~1 unit of
-    //                          the floor at -0.7)
-    //     i=10:   y ~= -1.69  (rising fast toward floor)
-    //     i=100:  y ~= -0.32  (near floor level)
-    //     i=1K:   y ~= +5.43
-    //     i=10K:  y ~= +20.0  (high enough to project above the
-    //                          near rings after perspective; reads
-    //                          as the back of the stadium)
-    //
-    // Earlier sqrt attempts (mul=0.65 -> outer +6.9) had distant
-    // clones occluded by near ones because at radius 150 a clone
-    // at y=7 only projects at ~4 degrees above horizon, while
-    // near outer at y=1, radius 15 projects at ~6 degrees.  Linear
-    // mul=0.155 puts outer at +20 -- ~13 degrees, clearly above
-    // the near rings' silhouette.
-    const float kInnerY         = -2.00f;
-    const float kHeightLinearMul = 0.155f;
+    // Computed against the constant-density Vogel formula
+    //   r = sqrt(innerR^2 + i * spacing^2)
+    // with spacing=1.0, so r(i=100)=10.97, r(i=10K)=100.1:
+    //     i=0:    y = -1.50
+    //     i=1:    y ~= -1.32  (visible per-clone rise from the start)
+    //     i=10:   y ~= -0.85
+    //     i=100:  y ~= +0.74
+    //     i=1K:   y ~= +5.24
+    //     i=10K:  y ~= +17.7
+    const float kInnerY          = -1.50f;
+    const float kHeightSqrtMul   =  0.50f;
+    const float kHeightLinearMul =  0.15f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  On whenever there are extra clones, NOT just at
@@ -1245,7 +1265,9 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         const float radiusBase = sqrtf(kInnerRadius * kInnerRadius
                                        + (float)i * kRadialSpacing * kRadialSpacing);
         const float radius   = std::max(kInnerRadius, radiusBase + radiusJitter);
-        const float heightY  = kInnerY + std::max(0.0f, radius - kInnerRadius) * kHeightLinearMul;
+        const float rOff     = std::max(0.0f, radius - kInnerRadius);
+        const float heightY  = kInnerY + sqrtf(rOff) * kHeightSqrtMul
+                                       + rOff * kHeightLinearMul;
         const DirectX::XMFLOAT3 spiralPos = {
             radius * cosf(angle),
             heightY,

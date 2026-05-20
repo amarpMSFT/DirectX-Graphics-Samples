@@ -1411,6 +1411,9 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     // appropriately-sized allocation for the new clone count + LOD
     // distribution.
     m_clusterBlasPoolBuffer.Reset();
+    m_tradBlasWorstcasePool.Reset();
+    m_tradBlasCompactPool.Reset();
+    m_tradBlasSharedScratch.Reset();
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalActualBytes  = 0;
     m_traditionalStaticTotalScratchBytes = 0;
@@ -2848,13 +2851,27 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
     UINT64 totalIbBytes      = 0;
     UINT   totalGeomDescs    = 0;
 
-    // Per-object temp storage used only during the build, kept alive in
-    // these vectors so we can do a GPU flush mid-function (for Compact)
-    // and resume.
-    struct Temp { ComPtr<ID3D12Resource> srcBlas; };  // worst-case BLAS (Compact mode only)
-    std::vector<Temp> temps(m_objects.size());
+    // Per-object build info we accumulate in PASS A so PASS C can run
+    // the actual BuildRaytracingAccelerationStructure into pre-allocated
+    // pool slots instead of per-object CreateCommittedResource calls.
+    struct PerObjInfo {
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geomDescs;
+        UINT64 resultBytes  = 0;   // prebuild ResultDataMaxSizeInBytes
+        UINT64 resultOffset = 0;   // running cumulative offset into the worst-case pool
+        UINT64 scratchBytes = 0;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS flags = (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS)0;
+    };
+    std::vector<PerObjInfo> info(m_objects.size());
 
-    // -------- Pass 1: build all BLASes (worst-case sized) and stash temps --------
+    constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
+    UINT64 maxScratchBytes = 0;
+
+    // -------- PASS A: per-object VB+IB + geom desc build + prebuild --------
+    // We allocate the per-object upload-heap VB+IB here (unavoidably
+    // per-object since they hold distinct mesh data) but DON'T yet
+    // allocate the BLAS or scratch -- those go into shared pools
+    // built after this pass completes and we know per-obj prebuild
+    // sizes.
     for (size_t oi = 0; oi < m_objects.size(); ++oi)
     {
         auto& obj = m_objects[oi];
@@ -3004,45 +3021,88 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
         m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &prebuild);
 
-        // Worst-case source BLAS.  In Compact mode this is a temp -- the
-        // final obj.tradBlasStorage gets reallocated to the compacted
-        // size in pass 2.  In Implicit mode this IS obj.tradBlasStorage.
-        ComPtr<ID3D12Resource> srcBlas;
-        AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes,
-                          &srcBlas,
-                          D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                          wantCompact ? L"Traditional BLAS result (temp, pre-compact)"
-                                      : L"Traditional BLAS result");
-        AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
-                          &obj.tradBlasScratch,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                          L"Traditional BLAS scratch");
+        // Stash everything PASS C will need to call BuildRTAS for this
+        // obj.  geomDescs is move'd into the per-obj info struct so it
+        // lives across passes (the build descriptor's pGeometryDescs
+        // points at it).  We also record the per-obj BLAS slot offset
+        // into the upcoming pool (cumulative running sum).
+        info[oi].resultBytes  = prebuild.ResultDataMaxSizeInBytes;
+        info[oi].scratchBytes = prebuild.ScratchDataSizeInBytes;
+        info[oi].resultOffset = totalResultBytes;
+        info[oi].flags        = inputs.Flags;
+        info[oi].geomDescs    = std::move(geomDescs);
+        const UINT64 alignedResult = (prebuild.ResultDataMaxSizeInBytes + kAlign - 1) & ~(kAlign - 1);
+        totalResultBytes  += alignedResult;
+        totalScratchBytes += prebuild.ScratchDataSizeInBytes;
+        maxScratchBytes    = std::max(maxScratchBytes, prebuild.ScratchDataSizeInBytes);
+
         obj.tradBlasResultBytes   = prebuild.ResultDataMaxSizeInBytes;
         obj.tradBlasScratchBytes  = prebuild.ScratchDataSizeInBytes;
-        totalResultBytes  += prebuild.ResultDataMaxSizeInBytes;
-        totalScratchBytes += prebuild.ScratchDataSizeInBytes;
+    }
+
+    // -------- PASS B: allocate worst-case BLAS pool + shared scratch --------
+    // Replaces N x AllocateUAVBuffer (each a separate CreateCommittedResource
+    // costing ~ms in driver overhead) with a SINGLE allocation that
+    // every per-object BLAS slot points into.  At [N]=10K trad mode this
+    // collapses 7500+ driver alloc calls (the cause of multi-second
+    // toggle stalls) down to 1 BLAS pool + 1 scratch.
+    AllocateUAVBuffer(device, totalResultBytes, &m_tradBlasWorstcasePool,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      wantCompact ? L"Traditional BLAS pool (worst-case, pre-compact)"
+                                  : L"Traditional BLAS pool (implicit)");
+    AllocateUAVBuffer(device, std::max<UINT64>(maxScratchBytes, 256ull),
+                      &m_tradBlasSharedScratch,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"Traditional BLAS scratch (shared)");
+    const D3D12_GPU_VIRTUAL_ADDRESS worstcasePoolBase = m_tradBlasWorstcasePool->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS sharedScratchGVA  = m_tradBlasSharedScratch->GetGPUVirtualAddress();
+
+    // -------- PASS C: actually run the per-object builds into pool slots --------
+    // Each build writes its BLAS into worstcasePoolBase + info[oi].resultOffset.
+    // The scratch buffer is shared across builds; we emit a UAV barrier on
+    // it between each build so the next build doesn't start scratch writes
+    // before the previous build's reads complete (per-build BuildRTAS is
+    // an indirect dispatch from D3D12's perspective; ordering between
+    // dispatches on the same scratch needs the barrier).
+    for (size_t oi = 0; oi < m_objects.size(); ++oi)
+    {
+        auto& obj = m_objects[oi];
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+        inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        inputs.NumDescs       = (UINT)info[oi].geomDescs.size();
+        inputs.pGeometryDescs = info[oi].geomDescs.data();
+        inputs.Flags          = info[oi].flags;
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
         buildDesc.Inputs                             = inputs;
-        buildDesc.DestAccelerationStructureData      = srcBlas->GetGPUVirtualAddress();
-        buildDesc.ScratchAccelerationStructureData   = obj.tradBlasScratch->GetGPUVirtualAddress();
+        buildDesc.DestAccelerationStructureData      = worstcasePoolBase + info[oi].resultOffset;
+        buildDesc.ScratchAccelerationStructureData   = sharedScratchGVA;
         m_dxrCommandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
 
-        auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(srcBlas.Get());
-        m_dxrCommandList->ResourceBarrier(1, &barrier);
+        // UAV barrier on shared scratch so the next per-obj build sees
+        // it idle.  The dest pool's own UAV barrier comes at the end
+        // (one for the whole pool).
+        auto scratchBar = CD3DX12_RESOURCE_BARRIER::UAV(m_tradBlasSharedScratch.Get());
+        m_dxrCommandList->ResourceBarrier(1, &scratchBar);
 
-        if (wantCompact)
+        if (!wantCompact)
         {
-            temps[oi].srcBlas = srcBlas;          // keep alive across mid-function flush
+            // Implicit: the pool slot IS the final storage; obj.tradBlasStorage
+            // stays null (the per-obj ComPtr would be redundant -- pool
+            // owns the memory).  obj.tradBlasGPUVA points into the pool.
+            obj.tradBlasStorage.Reset();
+            obj.tradBlasScratch.Reset();
+            obj.tradBlasGPUVA       = worstcasePoolBase + info[oi].resultOffset;
+            obj.tradBlasActualBytes = info[oi].resultBytes;
+            totalActualBytes       += info[oi].resultBytes;
         }
-        else
-        {
-            // Implicit: srcBlas IS the final storage.  Stash it onto the obj.
-            obj.tradBlasStorage = srcBlas;
-            obj.tradBlasGPUVA   = srcBlas->GetGPUVirtualAddress();
-            obj.tradBlasActualBytes = prebuild.ResultDataMaxSizeInBytes;
-            totalActualBytes += prebuild.ResultDataMaxSizeInBytes;
-        }
+    }
+    // One pool-level UAV barrier so subsequent ops (TLAS build,
+    // postbuild emit) see every per-obj BLAS write.
+    {
+        auto poolBar = CD3DX12_RESOURCE_BARRIER::UAV(m_tradBlasWorstcasePool.Get());
+        m_dxrCommandList->ResourceBarrier(1, &poolBar);
     }
 
     // -------- Implicit mode: done. --------
@@ -3086,9 +3146,11 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
     // Emit one COMPACTED_SIZE postbuild-info per BLAS.  Single API call --
     // EmitRaytracingAccelerationStructurePostbuildInfo takes an array of
     // BLAS GVAs and writes the descs back-to-back into postbuildBuf.
+    // Source GVAs come from worstcasePoolBase + per-obj offset (each
+    // BLAS lives in the worst-case pool, not in its own resource).
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> srcGvas(N);
     for (UINT i = 0; i < N; ++i)
-        srcGvas[i] = temps[i].srcBlas->GetGPUVirtualAddress();
+        srcGvas[i] = worstcasePoolBase + info[i].resultOffset;
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pbDesc = {};
     pbDesc.DestBuffer = postbuildBuf->GetGPUVirtualAddress();
     pbDesc.InfoType   = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
@@ -3119,38 +3181,56 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         postbuildReadback->Unmap(0, &wrote);
     }
 
-    // Pass 2: allocate compacted destinations + copy with COMPACT mode.
+    // Pass 2: allocate the COMPACTED-pool buffer sized to the sum of
+    // per-obj compacted sizes, then copy each per-obj BLAS from its
+    // slot in the worst-case pool into its slot in the compact pool
+    // via COPY_MODE_COMPACT.
     ThrowIfFailed(commandAllocator->Reset());
     ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
+
+    std::vector<UINT64> compactOffsets(N);
+    UINT64 totalCompactBytes = 0;
+    for (UINT i = 0; i < N; ++i)
+    {
+        compactOffsets[i] = totalCompactBytes;
+        totalCompactBytes += (compactedSizes[i] + kAlign - 1) & ~(kAlign - 1);
+    }
+    AllocateUAVBuffer(device, std::max<UINT64>(totalCompactBytes, 256ull),
+                      &m_tradBlasCompactPool,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"Traditional BLAS pool (compacted)");
+    const D3D12_GPU_VIRTUAL_ADDRESS compactPoolBase = m_tradBlasCompactPool->GetGPUVirtualAddress();
 
     for (UINT i = 0; i < N; ++i)
     {
         auto& obj = m_objects[i];
-        AllocateUAVBuffer(device, compactedSizes[i], &obj.tradBlasStorage,
-                          D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                          L"Traditional BLAS result (compacted)");
         m_dxrCommandList->CopyRaytracingAccelerationStructure(
-            obj.tradBlasStorage->GetGPUVirtualAddress(),
-            temps[i].srcBlas->GetGPUVirtualAddress(),
+            compactPoolBase + compactOffsets[i],
+            worstcasePoolBase + info[i].resultOffset,
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
 
-        auto barrier = CD3DX12_RESOURCE_BARRIER::UAV(obj.tradBlasStorage.Get());
-        m_dxrCommandList->ResourceBarrier(1, &barrier);
-
-        obj.tradBlasGPUVA       = obj.tradBlasStorage->GetGPUVirtualAddress();
+        // No per-resource ComPtr -- pool owns the memory.  Stats /
+        // reset paths read these GVA/size fields instead.
+        obj.tradBlasStorage.Reset();
+        obj.tradBlasGPUVA       = compactPoolBase + compactOffsets[i];
         obj.tradBlasActualBytes = compactedSizes[i];
         totalActualBytes       += compactedSizes[i];
     }
+    {
+        auto compactBar = CD3DX12_RESOURCE_BARRIER::UAV(m_tradBlasCompactPool.Get());
+        m_dxrCommandList->ResourceBarrier(1, &compactBar);
+    }
 
-    // Execute + wait HERE so the worst-case temps stay alive until the
-    // GPU finishes copying out of them; if we let the caller's
-    // ExecuteCommandList run, temps[].srcBlas would release at function
-    // return (before submit) and the cmd-list close-time validation
-    // would fire D3D12 ERROR 921 ("resource deleted prior to closing").
-    // Reset cmd list/allocator afterwards so the caller can keep
-    // recording (TLAS build, etc.) into an empty list as it expects.
+    // Execute + wait HERE so the worst-case temp pool (m_tradBlasWorstcasePool)
+    // stays alive until the GPU finishes copying out of it.  Same
+    // motivation as the old per-obj temps[].srcBlas keep-alive: dropping
+    // it pre-submit would fire D3D12 ERROR 921 ("resource deleted prior
+    // to closing").  After the wait, the worst-case pool is no longer
+    // needed (its contents are now copied into m_tradBlasCompactPool)
+    // so we drop it to reclaim the temp memory.
     m_deviceResources->ExecuteCommandList();
     m_deviceResources->WaitForGpu();
+    m_tradBlasWorstcasePool.Reset();
     ThrowIfFailed(commandAllocator->Reset());
     ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
 
@@ -5085,14 +5165,18 @@ void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
     if (m_clasResultBuffer) m_totalClasBytes = m_clasResultBuffer->GetDesc().Width;
 
     // Compute total BLAS allocation size.  Cluster path: pooled into
-    // m_clusterBlasPoolBuffer.  Traditional path: per-object
-    // obj.tradBlasStorage (separate code path, not pooled).
+    // m_clusterBlasPoolBuffer.  Traditional static path: pooled into
+    // m_tradBlasWorstcasePool (implicit alloc mode) OR
+    // m_tradBlasCompactPool (compact alloc mode; worst-case pool is
+    // dropped at end of BuildTraditionalStaticAS).  Animated trad
+    // path is still per-object on m_animatedObject.tradBlasStorage.
     m_totalBlasBytes = 0;
     if (m_clusterBlasPoolBuffer)
         m_totalBlasBytes += m_clusterBlasPoolBuffer->GetDesc().Width;
-    for (const auto& obj : m_objects)
-        if (obj.tradBlasStorage)
-            m_totalBlasBytes += obj.tradBlasStorage->GetDesc().Width;
+    if (m_tradBlasWorstcasePool)
+        m_totalBlasBytes += m_tradBlasWorstcasePool->GetDesc().Width;
+    if (m_tradBlasCompactPool)
+        m_totalBlasBytes += m_tradBlasCompactPool->GetDesc().Width;
 
     UINT64* ts = nullptr;
     D3D12_RANGE r = { 0, sizeof(UINT64) * kBuildTimestampCount };
@@ -7456,6 +7540,9 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_blasArgsMeta.Reset();
     m_blasResultAddrBuffer.Reset();
     m_clusterBlasPoolBuffer.Reset();
+    m_tradBlasWorstcasePool.Reset();
+    m_tradBlasCompactPool.Reset();
+    m_tradBlasSharedScratch.Reset();
     m_tlasBuffer.Reset();
     m_tlasScratchBuffer.Reset();
     m_tlasInstanceDescs.Reset();

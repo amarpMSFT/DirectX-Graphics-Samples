@@ -583,6 +583,29 @@ private:
     // destination GPU VAs so the indirect build naturally writes
     // each BLAS into its slice of the pool.
     ComPtr<ID3D12Resource>               m_clusterBlasPoolBuffer;
+    // Traditional-path BLAS storage pool.  Mirrors the cluster-path
+    // m_clusterBlasPoolBuffer optimization: one shared committed
+    // buffer holding every static object's BLAS storage in implicit-
+    // alloc mode, or holding the WORST-CASE temp BLAS storage during
+    // a compact-alloc build's pass 1 (the compacted finals live in
+    // m_tradBlasCompactPool below).  Eliminates the per-clone
+    // CreateCommittedResource overhead that scales poorly at high
+    // [N] clone counts -- 7500 driver calls collapse to ONE.
+    ComPtr<ID3D12Resource>               m_tradBlasWorstcasePool;
+    // Compact-alloc-mode-only: holds the final compacted BLASes
+    // (sized to sum of postbuild compacted sizes).  Pass 2 of the
+    // compact build copies each temp BLAS from m_tradBlasWorstcasePool
+    // into its slot here via COPY_MODE_COMPACT, then drops the
+    // worst-case pool.  obj.tradBlasGPUVA ends up pointing into this.
+    ComPtr<ID3D12Resource>               m_tradBlasCompactPool;
+    // Shared scratch buffer used by every per-object BLAS build in
+    // the trad-path static AS build.  One buffer sized to the
+    // largest single-BLAS scratch requirement; per-object builds
+    // run sequentially and emit a UAV barrier on the scratch
+    // between them so each build sees the scratch as available
+    // again before clobbering it.  Saves another N-1 driver alloc
+    // calls.
+    ComPtr<ID3D12Resource>               m_tradBlasSharedScratch;
 
     ComPtr<ID3D12Resource>               m_tlasBuffer;
     ComPtr<ID3D12Resource>               m_tlasScratchBuffer;

@@ -4260,7 +4260,12 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID  = obj.instanceID;
-        instances[i].InstanceMask= 0xFF;
+        // ⚠ DIAGNOSTIC: mask=0 hides all base-scene + static-clone instances
+        // so only the central animated ball + N_animClone anim clones render.
+        // If user sees ONLY one ball in the middle -> anim clones not rendering.
+        // If user sees N+1 balls -> anim clones ARE rendering, you can now see WHERE.
+        // Revert to 0xFF when done debugging.
+        instances[i].InstanceMask= 0x00;
         // Hit-group contribution.  Three cases:
         //   * SINGLE-region opaque-only        -> kHitGroupContribOpaque
         //   * SINGLE-region glass OR ALL-glass -> kHitGroupContribGlass

@@ -1063,20 +1063,32 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // check while still being an interesting stress test.  Below 1K
     // the overhead isn't worth it; clones get full source detail.
     //
-    // LOD = lerp(1.0, 0.10, t) where t = (radius - innerRadius) /
-    // (maxRadius - innerRadius), clamped to [0,1].  At the innermost
-    // ring clones keep all source clusters; at the outermost ring
-    // they drop to 10% of source clusters.  Truncated clones lose
-    // the trailing slices of their source mesh which leaves visible
-    // holes -- acceptable for a workload-scaling demo where the goal
-    // is bytes/triangles scaling, not geometric fidelity.
+    // We only drop CLUSTER COUNT (not tris-per-cluster).  Truncating
+    // trailing clusters leaves a coherent "missing slice" (sphere/
+    // torus/klein generators emit in spatial-tile order so the
+    // remaining clusters cover a contiguous spatial region); the
+    // viewer reads it as a partial mesh.  Truncating tris WITHIN a
+    // surviving cluster leaves random-looking pinholes throughout
+    // the mesh -- visually worse and not worth the marginal extra
+    // memory savings.
+    //
+    // LOD curve: a fixed "full detail zone" at the start (first 25%
+    // of the radial range) keeps the near-camera ring at lodFactor=1
+    // so close-up clones look identical to the source.  Past that
+    // zone, lodFactor falls linearly toward kLodFar=0.30 at the
+    // outermost ring -- still 30% of source clusters so the outer
+    // clones keep recognizable shape even though they're missing
+    // chunks.  Combined with the radial spread pushing outer clones
+    // to greater world distance (where pixel size is small), the
+    // truncation is hard to read as "broken" vs "low detail".
     const bool  kLodEnabled = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
                               (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
-    const float kLodNear      = 1.00f;
-    const float kLodFar       = 0.10f;
+    const float kLodNear           = 1.00f;
+    const float kLodFar            = 0.30f;
+    const float kLodFullDetailFrac = 0.25f;  // first 25% of radial range = full detail
     // Pre-compute maxRadius matching the spiral formula so we can
     // normalize the radius-to-LOD factor.
-    const float kMaxRadius    = kInnerRadius + sqrtf((float)std::max(N_extra, 1u)) * kRadialSpacing;
+    const float kMaxRadius     = kInnerRadius + sqrtf((float)std::max(N_extra, 1u)) * kRadialSpacing;
     const float kLodRadialSpan = std::max(0.001f, kMaxRadius - kInnerRadius);
 
     // Cycle-deterministic RNG so re-toggling to the same N produces the
@@ -1143,32 +1155,28 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         clone.tradBlasResultBytes  = 0;
         clone.tradBlasScratchBytes = 0;
 
-        // Distance LOD: at the higher tiers, drop both cluster COUNT
-        // and triangles-per-cluster as a function of radius.  Combined
-        // they multiply: a clone at the periphery with lodFactor=0.10
-        // gets 10% clusters x 10% tris-per-cluster = ~1% of source
-        // triangles, dramatically shrinking its CLAS+BLAS storage and
-        // BVH-traversal cost vs near-camera clones at full detail.
+        // Distance LOD: at the higher tiers, drop CLUSTER COUNT as a
+        // function of radius -- trailing spatial tiles fall away first.
+        // The first kLodFullDetailFrac of the radial range stays at
+        // lodFactor=1 (no truncation) so near-camera clones are
+        // visually indistinguishable from the source; past that zone,
+        // lodFactor falls linearly to kLodFar at the outermost ring.
         //
-        // The cluster-list truncation drops the trailing spatial tiles
-        // (sphere generators emit clusters in row-major lat/long
-        // order; torus in ring-major; klein in u-major).  The tri
-        // truncation within each surviving cluster drops the trailing
-        // triangles of that cluster's IB.  Both leave visible holes
-        // (acceptable for a workload-scaling demo where the goal is
-        // bytes/triangles scaling, not geometric fidelity).
-        //
-        // We DON'T resize the per-cluster positions array even when
-        // tris are dropped -- some positions may become unreferenced
-        // but the CLAS build accepts that (it reads vertCount + triCount
-        // independently).  Skipping the positions reorder keeps the
-        // LOD code O(N_clusters) instead of O(N_verts).
+        // Tris-per-cluster reduction was tried alongside and creates
+        // visible random pinholes throughout each cluster -- looks
+        // distinctly "broken" rather than "low detail" -- so we keep
+        // each surviving cluster's IB intact and accept a smaller
+        // per-clone memory delta vs the combined approach.
         if (kLodEnabled && !clone.mesh.clusters.empty())
         {
-            const float t = std::clamp(
+            const float tRaw = std::clamp(
                 (radius - kInnerRadius) / kLodRadialSpan, 0.0f, 1.0f);
-            const float lodFactor = kLodNear + (kLodFar - kLodNear) * t;
-            // (1) cluster-count LOD: drop trailing spatial tiles.
+            // Remap so [0..kLodFullDetailFrac] -> 0 and
+            //         [kLodFullDetailFrac..1] -> [0..1].
+            const float tEff = (tRaw <= kLodFullDetailFrac)
+                ? 0.0f
+                : (tRaw - kLodFullDetailFrac) / (1.0f - kLodFullDetailFrac);
+            const float lodFactor = kLodNear + (kLodFar - kLodNear) * tEff;
             const UINT  srcN      = (UINT)clone.mesh.clusters.size();
             const UINT  lodN      = std::max(1u, (UINT)std::ceil((float)srcN * lodFactor));
             if (lodN < srcN)
@@ -1176,29 +1184,18 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
                 clone.mesh.clusters.resize(lodN);
                 if (clone.encoded.size() > lodN)
                     clone.encoded.resize(lodN);
+                // Recount mesh totals so downstream stats (and the
+                // BLAS prebuild's MaxTotalTriangleCount inference) are
+                // correct for the LOD'd cluster set.
+                UINT totalTri = 0, totalVert = 0;
+                for (const auto& c : clone.mesh.clusters)
+                {
+                    totalTri  += (UINT)(c.indices.size() / 3);
+                    totalVert += (UINT)c.positions.size();
+                }
+                clone.mesh.totalTriangles = totalTri;
+                clone.mesh.totalVertices  = totalVert;
             }
-            // (2) tris-per-cluster LOD: drop trailing tris of each
-            //     surviving cluster.  Always keep at least 1 tri
-            //     (a degenerate-empty cluster would crash the CLAS
-            //     build's MaxTotalTriangleCount predicate).
-            for (auto& cl : clone.mesh.clusters)
-            {
-                const UINT srcTri = (UINT)(cl.indices.size() / 3);
-                const UINT lodTri = std::max(1u, (UINT)std::ceil((float)srcTri * lodFactor));
-                if (lodTri < srcTri)
-                    cl.indices.resize((size_t)lodTri * 3u);
-            }
-            // Recount mesh totals so downstream stats (and the BLAS
-            // prebuild's MaxTotalTriangleCount inference) are correct
-            // for the LOD'd cluster set.
-            UINT totalTri = 0, totalVert = 0;
-            for (const auto& c : clone.mesh.clusters)
-            {
-                totalTri  += (UINT)(c.indices.size() / 3);
-                totalVert += (UINT)c.positions.size();
-            }
-            clone.mesh.totalTriangles = totalTri;
-            clone.mesh.totalVertices  = totalVert;
         }
 
         clone.worldPos      = spiralPos;

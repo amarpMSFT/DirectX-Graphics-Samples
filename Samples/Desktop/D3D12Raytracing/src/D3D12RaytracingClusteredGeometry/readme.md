@@ -118,8 +118,48 @@ On HW adapters the window launches maximized; on WARP / Basic Render it stays
 at the default 1280×720 since maximizing a CPU rasterizer to 4K would make
 each frame take seconds. Headless runs (any of the above CLI flags) also stay
 at 1280×720 so screenshot resolution is deterministic.
-| B   | Pause animation                                            |
-| S   | Toggle stats overlay (cluster sizes, build wallclocks)     |
+
+## Source organization
+
+The sample is split across a few logical files so the bits worth copy-pasting
+into your own renderer are concentrated in one place.
+
+- **`D3D12RaytracingClusteredGeometry.cpp`** – the **main file**: CORE
+  acceleration-structure management + rendering.  This is where the DXR2 work
+  lives that you'd actually want to crib for your own engine:
+    * `BuildClasIndirect` / `BuildClasImplicit` / `BuildClasGetSizes` /
+      `BuildClasCompact` — the three CLAS alloc-mode variants the `[A]` toggle
+      cycles through.
+    * `BuildBlasFromClasIndirect` — pooled per-object BLAS-from-CLAS for the
+      static scene.
+    * `BuildAnimatedObjectSetup` / `UpdateAnimatedObjectPerFrame` — template
+      build (once) + per-frame `INSTANTIATE_CLUSTER_TEMPLATES` +
+      `BUILD_BLAS_FROM_CLAS` for the deforming ball.
+    * `BuildAnimatedClonesSetup` — phase-2 extension that fans the per-frame
+      BLAS-from-CLAS op out to N additional dest GVAs so each `[N]` anim clone
+      gets its own per-frame BLAS in a shared pool.
+    * `BuildTraditionalStaticAS` / `BuildAnimatedTraditionalAS` /
+      `UpdateAnimatedTradPerFrame` — DXR1 baseline path the `[T]` toggle
+      compares against.
+    * `BuildTlasClassic` — TLAS instance assembly + per-instance material
+      overrides + per-mode BLAS GVA selection.
+    * `CreateRaytracingPipelineAndShaderTables` + the `CreateFill*Pipeline`
+      helpers — state object + 8-record shader table + compute PSOs for the
+      GPU-side arg-fill passes.
+    * `OnInit` / `OnRender` / `DoRender` — the device + per-frame render loop.
+- **`OverlayUI.cpp`** – on-screen stats overlay (`RenderUI`, `CreateUIFont`,
+  delta-color snapshotting).  Pure presentation; safe to ignore if you're
+  reading for AS knowledge.
+- **`SceneSetup.cpp`** – `BuildScene` + `BuildMaterials`: this particular
+  demo's collection of spheres/torus/cube/klein + their PBR-ish materials.
+  Your engine has its own scene system; this file shows what it should hand
+  the AS pipeline.
+- **`ScenePopulation.cpp`** – `[N]` workload-scaling clone generator
+  (`RegenerateWorkloadCloneInstances` + `EnsureCloneSourceLodMeshes`).
+  Demo-only — engineers cribbing the AS pipeline can ignore this file
+  entirely.
+- **`InputHandling.cpp`** – `ParseCommandLineArgs` + `OnKeyDown` keyboard
+  routing.  CLI + UI hookups, not part of the AS pipeline.
 
 ## Things to note
 

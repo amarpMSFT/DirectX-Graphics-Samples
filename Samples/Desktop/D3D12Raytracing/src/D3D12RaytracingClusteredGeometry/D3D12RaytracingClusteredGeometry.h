@@ -768,6 +768,16 @@ private:
     // ONE committed resource so we don't pay N CreateCommittedResource
     // calls (same trick as the static BLAS pool).
     Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasPool;
+    // Phase-2 separate args + result-addr buffers for the per-frame
+    // BUILD_BLAS_FROM_CLAS batched op.  We can NOT replace source's
+    // obj.blasArgsBuffer / obj.blasResultAddrBuffer in-place because
+    // BuildAnimatedObjectSetup just recorded GPU work referencing those
+    // resources -- releasing them before the GPU consumes that work is
+    // UB.  These are NEW resources sized for (1 + N_animClones) entries
+    // that the per-frame op switches to when the pool exists.
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasArgsBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasResultAddrBuffer;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasScratchBuffer;
 
     // Pre-generated LOD-chain meshes for the cloneable source types.
     // Keyed by source instanceID (0=sphere0, 4=torus, 8=klein).  Each

@@ -787,13 +787,20 @@ private:
         D3D12_GPU_VIRTUAL_ADDRESS blasGPUVA = 0;
     };
     std::vector<AnimatedCloneInstance>      m_animatedClones;
-    // Cluster mode only: one pool buffer holding every animated clone's
-    // per-frame BLAS storage.  Sized at clone-gen time as
-    // (N_animatedClones * source per-frame BLAS size); each clone's
-    // BLAS GVA = poolBase + (cloneIdx * perBlasBytes).  Allocated as
-    // ONE committed resource so we don't pay N CreateCommittedResource
-    // calls (same trick as the static BLAS pool).
+    // Cluster mode only: per-clone BLAS storage pool.  Allocated by
+    // BuildAnimatedClonesSetup; each clone's blasGPUVA = poolBase + k*size.
     Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesBlasPool;
+    // Trad-mode phase-2 analog: per-anim-clone DXR1 BLAS storage pool.
+    // Each per-frame UpdateAnimatedTradPerFrame call rebuilds the source
+    // animated BLAS and then issues N more BuildRaytracingAccelerationStructure
+    // calls, one per anim clone, each into its own pool slot.  DXR1 has
+    // no batched-build API so this is genuinely O(N) driver calls per
+    // frame -- exactly the kind of overhead DXR2's batched
+    // ExecuteIndirectRTASOperations API is designed to eliminate, which
+    // is the headline DXR2-vs-DXR1 comparison this sample exists to
+    // demonstrate.  Allocated by BuildAnimatedClonesTradSetup.
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesTradBlasPool;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_animClonesTradBlasScratch;
     // Phase-2 separate args + result-addr buffers for the per-frame
     // BUILD_BLAS_FROM_CLAS batched op.  We can NOT replace source's
     // obj.blasArgsBuffer / obj.blasResultAddrBuffer in-place because
@@ -1275,6 +1282,12 @@ private:
     // AnimatedCloneInstance.blasGPUVA, which BuildTlasClassic then
     // bakes into the TLAS instance descs.
     void BuildAnimatedClonesSetup();
+    // Trad-mode analog: allocate the per-anim-clone DXR1 BLAS pool +
+    // shared scratch.  No-op outside trad mode or when m_animatedClones
+    // is empty.  Per-clone BLAS storage = N x (source's prebuild result
+    // size), so memory budget can be tight at the higher [N] tiers --
+    // a 4090 swallows N=10K fine, smaller GPUs may want to stop at N=1K.
+    void BuildAnimatedClonesTradSetup();
     // Traditional-mode addendum to BuildAnimatedObjectSetup.  Runs after
     // the shared mesh + perFrameVertexBuffer setup (which both modes need
     // because AnimateBall.cs writes the same per-vertex animation buffer

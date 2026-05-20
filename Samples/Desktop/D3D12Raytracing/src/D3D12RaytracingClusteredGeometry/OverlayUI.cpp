@@ -658,7 +658,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     const UINT animClusters = m_animatedObjectEnabled ? m_animatedObject.clusterCount : 0u;
     // Add anim clones' own BLASes when phase-2 pool exists.
     const UINT animCloneBlasCount =
-        (m_geometryMode == GeometryMode::Clusters && m_animClonesBlasPool)
+        ((m_geometryMode == GeometryMode::Clusters && m_animClonesBlasPool) ||
+         (m_geometryMode == GeometryMode::Traditional && m_animClonesTradBlasPool))
             ? (UINT)m_animatedClones.size()
             : 0u;
     const UINT sceneBlasCount    = (UINT)m_objects.size()
@@ -1371,7 +1372,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const UINT N_anim_clones   = (UINT)m_animatedClones.size();
         const wchar_t* fmt = (m_geometryMode == GeometryMode::Clusters)
             ? L"   extra unique BLAS+CLAS: %s   (%u static + %u animated [own BLAS, shared CLAS])   LOD reduces with distance"
-            : L"   extra unique BLASes:    %s   (%u static + %u animated [shared BLAS])   LOD reduces with distance";
+            : L"   extra unique BLASes:    %s   (%u static + %u animated [own BLAS, per-clone DXR1 rebuild])   LOD reduces with distance";
         swprintf_s(kbuf, fmt,
                    ExtraInstancesModeName(), N_static_clones, N_anim_clones);
     }

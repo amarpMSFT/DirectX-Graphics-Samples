@@ -662,6 +662,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     // depend on the current clone count + LOD distribution).
     m_tradVertexPool.Reset();
     m_tradIndexPool.Reset();
+    // Trad-mode phase-2 anim-clones pool + shared scratch.  Re-allocated
+    // by BuildAnimatedClonesTradSetup() if N_animClones > 0 in trad mode.
+    m_animClonesTradBlasPool.Reset();
+    m_animClonesTradBlasScratch.Reset();
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalActualBytes  = 0;
@@ -700,6 +704,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
         if (m_animatedObjectEnabled)
         {
             BuildAnimatedObjectSetup();
+            // Trad-mode phase-2 anim clones: separate per-clone BLAS pool +
+            // per-clone per-frame BuildRaytracingAccelerationStructure
+            // calls.  Sets ac.blasGPUVA so BuildTlasClassic picks them up.
+            BuildAnimatedClonesTradSetup();
             UpdateAnimatedTradPerFrame();
             // Refresh the tri->cid table now that the animated mesh is
             // part of the trad scene -- BuildTraditionalStaticAS already
@@ -3670,8 +3678,78 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedTraditionalAS()
                     obj.tradTriangleCount,
                     (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
                     (unsigned long long)scratchBytes,
-                    (unsigned long long)prebuild.ScratchDataSizeInBytes,
                     (unsigned long long)prebuild.UpdateScratchDataSizeInBytes);
+}
+
+// =====================================================================================
+// Trad-mode phase-2 anim clones: allocate per-clone DXR1 BLAS storage in a
+// single committed UAV pool (sized to N x prebuild.ResultDataMaxSizeInBytes
+// aligned to RTAS alignment) and a shared scratch buffer.  Per-clone GVAs
+// land in m_animatedClones[k].blasGPUVA so BuildTlasClassic picks them up
+// naturally (the TLAS code already prefers ac.blasGPUVA over the source's
+// GVA when non-zero, regardless of mode).
+//
+// The actual per-frame work (N x BuildRaytracingAccelerationStructure) is
+// scheduled by UpdateAnimatedTradPerFrame.
+//
+// Memory budget at the higher [N] tiers: per-clone BLAS = ~2 MB for the
+// source's sphere mesh, so 2000 anim clones at N=10K = ~4 GB.  RTX 4090
+// has 24 GB VRAM and swallows this fine; smaller GPUs would want to back
+// off to N=1K (200 anim clones = ~400 MB).
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesTradSetup()
+{
+    if (m_geometryMode != GeometryMode::Traditional) return;
+    if (m_animatedClones.empty())                    return;
+    if (!m_animatedObjectEnabled)                    return;
+
+    auto device = m_deviceResources->GetD3DDevice();
+    auto& obj   = m_animatedObject;
+    const UINT N = (UINT)m_animatedClones.size();
+
+    // Same geom desc shape as BuildAnimatedTraditionalAS / UpdateAnimatedTradPerFrame
+    // -- we just need the prebuild sizes here (driver doesn't actually
+    // read VB/IB until the per-frame BuildRaytracingAccelerationStructure
+    // call, which will refer to the live perFrameVertexBuffer + obj.tradIndexBuffer).
+    D3D12_RAYTRACING_GEOMETRY_DESC geomDesc = {};
+    geomDesc.Type  = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geomDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+    geomDesc.Triangles.IndexFormat                = DXGI_FORMAT_R32_UINT;
+    geomDesc.Triangles.IndexCount                 = obj.tradTriangleCount * 3;
+    geomDesc.Triangles.IndexBuffer                = obj.tradIndexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexFormat               = DXGI_FORMAT_R32G32B32_FLOAT;
+    geomDesc.Triangles.VertexCount                = obj.totalVertexCount;
+    geomDesc.Triangles.VertexBuffer.StartAddress  = obj.perFrameVertexBuffer->GetGPUVirtualAddress();
+    geomDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(XMFLOAT3);
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+    inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    inputs.NumDescs       = 1;
+    inputs.pGeometryDescs = &geomDesc;
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pb = {};
+    m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &pb);
+
+    constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
+    const UINT64 perBlasBytes = (pb.ResultDataMaxSizeInBytes + kAlign - 1) & ~(kAlign - 1);
+    const UINT64 poolBytes    = perBlasBytes * (UINT64)N;
+    const UINT64 scratchBytes = std::max<UINT64>(pb.ScratchDataSizeInBytes, 256ull);
+
+    AllocateUAVBuffer(device, poolBytes, &m_animClonesTradBlasPool,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"Animated clones trad BLAS pool");
+    AllocateUAVBuffer(device, scratchBytes, &m_animClonesTradBlasScratch,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                      L"Animated clones trad BLAS scratch (shared)");
+
+    const D3D12_GPU_VIRTUAL_ADDRESS poolBaseGVA = m_animClonesTradBlasPool->GetGPUVirtualAddress();
+    for (UINT k = 0; k < N; ++k)
+        m_animatedClones[k].blasGPUVA = poolBaseGVA + (UINT64)k * perBlasBytes;
+
+    SampleLog::LogF(L"[anim-clones trad phase2] N=%u, per-clone BLAS=%llu bytes, pool=%.2f MB\n",
+                    N, (unsigned long long)perBlasBytes,
+                    poolBytes / (1024.0 * 1024.0));
 }
 
 // =====================================================================================
@@ -3765,6 +3843,46 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimesta
 
     m_dxrCommandList->BuildRaytracingAccelerationStructure(&buildDesc, 0, nullptr);
     obj.tradBlasInitialized = true;
+
+    // ------------------------------------------------------------------
+    // 2b) Trad-mode phase-2 anim clones: per-clone BLAS rebuild.  Each
+    //     clone gets its own dest GVA in m_animClonesTradBlasPool (set
+    //     by BuildAnimatedClonesTradSetup); same geom desc shape as the
+    //     source above (same shared perFrameVertexBuffer +
+    //     obj.tradIndexBuffer inputs), so geom desc bytes are identical
+    //     except for dest.  Scratch is SHARED across all N builds and
+    //     serialised by UAV barriers between calls -- DXR1 has no
+    //     batched-build API so this is genuinely N driver calls per
+    //     frame.  At [N]=10K that's 2000 calls (~tens of ms of CPU
+    //     overhead alone, plus the per-build GPU work) -- exactly the
+    //     overhead DXR2's batched ExecuteIndirectRTASOperations API
+    //     beats by ~100x in the cluster path.
+    // ------------------------------------------------------------------
+    if (m_animClonesTradBlasPool && !m_animatedClones.empty())
+    {
+        auto scratchBar = CD3DX12_RESOURCE_BARRIER::UAV(m_animClonesTradBlasScratch.Get());
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS cInputs = {};
+        cInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+        cInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        cInputs.NumDescs       = 1;
+        cInputs.pGeometryDescs = &geomDesc;
+        cInputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC cBuildDesc = {};
+        cBuildDesc.Inputs                          = cInputs;
+        cBuildDesc.ScratchAccelerationStructureData = m_animClonesTradBlasScratch->GetGPUVirtualAddress();
+        for (size_t k = 0; k < m_animatedClones.size(); ++k)
+        {
+            cBuildDesc.DestAccelerationStructureData   = m_animatedClones[k].blasGPUVA;
+            cBuildDesc.SourceAccelerationStructureData = 0;  // always rebuild
+            m_dxrCommandList->BuildRaytracingAccelerationStructure(&cBuildDesc, 0, nullptr);
+            if (k + 1 < m_animatedClones.size())
+                cl->ResourceBarrier(1, &scratchBar);
+        }
+        // Single UAV barrier on the clone pool covers all clone BLAS writes.
+        auto poolBar = CD3DX12_RESOURCE_BARRIER::UAV(m_animClonesTradBlasPool.Get());
+        cl->ResourceBarrier(1, &poolBar);
+    }
+
 
     {
         auto bar = CD3DX12_RESOURCE_BARRIER::UAV(obj.tradBlasStorage.Get());
@@ -5596,7 +5714,8 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_tradVertexPool.Reset();
     m_tradIndexPool.Reset();
     m_animClonesBlasPool.Reset();
-    m_animClonesBlasPool.Reset();
+    m_animClonesTradBlasPool.Reset();
+    m_animClonesTradBlasScratch.Reset();
     m_tlasBuffer.Reset();
     m_tlasScratchBuffer.Reset();
     m_tlasInstanceDescs.Reset();

@@ -1152,26 +1152,19 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     const float kHeightSqrtMul  = 1.40f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
-    // Distance LOD.  Auto-enabled at the higher tiers (1K and 10K) --
-    // user requested "include lower detail as a function of distance
-    // for those" to keep memory + per-frame BVH-traversal cost in
-    // check while still being an interesting stress test.  Below 1K
-    // the overhead isn't worth it; clones get full source detail.
-    //
-    // Implementation: tessellation-based LOD via pre-generated mesh
-    // chains.  See EnsureCloneSourceLodMeshes() for the chain spec
-    // (each level halves both grid dimensions, keeps tile size
-    // constant -> cluster count drops quartically, tris-per-cluster
-    // stays at source value).  The result is a complete-but-lower-
-    // poly mesh (no missing chunks) -- the right way to do LOD on
-    // procedural geometry per user feedback.
-    //
-    // LOD curve: a fixed "full detail zone" at the start (first 25%
-    // of the radial range) keeps the near-camera ring at lodLevel=0
-    // so close-up clones look identical to the source.  Past that
-    // zone, lodLevel ramps linearly through the available chain.
-    const bool  kLodEnabled = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
-                              (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
+    // Distance LOD.  On whenever there are extra clones, NOT just at
+    // 1K/10K.  Earlier the gate was "tiers above 100" -- but the
+    // pooled BLAS allocation (m_clusterBlasPoolBuffer) now sizes
+    // each BLAS slot to its actual cluster count, so without LOD at
+    // N=100 every clone gets a full-tessellation slot.  That made
+    // N=100 cluster mode reserve MORE BLAS memory than N=1K (where
+    // most clones are LOD'd to a handful of clusters each) -- a
+    // confusing non-monotonic-with-N stat the user spotted.  Turning
+    // LOD on at N=100 keeps the inner ring at full detail (the
+    // kLodFullDetailFrac zone still covers the first 25% of the
+    // radial range) and only LOD's the outer 75% of clones, which
+    // restores monotonic memory scaling.
+    const bool  kLodEnabled = (m_extraInstancesMode != ExtraInstancesMode::None);
     const float kLodFullDetailFrac = 0.25f;  // first 25% of radial range = full detail
     // Pre-compute maxRadius matching the spiral formula so we can
     // normalize the radius-to-LOD-bucket lookup.
@@ -6787,8 +6780,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     {
         const UINT N_static_clones = (UINT)(m_objects.size() - m_sourceObjectCount);
         const UINT N_anim_clones   = (UINT)m_animatedClones.size();
-        const bool lodOn = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
-                           (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
+        const bool lodOn = (m_extraInstancesMode != ExtraInstancesMode::None);
         const wchar_t* label = (m_geometryMode == GeometryMode::Clusters)
             ? L"   extra unique BLAS+CLAS: %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s"
             : L"   extra unique BLASes:    %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s";

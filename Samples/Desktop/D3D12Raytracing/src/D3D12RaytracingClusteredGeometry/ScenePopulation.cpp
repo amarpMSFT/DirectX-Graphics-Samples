@@ -407,18 +407,27 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone: shadow TLAS instance.  Inherits the source's
-            // material + per-cluster checker overrides (so the clone looks
-            // visually identical to the central animated ball -- same
-            // chrome+glass checker pattern, same wave deformation).  We
-            // pass sentinel 0xFFFFFFFFu as the material override slot
-            // so the closesthit's per-instance-override path no-ops and
-            // ctx.meta.materialSlot stays at source's slot 7.
+            // Animated clone: shadow TLAS instance.  Push it OUTWARD
+            // along the spiral radial so it sits CLEAR of the static
+            // clones (which tend to overlap densely at the inner spiral
+            // radii).  Also scale up 1.5x so the wave deformation reads
+            // clearly at the increased distance.  Inherits source's
+            // material (sentinel override) so each clone looks like the
+            // central animated ball -- same chrome+glass checker, same
+            // wave -- just at a different position.
+            //
+            // Spiral push: ac.worldPos.x/z is the original Vogel
+            // position; scale outward by 2x and lift y by 1.5 so they
+            // sit ABOVE the static spiral too.
+            const float outwardScale = 2.0f;
             AnimatedCloneInstance ac;
-            ac.worldPos             = spiralPos;
+            ac.worldPos             = DirectX::XMFLOAT3(
+                spiralPos.x * outwardScale,
+                spiralPos.y + 1.5f,           // lift above the static spiral
+                spiralPos.z * outwardScale);
             ac.worldRotEuler        = randRot;
-            ac.worldScale           = randScale;
-            ac.materialOverrideSlot = 0xFFFFFFFFu;  // = no override = inherit source's material
+            ac.worldScale           = randScale * 1.5f;   // 0.9..2.1 effective
+            ac.materialOverrideSlot = 0xFFFFFFFFu;        // = inherit source's material
             m_animatedClones.push_back(ac);
             continue;
         }

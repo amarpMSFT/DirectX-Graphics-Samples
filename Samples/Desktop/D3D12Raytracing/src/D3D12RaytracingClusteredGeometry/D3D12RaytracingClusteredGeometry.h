@@ -199,7 +199,7 @@ private:
     // renders them cleanly) but hits a current NVIDIA driver bug; see the
     // banner in BuildScene() in the .cpp.
     enum class VertexMode { Compressed1, Float32_3 };
-    VertexMode                           m_vertexMode = VertexMode::Float32_3;
+    VertexMode                           m_vertexMode = VertexMode::Compressed1;  // bug-repro default; pass --vertex-format float for the working baseline
 
     // ---------- CLAS memory-allocation strategy (selectable via --clas-alloc) ----------
     // Implicit  - one IMPLICIT_DESTINATIONS build into a worst-case-sized buffer.

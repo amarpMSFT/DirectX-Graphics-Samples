@@ -491,136 +491,24 @@ void D3D12RaytracingClusteredGeometry::EncodeCompressedClusters()
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::BuildAccelerationStructures()
 {
-    auto device           = m_deviceResources->GetD3DDevice();
     auto commandList      = m_deviceResources->GetCommandList();
     auto commandAllocator = m_deviceResources->GetCommandAllocator();
-    auto commandQueue     = m_deviceResources->GetCommandQueue();
-
-    // ---- Create the build-timestamp query heap + readback buffer. We straddle
-    // each ExecuteIndirectRTASOperations / classic TLAS build with two EndQuery
-    // calls so we can report per-operation wall-clock times to the title bar. ----
-    {
-        D3D12_QUERY_HEAP_DESC qhd = {};
-        qhd.Type     = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qhd.Count    = kBuildTimestampCount;
-        qhd.NodeMask = 0;
-        ThrowIfFailed(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&m_buildQueryHeap)));
-        m_buildQueryHeap->SetName(L"AS build timestamp query heap");
-
-        auto rbHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-        auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(UINT64) * kBuildTimestampCount);
-        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE,
-            &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_buildQueryReadback)));
-        m_buildQueryReadback->SetName(L"AS build timestamp readback");
-
-        ThrowIfFailed(commandQueue->GetTimestampFrequency(&m_timestampFrequency));
-        SampleLog::LogF(L"[stats] timestamp frequency: %llu ticks/sec\n",
-                        (unsigned long long)m_timestampFrequency);
-    }
-
-    // Per-frame timestamp heap + readback. 3 ring slots * 6 timestamps each.
-    // Per-frame writes to one slot, resolves to its matching range in the
-    // readback buffer; CPU reads from the slot ~3 frames behind the write
-    // (safe past GPU completion).
-    {
-        D3D12_QUERY_HEAP_DESC qhd = {};
-        qhd.Type  = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qhd.Count = kPerFrameTsPerSlot * kPerFrameRingSlots;
-        ThrowIfFailed(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&m_pfQueryHeap)));
-        m_pfQueryHeap->SetName(L"AS per-frame timestamp heap");
-
-        auto rbHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-        auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(
-            sizeof(UINT64) * kPerFrameTsPerSlot * kPerFrameRingSlots);
-        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE,
-            &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_pfQueryReadback)));
-        m_pfQueryReadback->SetName(L"AS per-frame timestamp readback");
-    }
 
     ThrowIfFailed(commandAllocator->Reset());
     ThrowIfFailed(commandList->Reset(commandAllocator, nullptr));
 
-    if (m_geometryMode == GeometryMode::Clusters)
-    {
-        UploadClusterInputs();
-
-        // Stamp slot 0 (before CLAS build).
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        BuildClasIndirect();
-        // Stamp slot 1 (after CLAS UAV barrier).
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-
-        // Stamp slot 2 (before BLAS build).
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
-        BuildBlasFromClasIndirect();
-        // Stamp slot 3 (after BLAS UAV barrier).
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
-
-        // Animated object: build cluster templates once, then do a first
-        // per-frame instantiate+BLAS so the TLAS instance points at valid BVH
-        // contents from frame 0. (Subsequent frames re-run UpdateAnimatedObjectPerFrame
-        // from DoRender.) NOTE: BuildAnimatedObjectSetup itself flushes the cmd
-        // list partway through (CPU readback of the template GVA array), so it
-        // must run BEFORE the per-build EndQuery pair below or the resolve at
-        // bottom would resolve mid-flushed timestamps.
-        if (m_animatedObjectEnabled)
-        {
-}
-    }
-    else
-    {
-        // Traditional (DXR1) per-object BLAS path.  Slots 0/1 (CLAS) are
-        // stamped with a no-op pair so the ResolveQueryData below has a
-        // complete range to resolve; overlay shows them as 0 build time
-        // (the truth -- trad mode has no CLAS).  Slot 2/3 bracket the
-        // traditional BLAS build for the wall-clock readout.
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-        commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
-commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
-        // Traditional path's animated ball: build the mesh + per-frame VB +
-        // restPos + flat IB + BLAS storage.  Subsequent frames just rebuild/
-        // refit tradBlasStorage in UpdateAnimatedTradPerFrame -- this init
-        // pass also kicks one rebuild so the BLAS contents are valid before
-        // the TLAS build below references it.
-        if (m_animatedObjectEnabled)
-        {
-}
-    }
-
-    // Stamp slot 4 (before TLAS build).
-    commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4);
+    UploadClusterInputs();
+    BuildClasIndirect();
+    BuildBlasFromClasIndirect();
     BuildTlasClassic();
-    // Stamp slot 5 (after TLAS UAV barrier).
-    commandList->EndQuery(m_buildQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5);
-
-    // Resolve into the readback buffer. NumQueries=6 because we only wrote slots 0..5
-    // (the heap has spare capacity for future per-frame timestamps).
-    commandList->ResolveQueryData(m_buildQueryHeap.Get(),
-        D3D12_QUERY_TYPE_TIMESTAMP, 0, 6,
-        m_buildQueryReadback.Get(), 0);
 
     m_deviceResources->ExecuteCommandList();
     m_deviceResources->WaitForGpu();
 }
 
-// ---------------------------------------------------------------------------------
-// Hook for Win32Application::Run -- decide between SW_NORMAL and SW_MAXIMIZE
-// on the initial ShowWindow.  Two opt-outs:
-//   1. Software adapter (WARP / Basic Render) -- maximizing on a CPU
-//      rasterizer turns each frame into a seconds-long affair; the window
-//      stays at the launched 1280x720 so the app is at least interactive.
-//   2. Headless run (any of --screenshot-at, --screenshot-frame,
-//      --exit-after-frames is set) -- the back-buffer size is significant
-//      because captured screenshots use it; maximizing would silently
-//      change the screenshot resolution from 1280x720 to the user's
-//      desktop res, breaking any reference-image diff.
-// Otherwise (interactive HW run) -- maximize, since the 4K canvas is
-// where the cluster geometry actually showcases.
-// ---------------------------------------------------------------------------------
+// Skip maximising on software adapters (per-frame cost is multi-second on WARP).
 bool D3D12RaytracingClusteredGeometry::ShouldMaximizeWindowOnLaunch() const
 {
-    // Don't auto-maximise on software adapters (per-frame cost is multi-second on WARP).
     const wchar_t* desc = m_deviceResources->GetAdapterDescription();
     return !(wcsstr(desc, L"WARP") || wcsstr(desc, L"Basic Render"));
 }

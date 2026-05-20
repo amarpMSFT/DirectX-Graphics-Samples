@@ -6616,12 +6616,23 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     // Workload-scaling [N] toggle.  Always shown so the user knows the
     // hotkey exists even when N=0.  Reports the count + breakdown
-    // (static clones + animated clones share-source-BLAS) + LOD state
-    // (auto-on at 1K/10K to keep memory + traversal cost in check by
-    // dropping both cluster-count and tris-per-cluster with distance).
+    // (static clones + animated clones share-source-BLAS) + LOD state.
+    //
+    // Mode-aware label so it's clear these are NOT cheap TLAS-instance
+    // copies of a shared BLAS -- each STATIC clone gets its own full
+    // CLAS array + BLAS (in cluster mode) or its own DXR1 BLAS (in
+    // trad mode), so the toggle progressively stresses the
+    // CLAS+BLAS+templates paths rather than just the TLAS row count.
+    // ANIMATED clones currently SHARE the source's per-frame BLAS
+    // (phase 1) -- the breakdown count flags them separately so the
+    // reader can mentally subtract them when reasoning about the
+    // unique-BLAS budget.
     if (m_extraInstancesMode == ExtraInstancesMode::None)
     {
-        swprintf_s(kbuf, L"   extra instances:  %s", ExtraInstancesModeName());
+        const wchar_t* label = (m_geometryMode == GeometryMode::Clusters)
+            ? L"   extra unique BLAS+CLAS: %s"
+            : L"   extra unique BLASes:    %s";
+        swprintf_s(kbuf, label, ExtraInstancesModeName());
     }
     else
     {
@@ -6629,7 +6640,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const UINT N_anim_clones   = (UINT)m_animatedClones.size();
         const bool lodOn = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
                            (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
-        swprintf_s(kbuf, L"   extra instances:  %s   (%u static + %u animated)   distance-LOD: %s",
+        const wchar_t* label = (m_geometryMode == GeometryMode::Clusters)
+            ? L"   extra unique BLAS+CLAS: %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s"
+            : L"   extra unique BLASes:    %s   (%u static + %u animated [shared BLAS])   distance-LOD: %s";
+        swprintf_s(kbuf, label,
                    ExtraInstancesModeName(), N_static_clones, N_anim_clones,
                    lodOn ? L"on" : L"off");
     }

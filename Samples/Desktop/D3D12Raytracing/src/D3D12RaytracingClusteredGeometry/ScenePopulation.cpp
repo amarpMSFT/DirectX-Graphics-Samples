@@ -407,45 +407,27 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone placement -- UNMISSABLE EDITION.
+            // Animated clone placement.
             //
-            // Earlier attempts placed anim clones at the spiral position
-            // (or 2x-spread variants of it) and the user couldn't see
-            // them: at radii 4..22 they overlapped each other AND the
-            // dense static-clone spiral, blurring into one big
-            // checker-glass blob you can't visually parse.
+            // Per user feedback: place them at the SAME spiral position
+            // they'd occupy naturally (so they live mixed in with the
+            // static clones at familiar radii / heights), just BUMPED
+            // SLIGHTLY UP by +1.5 in y so they sit just above the
+            // static neighbours instead of getting buried inside them.
+            // Also scale 1.3x larger so the wave deformation reads
+            // more clearly at typical viewing distance.
             //
-            // New scheme: anim clones get their OWN deterministic ring
-            // entirely outside the static spiral.  Index k = the k'th
-            // anim clone created so far = m_animatedClones.size().
-            //
-            //   ring radius = 18.0  (well outside even N=10K static
-            //                        spiral which still has its inner
-            //                        bulk at r<15)
-            //   ring height = +2.0  (sits well above the floor, clear
-            //                        of static spiral height curve)
-            //   angle per   = 360 / max(1,N_anim) so they're spread
-            //                 evenly around the ring once N is fixed.
-            //   scale       = 1.8  (clearly bigger than static clones)
-            //
-            // Because N_anim isn't known until the loop finishes, just
-            // use a fixed angular step of 18 degrees -- guarantees first
-            // 20 anim clones are spaced 18deg apart (full ring); after
-            // 20 they wrap and overlap on later passes, but at N=10K
-            // we have 2K anim clones and the user only cares about
-            // SEEING SOMEWHERE that anim clones exist, not packing.
-            const float kAnimRingRadius = 18.0f;
-            const float kAnimRingY      = 2.0f;
-            const float kAnimRingAngStepDeg = 18.0f;
-            const UINT  kIdx = (UINT)m_animatedClones.size();
-            const float ang  = kIdx * (kAnimRingAngStepDeg * 3.14159265f / 180.0f);
+            // Material: sentinel override -> each clone inherits the
+            // source's checker glass+chrome material so the wave is
+            // immediately recognisable as "same as the central animated
+            // ball, but elsewhere".
             AnimatedCloneInstance ac;
             ac.worldPos             = DirectX::XMFLOAT3(
-                kAnimRingRadius * cosf(ang),
-                kAnimRingY,
-                kAnimRingRadius * sinf(ang));
-            ac.worldRotEuler        = DirectX::XMFLOAT3(0.f, 0.f, 0.f);  // upright
-            ac.worldScale           = 1.8f;
+                spiralPos.x,
+                spiralPos.y + 1.5f,
+                spiralPos.z);
+            ac.worldRotEuler        = randRot;
+            ac.worldScale           = randScale * 1.3f;
             ac.materialOverrideSlot = 0xFFFFFFFFu;
             m_animatedClones.push_back(ac);
             continue;

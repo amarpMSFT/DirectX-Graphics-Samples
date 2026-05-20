@@ -41,7 +41,7 @@
   <!-- Compile-time: pick up experimental d3d12.h before the Windows SDK one. -->
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(DxrExperimentalInstallDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DxrExperimentalInstallDir)\include;$(DxrExperimentalRoot)\packages\OSS\dxcbin_preview\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>DXR_EXPERIMENTAL_BUILD=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>

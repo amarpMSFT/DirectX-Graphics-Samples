@@ -10,10 +10,276 @@
 //*********************************************************
 
 #include "stdafx.h"
-#include "D3D12RaytracingClusteredGeometry.h"
+#include "DXSample.h"
+#include "StepTimer.h"
+#include "ProceduralGeometry.h"
+#include "Compressed1.h"
+#include <DirectXMath.h>
+#include <vector>
+
+namespace GlobalRootSig {
+    enum {
+        OutputUAVSlot = 0,
+        AccelerationStructureSlot,
+        SceneCBVSlot,
+        Count
+    };
+}
+
+// Shared CPU/HLSL layout for the per-frame scene CB.  Matches the HLSL
+// struct embedded in kRaytracingHLSL below (just the camera basis +
+// aspect/FOV; the minimal shader doesn't need anything else).
+struct SceneConstantBuffer
+{
+    DirectX::XMMATRIX viewToWorld;
+    DirectX::XMFLOAT4 cameraPosition;
+    DirectX::XMFLOAT4 miscParams;     // .x = aspect ratio, .y = tan(fov/2)
+};
+
+
+// One object in the scene.  Each object becomes one BLAS in the TLAS.
+struct ClusterObject
+{
+    ProceduralGeometry::Mesh                            mesh;
+    // Per-cluster compressed-vertex payload.  Populated unconditionally at
+    // scene-build time so the runtime --vertex-format toggle can flip
+    // between FLOAT32_3 and COMPRESSED1 without re-running BuildScene.
+    // The FLOAT32_3 path reads `mesh.clusters[i].positions` directly.
+    std::vector<Compressed1::EncodedCluster>            encoded;
+
+    UINT                                                globalClusterStart = 0;
+    UINT                                                clusterCount       = 0;
+
+    // EXPLICIT_DESTINATIONS BLAS storage + GVA, set by BuildBlasFromClasIndirect.
+    Microsoft::WRL::ComPtr<ID3D12Resource>              blasStorage;
+    D3D12_GPU_VIRTUAL_ADDRESS                           blasGPUVA = 0;
+
+    DirectX::XMFLOAT3                                   worldPos      = { 0, 0, 0 };
+    float                                               worldScale    = 1.0f;
+    DirectX::XMFLOAT3                                   worldRotEuler = { 0, 0, 0 };
+    UINT                                                instanceID    = 0;
+};
+
+class D3D12RaytracingClusteredGeometry : public DXSample
+{
+public:
+    D3D12RaytracingClusteredGeometry(UINT width, UINT height, std::wstring name);
+
+    // IDeviceNotify
+    virtual void OnDeviceLost() override;
+    virtual void OnDeviceRestored() override;
+
+    // DXSample messages.
+    virtual void OnInit() override;
+    virtual bool ShouldMaximizeWindowOnLaunch() const override;
+    virtual void OnUpdate() override;
+    virtual void OnRender() override;
+    virtual void OnSizeChanged(UINT width, UINT height, bool minimized) override;
+    virtual void OnDestroy() override;
+    virtual void OnKeyDown(UINT8 key) override;
+    virtual IDXGISwapChain* GetSwapchain() override { return m_deviceResources->GetSwapChain(); }
+    virtual void ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc) override;
+
+private:
+    static const UINT FrameCount = 3;
+
+    // ---- DXR1 + DXR2 device / cmdlist interfaces ----
+    ComPtr<ID3D12Device5>                m_dxrDevice;
+    ComPtr<ID3D12GraphicsCommandList4>   m_dxrCommandList;
+    ComPtr<ID3D12DeviceRaytracing2>      m_dxr2Device;
+    ComPtr<ID3D12CommandListRaytracing2> m_dxr2CommandList;
+    bool                                 m_clustersAndPtlasSupported = false;
+
+    // ---- Vertex format toggle (--vertex-format float|compressed) ----
+    enum class VertexMode { Float32_3, Compressed1 };
+    VertexMode                           m_vertexMode = VertexMode::Compressed1;  // bug-repro default
+    UINT                                 m_compressedBitsPerComponent = 12;       // COMPRESSED1 quantizer precision
+    UINT                                 m_positionTruncateBits       = 0;        // FLOAT32_3 mantissa-truncate floor
+
+    // ---- Scene ----
+    std::vector<ClusterObject>           m_objects;
+    UINT                                 m_totalClusterCount  = 0;
+    UINT                                 m_totalTriangleCount = 0;
+
+    // ---- CLAS+BLAS (all clusters batched into one BUILD_CLAS_FROM_TRIANGLES,
+    //                 followed by one BUILD_BLAS_FROM_CLAS per object) ----
+    ComPtr<ID3D12Resource>               m_clusterInputBuffer;     // concatenated per-cluster vert+idx
+    ComPtr<ID3D12Resource>               m_clasArgsBuffer;         // BUILD_CLAS_FROM_TRIANGLES_ARGS[N], CPU-filled
+    D3D12_GPU_VIRTUAL_ADDRESS            m_clasArgsArrayGPUVA = 0;
+    UINT                                 m_clasArgsStride     = 0;
+    ComPtr<ID3D12Resource>               m_clasResultBuffer;       // worst-case CLAS storage (implicit alloc)
+    ComPtr<ID3D12Resource>               m_clasScratchBuffer;
+    ComPtr<ID3D12Resource>               m_clasAddressArray;       // per-cluster CLAS GVA, filled by the build
+
+    ComPtr<ID3D12Resource>               m_blasArgsBuffer;         // BUILD_BLAS_FROM_CLAS_ARGS[N_obj], CPU-filled
+    ComPtr<ID3D12Resource>               m_blasResultAddrBuffer;   // per-object dest addresses (EXPLICIT_DESTINATIONS)
+    ComPtr<ID3D12Resource>               m_blasScratchBuffer;
+
+    // ---- TLAS ----
+    ComPtr<ID3D12Resource>               m_tlasBuffer;
+    ComPtr<ID3D12Resource>               m_tlasScratchBuffer;
+    ComPtr<ID3D12Resource>               m_tlasInstanceDescs;
+
+    // ---- DXR pipeline + shader tables ----
+    ComPtr<ID3D12StateObject>            m_dxrStateObject;
+    ComPtr<ID3D12RootSignature>          m_globalRootSignature;
+    ComPtr<ID3D12RootSignature>          m_localRootSignature;     // empty (no per-shader records)
+    ComPtr<ID3D12Resource>               m_rayGenShaderTable;
+    ComPtr<ID3D12Resource>               m_missShaderTable;
+    ComPtr<ID3D12Resource>               m_hitGroupShaderTable;
+    static const wchar_t* c_raygenName;
+    static const wchar_t* c_opaqueClosestHitName;
+    static const wchar_t* c_missName;
+    static const wchar_t* c_opaqueHitGroupName;
+
+    // ---- DXR output texture + descriptor heap (1 UAV) ----
+    ComPtr<ID3D12DescriptorHeap>         m_descriptorHeap;
+    UINT                                 m_descriptorSize       = 0;
+    UINT                                 m_descriptorsAllocated = 0;
+    ComPtr<ID3D12Resource>               m_raytracingOutput;
+    D3D12_GPU_DESCRIPTOR_HANDLE          m_raytracingOutputUAV  = {};
+
+    // ---- Scene CB (camera basis, aspect, fov) ----
+    ComPtr<ID3D12Resource>               m_sceneCB;
+    SceneConstantBuffer*                 m_sceneCBMapped = nullptr;
+
+    // ---- Animation clock (drives the orbit camera) ----
+    StepTimer                            m_timer;
+    double                               m_animSeconds  = 0.0;
+    UINT                                 m_framesRendered = 0;
+
+    // ---- Setup / per-frame ----
+    void CreateDeviceDependentResources();
+    void QueryDXR2Support();
+    void BuildScene();
+    void EncodeCompressedClusters();
+    void BuildAccelerationStructures();
+    void UploadClusterInputs();
+    void BuildClasIndirect();
+    void BuildClasImplicit();
+    void BuildBlasFromClasIndirect();
+    void BuildTlasClassic();
+    void CreateRaytracingPipelineAndShaderTables();
+    void CreateDescriptorHeapAndRaytracingOutput();
+    void UpdateSceneConstantBuffer();
+    void DoRender();
+    UINT AllocateDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu);
+};
+
 #include "DirectXRaytracingHelper.h"
-#include "CompiledShaders\\Raytracing.hlsl.h"
-#include "CompiledShaders\\FillClusterTemplateArgs.hlsl.h"
+#include <dxcapi.h>
+
+// Raytracing shader source -- compiled at runtime via dxcompiler.dll.
+// One primary ray per pixel; hit returns a per-(cluster, primitive,
+// instance) hash colour so each surviving triangle is visibly distinct;
+// miss returns sky blue.  No any-hit / shadow / reflection / refraction
+// shaders -- the bug demo only needs BVH traversal of the CLAS+BLAS
+// chain to fail, not the optical effects of the original sample.
+static const char kRaytracingHLSL[] = R"HLSL(
+struct SceneConstantBuffer
+{
+    float4x4 viewToWorld;
+    float4   cameraPosition;
+    float4   miscParams;       // .x = aspect ratio, .y = tan(fov/2)
+};
+
+RaytracingAccelerationStructure       Scene    : register(t0);
+RWTexture2D<float4>                   Output   : register(u0);
+ConstantBuffer<SceneConstantBuffer>   g_scene  : register(b0);
+
+struct [raypayload] Payload {
+    float4 color : write(caller, closesthit, miss) : read(caller);
+};
+typedef BuiltInTriangleIntersectionAttributes Attribs;
+
+[shader("raygeneration")]
+void RayGen()
+{
+    const uint2  px      = DispatchRaysIndex().xy;
+    const uint2  dim     = DispatchRaysDimensions().xy;
+    const float2 ndc     = (float2(px) + 0.5) / float2(dim) * 2.0 - 1.0;
+    const float2 view2d  = float2(ndc.x, -ndc.y);
+    const float  aspect      = g_scene.miscParams.x;
+    const float  tanHalfFov  = g_scene.miscParams.y;
+    const float3 dirView     = normalize(float3(view2d.x * aspect * tanHalfFov,
+                                                view2d.y * tanHalfFov,
+                                                1.0));
+    const float3 dirWorld    = mul((float3x3)g_scene.viewToWorld, dirView);
+
+    RayDesc r;
+    r.Origin    = g_scene.cameraPosition.xyz;
+    r.Direction = normalize(dirWorld);
+    r.TMin      = 0.001;
+    r.TMax      = 1000.0;
+
+    Payload p; p.color = float4(0, 0, 0, 1);
+
+    TraceRay(Scene,
+        RAY_FLAG_CULL_BACK_FACING_TRIANGLES,
+        /*InstanceInclusionMask*/0xff,
+        /*RayContributionToHitGroupIndex*/0,
+        /*MultiplierForGeometryContributionToHitGroupIndex*/0,
+        /*MissShaderIndex*/0,
+        r, p);
+    Output[px] = p.color;
+}
+
+[shader("miss")]
+void Miss(inout Payload p) { p.color = float4(0.40, 0.60, 0.90, 1); }
+
+[shader("closesthit")]
+void OpaqueHit(inout Payload p, in Attribs a)
+{
+    const uint cid  = ClusterID();
+    const uint pid  = PrimitiveIndex();
+    const uint inst = InstanceIndex();
+    const uint h    = (cid * 2654435761u) ^ (pid * 374761393u) ^ (inst * 668265263u);
+    p.color = float4(((h >>  0) & 0xFF) / 255.0,
+                     ((h >>  8) & 0xFF) / 255.0,
+                     ((h >> 16) & 0xFF) / 255.0,
+                     1.0);
+}
+)HLSL";
+
+// Compile the embedded HLSL source via the runtime dxcompiler.dll (dynamically
+// loaded so we don't need a compile-time link dep on dxcompiler.lib).  Caller
+// owns the returned blob and must keep it alive past CreateStateObject.
+static Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const char* src, size_t srcLen)
+{
+    using Microsoft::WRL::ComPtr;
+    HMODULE dxc = LoadLibraryW(L"dxcompiler.dll");
+    ThrowIfFalse(dxc != nullptr, L"dxcompiler.dll not found alongside the exe\n");
+    using DxcCreateInstance_fn = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID*);
+    auto pCreate = (DxcCreateInstance_fn)GetProcAddress(dxc, "DxcCreateInstance");
+
+    ComPtr<IDxcCompiler3> compiler;
+    ComPtr<IDxcUtils>     utils;
+    pCreate(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
+    pCreate(CLSID_DxcUtils,    IID_PPV_ARGS(&utils));
+
+    DxcBuffer buf{ src, srcLen, DXC_CP_UTF8 };
+    LPCWSTR args[] = { L"-T", L"lib_6_10", L"-HV", L"2021" };
+    ComPtr<IDxcResult> result;
+    ThrowIfFailed(compiler->Compile(&buf, args, _countof(args), nullptr, IID_PPV_ARGS(&result)),
+                  L"IDxcCompiler3::Compile failed\n");
+    HRESULT hr = E_FAIL;
+    result->GetStatus(&hr);
+    if (FAILED(hr))
+    {
+        ComPtr<IDxcBlobUtf8> errors;
+        result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        std::wstring msg = L"Shader compile failed:\n";
+        if (errors && errors->GetStringLength())
+        {
+            const char* p = errors->GetStringPointer();
+            for (size_t i = 0; i < errors->GetStringLength(); ++i) msg.push_back((wchar_t)(unsigned char)p[i]);
+        }
+        ThrowIfFailed(hr, msg.c_str());
+    }
+    ComPtr<IDxcBlob> dxil;
+    result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&dxil), nullptr);
+    return dxil;
+}
 
 #include <DirectXMath.h>
 #include <algorithm>
@@ -582,7 +848,8 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     pipeline.CreateSubobject<CD3DX12_LOCAL_ROOT_SIGNATURE_SUBOBJECT>()->SetRootSignature(m_localRootSignature.Get());
 
     auto lib = pipeline.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
-    D3D12_SHADER_BYTECODE libdxil = CD3DX12_SHADER_BYTECODE((void*)g_pRaytracing, ARRAYSIZE(g_pRaytracing));
+    ComPtr<IDxcBlob> shaderBlob = CompileShader(kRaytracingHLSL, sizeof(kRaytracingHLSL) - 1);
+    D3D12_SHADER_BYTECODE libdxil = { shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize() };
     lib->SetDXILLibrary(&libdxil);
     lib->DefineExport(c_raygenName);
     lib->DefineExport(c_opaqueClosestHitName);
@@ -594,7 +861,7 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     opaqueHG->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
     auto shaderConfig = pipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-    shaderConfig->Config(/*payload*/ 4 * sizeof(float) + 2 * sizeof(uint),
+    shaderConfig->Config(/*payload*/ 4 * sizeof(float),
                          /*attribs*/ 2 * sizeof(float));
     pipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>()->SetRootSignature(m_globalRootSignature.Get());
 
@@ -875,3 +1142,32 @@ void D3D12RaytracingClusteredGeometry::OnDeviceRestored()
 // OnKeyDown is a virtual override from DXSample base.  Headless repro
 // has no interactive keys, so this is just a no-op stub.
 void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8) {}
+
+// =====================================================================
+// Entry point
+// =====================================================================
+#include "stdafx.h"
+
+// Agility SDK loader hooks. The system d3d12.dll uses these exports to find the
+// matching D3D12Core.dll at runtime. The DLL is copied into bin\<cfg>\D3D12\
+// by ExperimentalD3D12.props.
+//
+// The new experimental D3D12Core (post-17:37 build, fixing the NVIDIA caps
+// regression) loads via the release-SDK loader path, not the preview one --
+// so we export 721 directly rather than D3D12_PREVIEW_SDK_VERSION (which
+// today happens to be the same number but routes through the preview-only
+// loader paths). When a real Agility SDK NuGet package shipping DXR2 ships,
+// swap this back to D3D12_SDK_VERSION.
+extern "C" { __declspec(dllexport) extern const UINT  D3D12SDKVersion = 721; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath    = ".\\D3D12\\"; }
+
+_Use_decl_annotations_
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
+{
+    SampleLog::Init();
+    SampleLog::LogF(L"=== D3D12RaytracingClusteredGeometry starting (sdk=%u, preview=%u) ===\n",
+                    (unsigned)D3D12_SDK_VERSION, (unsigned)D3D12_PREVIEW_SDK_VERSION);
+
+    D3D12RaytracingClusteredGeometry sample(1280, 720, L"D3D12 Raytracing - Clustered Geometry");
+    return Win32Application::Run(&sample, hInstance, nCmdShow);
+}

@@ -571,6 +571,18 @@ private:
     // the BLAS-args CS.  12 bytes/object, upload heap, built once at init.
     ComPtr<ID3D12Resource>               m_blasArgsMeta;
     ComPtr<ID3D12Resource>               m_blasResultAddrBuffer;   // N_objects x GVA (explicit dests)
+    // Pool buffer holding ALL static-object BLAS storage in one
+    // contiguous allocation.  Each ClusterObject::blasGPUVA points
+    // somewhere inside this buffer (poolBase + per-object offset);
+    // ClusterObject::blasStorage stays null since the per-object
+    // ComPtr would be redundant.  Eliminates the per-clone
+    // CreateCommittedResource overhead that made N=10K cluster mode
+    // hang on driver-side allocation churn -- with the pool the cost
+    // is a single CreateCommittedResource regardless of clone count.
+    // EXPLICIT_DESTINATIONS BLAS-from-CLAS mode takes per-arg
+    // destination GPU VAs so the indirect build naturally writes
+    // each BLAS into its slice of the pool.
+    ComPtr<ID3D12Resource>               m_clusterBlasPoolBuffer;
 
     ComPtr<ID3D12Resource>               m_tlasBuffer;
     ComPtr<ID3D12Resource>               m_tlasScratchBuffer;

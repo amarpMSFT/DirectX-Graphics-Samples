@@ -1136,13 +1136,20 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     float kRadialSpacing = 0.5f;
     if      (m_extraInstancesMode == ExtraInstancesMode::Thousand)    kRadialSpacing = 0.7f;
     else if (m_extraInstancesMode == ExtraInstancesMode::TenThousand) kRadialSpacing = 1.0f;
-    // Height curve is sqrt-based so clones in the dense mid-radius
-    // band get most of the rise (helping visibility) while extreme-
-    // outer clones don't go absurdly high.  At N=10K the maxRadius
-    // is ~104 so the outermost clones land at floorY + sqrt(100)*1.2
-    // ~= +11 units, while the median clone lands ~+5-6.
-    const float kHeightSqrtMul  = 1.20f;
-    const float kFloorY         = -0.7f;              // floor world-y
+    // Height curve.  The inner ring starts BELOW the floor (sunken
+    // about 1 unit underground) and ramps up sqrt-wise with radius,
+    // so the spiral feels like it RISES OUT of depth.  The multiplier
+    // is tuned so the outermost clone at N=1K lands around y=+5 (same
+    // as the previous floor-anchored curve), while higher tiers get
+    // proportionally more rise:
+    //     N=1K:  outer ~= 4.89  (was 4.95, kept the same target)
+    //     N=10K: outer ~= 12.3  (was 11.3)
+    // The lower inner-ring start helps keep the spiral's foreground
+    // clones from cluttering the camera's eye-level original-scene
+    // shot, AND the steeper ramp means more of the inner-band rise
+    // happens before the outer-band slope flattens out.
+    const float kInnerY         = -1.70f;
+    const float kHeightSqrtMul  = 1.40f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
 
     // Distance LOD.  Auto-enabled at the higher tiers (1K and 10K) --
@@ -1187,12 +1194,12 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         const UINT cycleSlot = i % srcPoolSize;
 
         // Spiral placement: shared between static + anim clones.
-        // Height curve is sqrt-based so the dense mid-radius band gets
-        // most of the rise (helping visibility) while extreme-outer
-        // clones don't go absurdly high.  See kHeightSqrtMul comment.
+        // Height curve is sqrt-based with a sunken inner-ring start
+        // (kInnerY) so the spiral feels like it rises out of depth;
+        // see kHeightSqrtMul comment for the tuning rationale.
         const float angle    = (float)i * kGoldenAngleRad;
         const float radius   = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
-        const float heightY  = kFloorY + sqrtf(std::max(0.0f, radius - kInnerRadius)) * kHeightSqrtMul;
+        const float heightY  = kInnerY + sqrtf(std::max(0.0f, radius - kInnerRadius)) * kHeightSqrtMul;
         const DirectX::XMFLOAT3 spiralPos = {
             radius * cosf(angle),
             heightY,
@@ -1406,6 +1413,11 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
     m_blasArgsBuffer.Reset();
     m_blasArgsMeta.Reset();
     m_blasResultAddrBuffer.Reset();
+    // Pool buffer holding all clones' BLAS storage -- released so
+    // the next BuildBlasFromClasIndirect call gets a fresh
+    // appropriately-sized allocation for the new clone count + LOD
+    // distribution.
+    m_clusterBlasPoolBuffer.Reset();
     m_traditionalStaticTotalResultBytes  = 0;
     m_traditionalStaticTotalActualBytes  = 0;
     m_traditionalStaticTotalScratchBytes = 0;
@@ -2616,13 +2628,64 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
                     (unsigned long long)prebuild.ResultDataMaxSizeInBytes,
                     (unsigned long long)prebuild.ScratchDataSizeInBytes);
 
-    // One BLAS storage buffer per object (each at its own GPU VA).
-    for (auto& obj : m_objects)
+    // ONE pool buffer holding every object's BLAS storage.  Per-object
+    // BLAS sizes vary (LOD'd clones have far fewer clusters than full-
+    // detail sources) so we re-prebuild PER UNIQUE cluster count via a
+    // memoized helper -- typically only a handful of distinct cluster
+    // counts across the whole scene (one per source + one per LOD
+    // tier per cloneable source).  Per-object offset is the running
+    // sum of aligned per-object sizes.
+    //
+    // EXPLICIT_DESTINATIONS BLAS-from-CLAS mode lets each per-arg
+    // BUILD_BLAS_FROM_CLAS_ARGS specify its own DestAddress GPU VA --
+    // so the driver writes each BLAS directly into its slice of the
+    // pool with no per-clone CreateCommittedResource roundtrip.  This
+    // collapses 10K driver allocation calls (which made cluster N=10K
+    // hang) into one.
+    std::unordered_map<UINT, UINT64> blasSizeByClusterCount;
+    auto getBlasSizeForClusters = [&](UINT clusterCount) -> UINT64 {
+        if (auto it = blasSizeByClusterCount.find(clusterCount); it != blasSizeByClusterCount.end())
+            return it->second;
+        D3D12_RTAS_CLAS_INPUTS_DESC d = {};
+        d.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+        d.MaxArgCount        = 1;
+        d.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+        d.MaxTotalClasCount  = clusterCount;
+        d.MaxClasCountPerArg = clusterCount;
+        D3D12_RTAS_OPERATION_INPUTS oi = {};
+        oi.Type      = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
+        oi.pClasDesc = &d;
+        D3D12_RTAS_OPERATION_PREBUILD_INFO pb = {};
+        m_dxr2Device->GetRTASOperationPrebuildInfo(&oi, &pb);
+        blasSizeByClusterCount[clusterCount] = pb.ResultDataMaxSizeInBytes;
+        return pb.ResultDataMaxSizeInBytes;
+    };
+
+    constexpr UINT64 kBlasAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
+    std::vector<UINT64> perObjOffset(N_obj);
+    UINT64 poolBytes = 0;
+    for (UINT i = 0; i < N_obj; ++i)
     {
-        AllocateUAVBuffer(device, prebuild.ResultDataMaxSizeInBytes, &obj.blasStorage,
-                          D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                          L"Cluster BLAS storage");
-        obj.blasGPUVA = obj.blasStorage->GetGPUVirtualAddress();
+        const auto& obj = m_objects[i];
+        const UINT64 sz = getBlasSizeForClusters(obj.clusterCount);
+        const UINT64 aligned = (sz + (kBlasAlign - 1)) & ~(kBlasAlign - 1);
+        perObjOffset[i] = poolBytes;
+        poolBytes += aligned;
+    }
+    SampleLog::LogF(L"[BLAS pool] %u objects, %zu unique cluster-counts, %.2f MB total (%.2f MB if per-obj worst-case)\n",
+                    N_obj, blasSizeByClusterCount.size(),
+                    poolBytes / (1024.0 * 1024.0),
+                    (UINT64)N_obj * prebuild.ResultDataMaxSizeInBytes / (1024.0 * 1024.0));
+
+    // Allocate the pool in ONE shot (drops 10K driver calls to 1).
+    AllocateUAVBuffer(device, poolBytes, &m_clusterBlasPoolBuffer,
+                      D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                      L"Cluster BLAS pool (all objects)");
+    const D3D12_GPU_VIRTUAL_ADDRESS poolBaseGVA = m_clusterBlasPoolBuffer->GetGPUVirtualAddress();
+    for (UINT i = 0; i < N_obj; ++i)
+    {
+        m_objects[i].blasStorage.Reset();  // not needed when pool owns the memory
+        m_objects[i].blasGPUVA = poolBaseGVA + perObjOffset[i];
     }
     AllocateUAVBuffer(device, std::max<UINT64>(prebuild.ScratchDataSizeInBytes, 256ull),
                       &m_blasScratchBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -2690,12 +2753,12 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
 
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDesc, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
 
-    // UAV barrier per BLAS so subsequent TLAS build sees the writes.
-    std::vector<D3D12_RESOURCE_BARRIER> uavBarriers;
-    uavBarriers.reserve(N_obj);
-    for (auto& obj : m_objects)
-        uavBarriers.push_back(CD3DX12_RESOURCE_BARRIER::UAV(obj.blasStorage.Get()));
-    m_dxrCommandList->ResourceBarrier((UINT)uavBarriers.size(), uavBarriers.data());
+    // ONE UAV barrier covers every clone's BLAS because they all share
+    // the m_clusterBlasPoolBuffer storage.  Replaces the per-object
+    // barrier loop (which collapsed N=10K x 1 barrier into the same
+    // count of structs the kernel had to walk).
+    auto poolBarrier = CD3DX12_RESOURCE_BARRIER::UAV(m_clusterBlasPoolBuffer.Get());
+    m_dxrCommandList->ResourceBarrier(1, &poolBarrier);
 }
 
 // =====================================================================================
@@ -3357,11 +3420,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
 
     m_dxr2CommandList->ExecuteIndirectRTASOperations(1, &opDesc, D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
 
-    std::vector<D3D12_RESOURCE_BARRIER> uavBarriers;
-    uavBarriers.reserve(N_obj);
-    for (auto& obj : m_objects)
-        uavBarriers.push_back(CD3DX12_RESOURCE_BARRIER::UAV(obj.blasStorage.Get()));
-    m_dxrCommandList->ResourceBarrier((UINT)uavBarriers.size(), uavBarriers.data());
+    // One pool-level UAV barrier covers all per-object BLAS writes
+    // (they all live in m_clusterBlasPoolBuffer; see BuildBlasFromClasIndirect).
+    auto poolBarrier = CD3DX12_RESOURCE_BARRIER::UAV(m_clusterBlasPoolBuffer.Get());
+    m_dxrCommandList->ResourceBarrier(1, &poolBarrier);
 }
 
 void D3D12RaytracingClusteredGeometry::RebuildStaticClasPerFrame()
@@ -4434,8 +4496,8 @@ void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
     s.staticClasActualBytes  = m_clasMemStats.sumActualBytes;
     s.staticClasScratchBytes = m_clasMemStats.scratchBytesPhase1;
     UINT64 blasSum = 0;
-    for (const auto& obj : m_objects)
-        if (obj.blasStorage) blasSum += obj.blasStorage->GetDesc().Width;
+    if (m_clusterBlasPoolBuffer)
+        blasSum += m_clusterBlasPoolBuffer->GetDesc().Width;
     s.staticBlasTotalBytes   = blasSum;
     s.staticBlasScratchBytes = sizeOf(m_blasScratchBuffer);
     s.staticClusterInputBytes = sizeOf(m_clusterInputBuffer);
@@ -5029,11 +5091,15 @@ void D3D12RaytracingClusteredGeometry::ReadBuildTimestamps()
     m_totalClasBytes = 0;
     if (m_clasResultBuffer) m_totalClasBytes = m_clasResultBuffer->GetDesc().Width;
 
-    // Compute total BLAS allocation size.
+    // Compute total BLAS allocation size.  Cluster path: pooled into
+    // m_clusterBlasPoolBuffer.  Traditional path: per-object
+    // obj.tradBlasStorage (separate code path, not pooled).
     m_totalBlasBytes = 0;
+    if (m_clusterBlasPoolBuffer)
+        m_totalBlasBytes += m_clusterBlasPoolBuffer->GetDesc().Width;
     for (const auto& obj : m_objects)
-        if (obj.blasStorage)
-            m_totalBlasBytes += obj.blasStorage->GetDesc().Width;
+        if (obj.tradBlasStorage)
+            m_totalBlasBytes += obj.tradBlasStorage->GetDesc().Width;
 
     UINT64* ts = nullptr;
     D3D12_RANGE r = { 0, sizeof(UINT64) * kBuildTimestampCount };
@@ -7397,6 +7463,7 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     m_blasArgsBuffer.Reset();
     m_blasArgsMeta.Reset();
     m_blasResultAddrBuffer.Reset();
+    m_clusterBlasPoolBuffer.Reset();
     m_tlasBuffer.Reset();
     m_tlasScratchBuffer.Reset();
     m_tlasInstanceDescs.Reset();

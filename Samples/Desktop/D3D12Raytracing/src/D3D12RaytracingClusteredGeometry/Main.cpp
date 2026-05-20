@@ -32,7 +32,6 @@
 #include <d3d12.h>
 #include <d3dx12.h>           // CD3DX12_* helpers
 #include <dxcapi.h>           // runtime HLSL compile via dxcompiler.dll
-#include <DirectXMath.h>
 
 #include <vector>
 #include <string>
@@ -45,7 +44,6 @@
 #include <algorithm>
 
 using Microsoft::WRL::ComPtr;
-using namespace DirectX;
 
 // ============================================================================
 //  Log + error helpers
@@ -73,6 +71,11 @@ static void TF(HRESULT hr, const wchar_t* what = L"HRESULT failed")
 }
 
 // ============================================================================
+//  Basic geometry types (shared between the encoder and the cube generator).
+// ============================================================================
+struct float3 { float x, y, z; };
+
+// ============================================================================
 //  COMPRESSED1 encoder
 //
 //  Per-cluster vertex-buffer layout (matches the public spec / d3d12conf
@@ -87,8 +90,6 @@ static void TF(HRESULT hr, const wchar_t* what = L"HRESULT failed")
 // ============================================================================
 namespace Compressed1
 {
-    struct float3 { float x, y, z; };
-
     struct EncodedCluster
     {
         D3D12_VERTEX_FORMAT_COMPRESSED1_HEADER header = {};
@@ -130,8 +131,7 @@ namespace Compressed1
     //     pick.
     static EncodedCluster Encode(const std::vector<float3>& verts,
                                  int maxPrecisionBits = 12,
-                                 int forcedBiasedExponent = -1)
-    {
+                                 int forcedBiasedExponent = -1)    {
         EncodedCluster out;
         out.vertexCount = (unsigned)verts.size();
         if (verts.empty()) return out;
@@ -231,16 +231,19 @@ namespace Compressed1
 // ============================================================================
 struct Face
 {
-    std::vector<Compressed1::float3> positions;  // 4 corners
-    static constexpr uint16_t indices[6] = { 0, 3, 2, 0, 1, 3 };
+    std::vector<float3> positions;  // 4 corners
 };
+
+// Per-face shared index buffer: 2 tris formed by quad corners (0,1,2,3) laid
+// out as a row-major 2x2 grid, with CCW-from-outside winding.
+static constexpr uint16_t kFaceIndices[6] = { 0, 3, 2, 0, 1, 3 };
 
 // Generate a unit cube (halfExtent h) as 6 single-cluster faces. Each face's
 // CCW-from-outside winding matches the index pattern above (the axisU x
 // axisV cross product is the outward normal).
 static std::vector<Face> BuildCubeFaces(float h)
 {
-    struct Basis { Compressed1::float3 origin, axisU, axisV; };
+    struct Basis { float3 origin, axisU, axisV; };
     const Basis bases[6] = {
         // +X (n=+X): U=+Y V=+Z
         {{ +h,-h,-h}, {0,1,0}, {0,0,1}},
@@ -273,17 +276,17 @@ static std::vector<Face> BuildCubeFaces(float h)
     }
     return faces;
 }
-constexpr uint16_t Face::indices[6];
 
 // ============================================================================
 //  Shader source (runtime-compiled via dxcompiler.dll, target lib_6_10).
+//
+//  Camera is fully static (eye looking at origin from in front + slightly
+//  above, 60-deg vertical FOV, 16:9 aspect) so the basis vectors are
+//  hardcoded as HLSL constants - no scene constant buffer needed.
 // ============================================================================
 static const char kRaytracingHLSL[] = R"HLSL(
-struct SceneCB { float4x4 viewToWorld; float4 cameraPosition; float4 misc; };
-
-RaytracingAccelerationStructure       Scene   : register(t0);
-RWTexture2D<float4>                   Output  : register(u0);
-ConstantBuffer<SceneCB>               gScene  : register(b0);
+RaytracingAccelerationStructure  Scene  : register(t0);
+RWTexture2D<float4>              Output : register(u0);
 
 struct [raypayload] Payload {
     float4 color : write(caller, closesthit, miss) : read(caller);
@@ -293,18 +296,24 @@ typedef BuiltInTriangleIntersectionAttributes Attribs;
 [shader("raygeneration")]
 void RayGen()
 {
-    const uint2  px      = DispatchRaysIndex().xy;
-    const uint2  dim     = DispatchRaysDimensions().xy;
-    const float2 ndc     = (float2(px) + 0.5) / float2(dim) * 2.0 - 1.0;
-    const float2 v2d     = float2(ndc.x, -ndc.y);
-    const float  aspect  = gScene.misc.x;
-    const float  tanHF   = gScene.misc.y;
-    const float3 dirView = normalize(float3(v2d.x * aspect * tanHF, v2d.y * tanHF, 1.0));
-    const float3 dirWld  = mul((float3x3)gScene.viewToWorld, dirView);
+    // Hardcoded LH-view basis: eye looks at the origin from (1.5, 1.1, -1.5).
+    // (Constant-folded by the HLSL compiler.)
+    static const float3 eye    = float3(1.5, 1.1, -1.5);
+    static const float3 fwd    = normalize(float3(-1.5, -1.1, 1.5));    // at - eye
+    static const float3 right  = normalize(cross(float3(0, 1, 0), fwd));
+    static const float3 up     = cross(fwd, right);
+    static const float  aspect = 1280.0 / 720.0;
+    static const float  tanHF  = 0.57735026919;                          // tan(30 deg)
+
+    const uint2  px  = DispatchRaysIndex().xy;
+    const uint2  dim = DispatchRaysDimensions().xy;
+    const float2 ndc = (float2(px) + 0.5) / float2(dim) * 2.0 - 1.0;
 
     RayDesc r;
-    r.Origin    = gScene.cameraPosition.xyz;
-    r.Direction = normalize(dirWld);
+    r.Origin    = eye;
+    r.Direction = normalize(fwd
+                          + right * ndc.x * aspect * tanHF
+                          -    up * ndc.y *          tanHF);   // -ndc.y: screen-down = world-down
     r.TMin      = 0.001;
     r.TMax      = 1000.0;
 
@@ -321,9 +330,11 @@ void OpaqueHit(inout Payload p, in Attribs a)
 {
     // Per-(cluster, primitive, instance) hash colour - each surviving
     // triangle reads as a distinct colour so missing faces are obvious.
-    const uint cid  = ClusterID();
-    const uint pid  = PrimitiveIndex();
-    const uint inst = InstanceIndex();
+    // +1 biases inside the hash to avoid the all-zeros input producing
+    // a black triangle for cluster 0, primitive 0, instance 0.
+    const uint cid  = ClusterID()      + 1;
+    const uint pid  = PrimitiveIndex() + 1;
+    const uint inst = InstanceIndex()  + 1;
     const uint h    = (cid * 2654435761u) ^ (pid * 374761393u) ^ (inst * 668265263u);
     p.color = float4(((h >>  0) & 0xFF) / 255.0,
                      ((h >>  8) & 0xFF) / 255.0,
@@ -436,21 +447,23 @@ public:
     UINT compressedBits = 12;                      // COMPRESSED1 precision
 
     // ---- device / swapchain ----
-    static constexpr UINT kFrameCount = 2;
+    // (Flip-model swap chain requires BufferCount >= 2; we treat both buffers
+    //  uniformly via swapChain->GetCurrentBackBufferIndex() inline at render
+    //  time, with a full WaitForGpu after every Present.  Single allocator,
+    //  no per-frame pipelining - keeps the plumbing trivial.)
+    static constexpr UINT kBackBufferCount = 2;
     ComPtr<IDXGIFactory4>                 factory;
     ComPtr<ID3D12Device5>                 device;
     ComPtr<ID3D12DeviceRaytracing2>       dxr2Device;
     ComPtr<ID3D12CommandQueue>            queue;
     ComPtr<IDXGISwapChain3>               swapChain;
-    ComPtr<ID3D12Resource>                backBuffers[kFrameCount];
-    ComPtr<ID3D12CommandAllocator>        cmdAlloc[kFrameCount];
+    ComPtr<ID3D12Resource>                backBuffers[kBackBufferCount];
+    ComPtr<ID3D12CommandAllocator>        cmdAlloc;
     ComPtr<ID3D12GraphicsCommandList4>    cmdList;
     ComPtr<ID3D12CommandListRaytracing2>  dxr2CmdList;
     ComPtr<ID3D12Fence>                   fence;
-    UINT64                                fenceVals[kFrameCount] = {};
     UINT64                                nextFenceVal = 1;
     HANDLE                                fenceEvent = nullptr;
-    UINT                                  frameIndex = 0;
 
     // ---- output UAV ----
     ComPtr<ID3D12DescriptorHeap>          uavHeap;
@@ -485,10 +498,6 @@ public:
     ComPtr<ID3D12Resource>                missST;
     ComPtr<ID3D12Resource>                hitST;
 
-    // ---- scene CB ----
-    ComPtr<ID3D12Resource>                sceneCB;
-    void*                                 sceneCBMapped = nullptr;
-
     // ------------------------------------------------------------------
     void ParseCommandLine(int argc, WCHAR** argv)
     {
@@ -513,7 +522,6 @@ public:
         InitSwapChain();
         InitFenceAndCmdList();
         InitDescriptorHeapAndUavOutput();
-        InitSceneCB();
         BuildScene();
         BuildAccelerationStructures();
         BuildRaytracingPipeline();
@@ -572,25 +580,23 @@ public:
         scd.Format      = DXGI_FORMAT_B8G8R8A8_UNORM;
         scd.SampleDesc  = { 1, 0 };
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.BufferCount = kFrameCount;
+        scd.BufferCount = kBackBufferCount;
         scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         ComPtr<IDXGISwapChain1> sc1;
         TF(factory->CreateSwapChainForHwnd(queue.Get(), g_hwnd, &scd, nullptr, nullptr, &sc1));
         TF(sc1.As(&swapChain));
         factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
-        for (UINT i = 0; i < kFrameCount; ++i)
+        for (UINT i = 0; i < kBackBufferCount; ++i)
             TF(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])));
-        frameIndex = swapChain->GetCurrentBackBufferIndex();
     }
 
     // ------------------------------------------------------------------
     void InitFenceAndCmdList()
     {
-        for (UINT i = 0; i < kFrameCount; ++i)
-            TF(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(&cmdAlloc[i])));
+        TF(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          IID_PPV_ARGS(&cmdAlloc)));
         TF(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                     cmdAlloc[frameIndex].Get(), nullptr,
+                                     cmdAlloc.Get(), nullptr,
                                      IID_PPV_ARGS(&cmdList)));
         TF(cmdList->QueryInterface(IID_PPV_ARGS(&dxr2CmdList)),
            L"ID3D12CommandListRaytracing2 QI failed");
@@ -625,64 +631,22 @@ public:
     }
 
     // ------------------------------------------------------------------
-    struct SceneCBData {
-        XMMATRIX viewToWorld;
-        XMFLOAT4 cameraPosition;
-        XMFLOAT4 misc;        // .x = aspect, .y = tan(fov/2)
-    };
-
-    void InitSceneCB()
-    {
-        const UINT sz = (sizeof(SceneCBData) + 255) & ~255u;
-        auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-        auto desc = CD3DX12_RESOURCE_DESC::Buffer(sz);
-        TF(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&sceneCB)));
-        sceneCB->SetName(L"Scene CB");
-        TF(sceneCB->Map(0, nullptr, &sceneCBMapped));
-
-        // Static camera: eye looking at origin from in front and slightly above,
-        // chosen to show 3 cube faces (+X, +Y, -Z).
-        XMVECTOR eye = XMVectorSet(1.5f, 1.1f, -1.5f, 1.0f);
-        XMVECTOR at  = XMVectorSet(0,    0,    0,    1.0f);
-        XMVECTOR up  = XMVectorSet(0,    1,    0,    0.0f);
-        XMMATRIX view = XMMatrixLookAtLH(eye, at, up);
-
-        SceneCBData cb = {};
-        cb.viewToWorld = XMMatrixInverse(nullptr, view);
-        XMStoreFloat4(&cb.cameraPosition, eye);
-        cb.misc.x = (float)kWidth / (float)kHeight;
-        cb.misc.y = std::tan(60.0f * (XM_PI / 180.0f) * 0.5f);  // 60-deg vertical FOV
-        memcpy(sceneCBMapped, &cb, sizeof(cb));
-    }
-
-    // ------------------------------------------------------------------
     void BuildScene()
     {
         cubeFaces = BuildCubeFaces(0.45f);
         clusterCount = (UINT)cubeFaces.size();
 
-        // Pick a single scene-wide COMPRESSED1 exponent so shared cluster-edge
-        // vertices quantize identically (watertight at quantization level).
-        float maxExtent = 0.f;
-        for (const auto& f : cubeFaces)
-        {
-            float mn[3] = { FLT_MAX,FLT_MAX,FLT_MAX }, mx[3] = { -FLT_MAX,-FLT_MAX,-FLT_MAX };
-            for (const auto& p : f.positions)
-            {
-                const float ps[3] = { p.x, p.y, p.z };
-                for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], ps[k]); mx[k] = std::max(mx[k], ps[k]); }
-            }
-            for (int k = 0; k < 3; ++k) maxExtent = std::max(maxExtent, mx[k] - mn[k]);
-        }
-        const float minUnit = maxExtent / float((1ull << compressedBits) - 1);
-        int sharedExponent = (int)std::ceil(std::log2(minUnit)) + 127;
-        sharedExponent = std::clamp(sharedExponent, 1, 232);
+        // Pick a scene-wide COMPRESSED1 exponent so cluster-edge vertices
+        // quantize identically (watertight at quantization).  Geometry is a
+        // fixed unit cube so the max axis-extent is known a priori.
+        const float maxExtent    = 0.9f;    // = 2 * halfExtent (BuildCubeFaces(0.45f))
+        const float minUnit      = maxExtent / float((1ull << compressedBits) - 1);
+        const int   sharedExp    = std::clamp((int)std::ceil(std::log2(minUnit)) + 127, 1, 232);
 
         encoded.clear();
         encoded.reserve(cubeFaces.size());
         for (const auto& f : cubeFaces)
-            encoded.push_back(Compressed1::Encode(f.positions, (int)compressedBits, sharedExponent));
+            encoded.push_back(Compressed1::Encode(f.positions, (int)compressedBits, sharedExp));
 
         Log(L"[scene] cube: %u clusters, %u tris.  vertex format: %s\n",
             clusterCount, clusterCount * 2,
@@ -697,8 +661,8 @@ public:
     // ------------------------------------------------------------------
     void BuildAccelerationStructures()
     {
-        TF(cmdAlloc[frameIndex]->Reset());
-        TF(cmdList->Reset(cmdAlloc[frameIndex].Get(), nullptr));
+        TF(cmdAlloc->Reset());
+        TF(cmdList->Reset(cmdAlloc.Get(), nullptr));
 
         UploadClusterInputs();
         BuildClas();
@@ -730,12 +694,12 @@ public:
             cursor = align(cursor, kAlign);
             slots[i].vbOff  = cursor;
             slots[i].vbSize = useFloat
-                ? cubeFaces[i].positions.size() * sizeof(Compressed1::float3)
+                ? cubeFaces[i].positions.size() * sizeof(float3)
                 : encoded[i].TotalBytes();
             cursor += slots[i].vbSize;
             cursor = align(cursor, kAlign);
             slots[i].ibOff  = cursor;
-            slots[i].ibSize = sizeof(Face::indices);
+            slots[i].ibSize = sizeof(kFaceIndices);
             cursor += slots[i].ibSize;
         }
 
@@ -761,7 +725,7 @@ public:
                     memcpy(mapped + slots[i].vbOff + sizeof(encoded[i].header),
                            encoded[i].bitstream.data(), encoded[i].bitstream.size());
             }
-            memcpy(mapped + slots[i].ibOff, Face::indices, sizeof(Face::indices));
+            memcpy(mapped + slots[i].ibOff, kFaceIndices, sizeof(kFaceIndices));
         }
         clusterInputBuf->Unmap(0, nullptr);
 
@@ -772,11 +736,11 @@ public:
         {
             auto& a = args[i];
             a = {};
-            a.ClusterID                 = 500 + i;
+            a.ClusterID                 = i;
             a.TriangleCount             = 2;
             a.VertexCount               = 4;
             a.BaseGeometryIndexAndFlags = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
-            a.VertexBufferStride        = useFloat ? (UINT16)sizeof(Compressed1::float3) : 0;
+            a.VertexBufferStride        = useFloat ? (UINT16)sizeof(float3) : 0;
             a.IndexBufferStride         = sizeof(uint16_t);
             a.PositionTruncateBitCount  = 0;
             a.VertexBuffer              = baseGVA + slots[i].vbOff;
@@ -903,8 +867,10 @@ public:
     void BuildTlas()
     {
         D3D12_RAYTRACING_INSTANCE_DESC inst = {};
-        XMMATRIX m = XMMatrixIdentity();
-        XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(inst.Transform), m);
+        // Identity transform (row-major 3x4): the cube is already at origin.
+        inst.Transform[0][0] = 1.0f;
+        inst.Transform[1][1] = 1.0f;
+        inst.Transform[2][2] = 1.0f;
         inst.InstanceID                          = 0;
         inst.InstanceMask                        = 0xFF;
         inst.InstanceContributionToHitGroupIndex = 0;
@@ -940,14 +906,14 @@ public:
     // ------------------------------------------------------------------
     void BuildRaytracingPipeline()
     {
-        // Global root sig: t0=Scene SRV, u0=RT output UAV, b0=Scene CBV.
+        // Global root sig: u0 = RT output UAV (descriptor table), t0 = TLAS SRV.
+        // (No CBV - camera is hardcoded in the shader.)
         {
             CD3DX12_DESCRIPTOR_RANGE uavRange;
             uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
-            CD3DX12_ROOT_PARAMETER params[3];
+            CD3DX12_ROOT_PARAMETER params[2];
             params[0].InitAsDescriptorTable(1, &uavRange);
             params[1].InitAsShaderResourceView(0);
-            params[2].InitAsConstantBufferView(0);
             CD3DX12_ROOT_SIGNATURE_DESC d(_countof(params), params);
             ComPtr<ID3DBlob> blob, err;
             TF(D3D12SerializeRootSignature(&d, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err));
@@ -1011,26 +977,28 @@ public:
     // ------------------------------------------------------------------
     void Render()
     {
-        TF(cmdAlloc[frameIndex]->Reset());
-        TF(cmdList->Reset(cmdAlloc[frameIndex].Get(), nullptr));
+        const UINT bbIdx = swapChain->GetCurrentBackBufferIndex();
+        auto*      bb    = backBuffers[bbIdx].Get();
+
+        TF(cmdAlloc->Reset());
+        TF(cmdList->Reset(cmdAlloc.Get(), nullptr));
 
         cmdList->SetComputeRootSignature(globalRS.Get());
         ID3D12DescriptorHeap* heaps[] = { uavHeap.Get() };
         cmdList->SetDescriptorHeaps(1, heaps);
         cmdList->SetComputeRootDescriptorTable(0, rtOutputUav);
         cmdList->SetComputeRootShaderResourceView(1, tlasBuf->GetGPUVirtualAddress());
-        cmdList->SetComputeRootConstantBufferView(2, sceneCB->GetGPUVirtualAddress());
         cmdList->SetPipelineState1(rtPipeline.Get());
 
         D3D12_DISPATCH_RAYS_DESC drd = {};
-        drd.RayGenerationShaderRecord.StartAddress = raygenST->GetGPUVirtualAddress();
-        drd.RayGenerationShaderRecord.SizeInBytes  = raygenST->GetDesc().Width;
-        drd.MissShaderTable.StartAddress           = missST->GetGPUVirtualAddress();
-        drd.MissShaderTable.SizeInBytes            = missST->GetDesc().Width;
-        drd.MissShaderTable.StrideInBytes          = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
-        drd.HitGroupTable.StartAddress             = hitST->GetGPUVirtualAddress();
-        drd.HitGroupTable.SizeInBytes              = hitST->GetDesc().Width;
-        drd.HitGroupTable.StrideInBytes            = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+        drd.RayGenerationShaderRecord = { raygenST->GetGPUVirtualAddress(),
+                                          raygenST->GetDesc().Width };
+        drd.MissShaderTable           = { missST->GetGPUVirtualAddress(),
+                                          missST->GetDesc().Width,
+                                          D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES };
+        drd.HitGroupTable             = { hitST->GetGPUVirtualAddress(),
+                                          hitST->GetDesc().Width,
+                                          D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES };
         drd.Width = kWidth; drd.Height = kHeight; drd.Depth = 1;
         cmdList->DispatchRays(&drd);
 
@@ -1038,41 +1006,27 @@ public:
         D3D12_RESOURCE_BARRIER toCopy[2] = {
             CD3DX12_RESOURCE_BARRIER::Transition(rtOutput.Get(),
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            CD3DX12_RESOURCE_BARRIER::Transition(backBuffers[frameIndex].Get(),
-                D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+            CD3DX12_RESOURCE_BARRIER::Transition(bb,
+                D3D12_RESOURCE_STATE_PRESENT,          D3D12_RESOURCE_STATE_COPY_DEST),
         };
-        cmdList->ResourceBarrier(_countof(toCopy), toCopy);
-        cmdList->CopyResource(backBuffers[frameIndex].Get(), rtOutput.Get());
+        cmdList->ResourceBarrier(2, toCopy);
+        cmdList->CopyResource(bb, rtOutput.Get());
         D3D12_RESOURCE_BARRIER toPresent[2] = {
             CD3DX12_RESOURCE_BARRIER::Transition(rtOutput.Get(),
                 D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            CD3DX12_RESOURCE_BARRIER::Transition(backBuffers[frameIndex].Get(),
-                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+            CD3DX12_RESOURCE_BARRIER::Transition(bb,
+                D3D12_RESOURCE_STATE_COPY_DEST,   D3D12_RESOURCE_STATE_PRESENT),
         };
-        cmdList->ResourceBarrier(_countof(toPresent), toPresent);
+        cmdList->ResourceBarrier(2, toPresent);
 
         TF(cmdList->Close());
         ID3D12CommandList* lists[] = { cmdList.Get() };
         queue->ExecuteCommandLists(1, lists);
         TF(swapChain->Present(1, 0));
-        MoveToNextFrame();
+        WaitForGpu();   // simple synchronous loop - no CPU/GPU pipelining
     }
 
     // ------------------------------------------------------------------
-    void MoveToNextFrame()
-    {
-        const UINT64 sig = nextFenceVal++;
-        TF(queue->Signal(fence.Get(), sig));
-        fenceVals[frameIndex] = sig;
-
-        frameIndex = swapChain->GetCurrentBackBufferIndex();
-        if (fence->GetCompletedValue() < fenceVals[frameIndex])
-        {
-            TF(fence->SetEventOnCompletion(fenceVals[frameIndex], fenceEvent));
-            WaitForSingleObject(fenceEvent, INFINITE);
-        }
-    }
-
     void WaitForGpu()
     {
         const UINT64 sig = nextFenceVal++;
@@ -1082,12 +1036,10 @@ public:
             TF(fence->SetEventOnCompletion(sig, fenceEvent));
             WaitForSingleObject(fenceEvent, INFINITE);
         }
-        fenceVals[frameIndex] = sig;
     }
 
     void Shutdown()
     {
-        if (sceneCB && sceneCBMapped) { sceneCB->Unmap(0, nullptr); sceneCBMapped = nullptr; }
         WaitForGpu();
         if (fenceEvent) { CloseHandle(fenceEvent); fenceEvent = nullptr; }
     }

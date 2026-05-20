@@ -407,15 +407,18 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone: record a shadow TLAS instance pointing at
-            // m_animatedObject's shared per-frame BLAS.  No new build
-            // work needed -- the spiral entry "rides" the source's
-            // animated BLAS as it gets rebuilt every frame.
+            // Animated clone: shadow TLAS instance.  Inherits the source's
+            // material + per-cluster checker overrides (so the clone looks
+            // visually identical to the central animated ball -- same
+            // chrome+glass checker pattern, same wave deformation).  We
+            // pass sentinel 0xFFFFFFFFu as the material override slot
+            // so the closesthit's per-instance-override path no-ops and
+            // ctx.meta.materialSlot stays at source's slot 7.
             AnimatedCloneInstance ac;
             ac.worldPos             = spiralPos;
             ac.worldRotEuler        = randRot;
             ac.worldScale           = randScale;
-            ac.materialOverrideSlot = randMatSlot;
+            ac.materialOverrideSlot = 0xFFFFFFFFu;  // = no override = inherit source's material
             m_animatedClones.push_back(ac);
             continue;
         }

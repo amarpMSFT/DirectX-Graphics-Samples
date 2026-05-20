@@ -692,7 +692,7 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticAccelerationStructures(const
         if (m_animatedObjectEnabled)
         {
             BuildAnimatedObjectSetup();
-            BuildAnimatedClonesSetup();  // re-enabled for debugging
+            BuildAnimatedClonesSetup();
             UpdateAnimatedObjectPerFrame();
         }
     }

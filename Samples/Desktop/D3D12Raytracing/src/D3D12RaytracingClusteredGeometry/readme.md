@@ -86,8 +86,20 @@ On-screen overlay (right column) lists the active value for each toggle.
 |          | `COMPRESSED1` bits/component). Triggers full static rebuild on change.                  |
 
 ### Headless / scripted runs
+- **WARP**: works.
+- **NVIDIA preview driver**: works.
 
-`--screenshot-at <seconds> path.png --exit-after-frames <N>` renders headless,
+### Stress-test sweep (RTX 4090, N=10K, ~10M tris)
+
+| Mode    | BLAS time / frame | FPS  | What it shows                                                  |
+| ------- | ----------------- | ---- | -------------------------------------------------------------- |
+| cluster | 0.78 ms (2001 builds) | 43 | DXR2 batched `ExecuteIndirectRTASOperations` — one driver call covering 2K BLAS builds. |
+| trad    | 640 ms (2001 builds)  | 1.5 | DXR1 baseline — 2K separate `BuildRaytracingAccelerationStructure` calls. |
+
+→ ~800× faster per-frame BLAS work in the DXR2 path on the same scene
+with the same per-clone animated geometry.  The cluster-mode N=10K
+result spends most of its frame time on ray traversal, not on AS work
+anymore.
 takes a screenshot, then quits. Useful for unattended visual diffs.
 
 `--at <seconds>:<action>` queues a runtime action that fires at the given

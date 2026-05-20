@@ -1037,10 +1037,47 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // generous inner radius matching the 3.5 floor used in SceneData.
     const float kFloorHalf      = 3.5f;
     const float kInnerRadius    = kFloorHalf + 1.0f;  // 1 unit margin outside the floor
-    const float kRadialSpacing  = 0.5f;               // sqrt(i) * this = radial step
-    const float kHeightPerUnit  = 0.10f;              // y gain per radial unit (gentle rise)
+    // Radial spacing widens at higher tiers (where distance LOD is
+    // active) so the lower-detail outer clones land at LARGER world
+    // distances -- the smaller pixel footprint hides the LOD's
+    // cluster-truncation holes the way a real LOD chain hides its
+    // mesh-decimation artifacts behind perspective.
+    //   100:  spacing 0.5  (no LOD, dense cluster of full-detail copies)
+    //   1K:   spacing 0.7  (LOD on, mild spread)
+    //   10K:  spacing 1.0  (LOD on, double the spread of 100-tier)
+    float kRadialSpacing = 0.5f;
+    if      (m_extraInstancesMode == ExtraInstancesMode::Thousand)    kRadialSpacing = 0.7f;
+    else if (m_extraInstancesMode == ExtraInstancesMode::TenThousand) kRadialSpacing = 1.0f;
+    // Height curve is sqrt-based so clones in the dense mid-radius
+    // band get most of the rise (helping visibility) while extreme-
+    // outer clones don't go absurdly high.  At N=10K the maxRadius
+    // is ~104 so the outermost clones land at floorY + sqrt(100)*1.2
+    // ~= +11 units, while the median clone lands ~+5-6.
+    const float kHeightSqrtMul  = 1.20f;
     const float kFloorY         = -0.7f;              // floor world-y
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
+
+    // Distance LOD.  Auto-enabled at the higher tiers (1K and 10K) --
+    // user requested "include lower detail as a function of distance
+    // for those" to keep memory + per-frame BVH-traversal cost in
+    // check while still being an interesting stress test.  Below 1K
+    // the overhead isn't worth it; clones get full source detail.
+    //
+    // LOD = lerp(1.0, 0.10, t) where t = (radius - innerRadius) /
+    // (maxRadius - innerRadius), clamped to [0,1].  At the innermost
+    // ring clones keep all source clusters; at the outermost ring
+    // they drop to 10% of source clusters.  Truncated clones lose
+    // the trailing slices of their source mesh which leaves visible
+    // holes -- acceptable for a workload-scaling demo where the goal
+    // is bytes/triangles scaling, not geometric fidelity.
+    const bool  kLodEnabled = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
+                              (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
+    const float kLodNear      = 1.00f;
+    const float kLodFar       = 0.10f;
+    // Pre-compute maxRadius matching the spiral formula so we can
+    // normalize the radius-to-LOD factor.
+    const float kMaxRadius    = kInnerRadius + sqrtf((float)std::max(N_extra, 1u)) * kRadialSpacing;
+    const float kLodRadialSpan = std::max(0.001f, kMaxRadius - kInnerRadius);
 
     // Cycle-deterministic RNG so re-toggling to the same N produces the
     // same scene (helpful when comparing perf snapshots between cycles).
@@ -1055,11 +1092,15 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         const UINT cycleSlot = i % srcPoolSize;
 
         // Spiral placement: shared between static + anim clones.
-        const float angle  = (float)i * kGoldenAngleRad;
-        const float radius = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
+        // Height curve is sqrt-based so the dense mid-radius band gets
+        // most of the rise (helping visibility) while extreme-outer
+        // clones don't go absurdly high.  See kHeightSqrtMul comment.
+        const float angle    = (float)i * kGoldenAngleRad;
+        const float radius   = kInnerRadius + sqrtf((float)i) * kRadialSpacing;
+        const float heightY  = kFloorY + sqrtf(std::max(0.0f, radius - kInnerRadius)) * kHeightSqrtMul;
         const DirectX::XMFLOAT3 spiralPos = {
             radius * cosf(angle),
-            kFloorY + (radius - kInnerRadius) * kHeightPerUnit,
+            heightY,
             radius * sinf(angle)
         };
         const DirectX::XMFLOAT3 randRot = { rotDist(rng), rotDist(rng), rotDist(rng) };
@@ -1071,7 +1112,10 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
             // Animated clone: record a shadow TLAS instance pointing at
             // m_animatedObject's shared per-frame BLAS.  No new build
             // work needed -- the spiral entry "rides" the source's
-            // animated BLAS as it gets rebuilt every frame.
+            // animated BLAS as it gets rebuilt every frame.  Distance
+            // LOD doesn't apply to anim clones in phase 1 (they share
+            // the source's full-detail BLAS); a future phase-2 anim
+            // clones with own per-frame CLAS could honor LOD here too.
             AnimatedCloneInstance ac;
             ac.worldPos             = spiralPos;
             ac.worldRotEuler        = randRot;
@@ -1099,6 +1143,64 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         clone.tradBlasResultBytes  = 0;
         clone.tradBlasScratchBytes = 0;
 
+        // Distance LOD: at the higher tiers, drop both cluster COUNT
+        // and triangles-per-cluster as a function of radius.  Combined
+        // they multiply: a clone at the periphery with lodFactor=0.10
+        // gets 10% clusters x 10% tris-per-cluster = ~1% of source
+        // triangles, dramatically shrinking its CLAS+BLAS storage and
+        // BVH-traversal cost vs near-camera clones at full detail.
+        //
+        // The cluster-list truncation drops the trailing spatial tiles
+        // (sphere generators emit clusters in row-major lat/long
+        // order; torus in ring-major; klein in u-major).  The tri
+        // truncation within each surviving cluster drops the trailing
+        // triangles of that cluster's IB.  Both leave visible holes
+        // (acceptable for a workload-scaling demo where the goal is
+        // bytes/triangles scaling, not geometric fidelity).
+        //
+        // We DON'T resize the per-cluster positions array even when
+        // tris are dropped -- some positions may become unreferenced
+        // but the CLAS build accepts that (it reads vertCount + triCount
+        // independently).  Skipping the positions reorder keeps the
+        // LOD code O(N_clusters) instead of O(N_verts).
+        if (kLodEnabled && !clone.mesh.clusters.empty())
+        {
+            const float t = std::clamp(
+                (radius - kInnerRadius) / kLodRadialSpan, 0.0f, 1.0f);
+            const float lodFactor = kLodNear + (kLodFar - kLodNear) * t;
+            // (1) cluster-count LOD: drop trailing spatial tiles.
+            const UINT  srcN      = (UINT)clone.mesh.clusters.size();
+            const UINT  lodN      = std::max(1u, (UINT)std::ceil((float)srcN * lodFactor));
+            if (lodN < srcN)
+            {
+                clone.mesh.clusters.resize(lodN);
+                if (clone.encoded.size() > lodN)
+                    clone.encoded.resize(lodN);
+            }
+            // (2) tris-per-cluster LOD: drop trailing tris of each
+            //     surviving cluster.  Always keep at least 1 tri
+            //     (a degenerate-empty cluster would crash the CLAS
+            //     build's MaxTotalTriangleCount predicate).
+            for (auto& cl : clone.mesh.clusters)
+            {
+                const UINT srcTri = (UINT)(cl.indices.size() / 3);
+                const UINT lodTri = std::max(1u, (UINT)std::ceil((float)srcTri * lodFactor));
+                if (lodTri < srcTri)
+                    cl.indices.resize((size_t)lodTri * 3u);
+            }
+            // Recount mesh totals so downstream stats (and the BLAS
+            // prebuild's MaxTotalTriangleCount inference) are correct
+            // for the LOD'd cluster set.
+            UINT totalTri = 0, totalVert = 0;
+            for (const auto& c : clone.mesh.clusters)
+            {
+                totalTri  += (UINT)(c.indices.size() / 3);
+                totalVert += (UINT)c.positions.size();
+            }
+            clone.mesh.totalTriangles = totalTri;
+            clone.mesh.totalVertices  = totalVert;
+        }
+
         clone.worldPos      = spiralPos;
         clone.worldRotEuler = randRot;
         clone.worldScale    = randScale;
@@ -1123,11 +1225,12 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     for (const auto& obj : m_objects)
         m_totalTriangleCount += obj.mesh.totalTriangles;
 
-    SampleLog::LogF(L"[clones] N=%u extra; %zu static clones + %zu animated clones; "
-                    L"m_objects=%zu, m_totalClusterCount=%u, m_totalTriangleCount=%u\n",
+    SampleLog::LogF(L"[clones] N=%u extra; %zu static clones + %zu animated clones "
+                    L"(LOD %s); m_objects=%zu, m_totalClusterCount=%u, m_totalTriangleCount=%u\n",
                     N_extra,
                     m_objects.size() - m_sourceObjectCount,
                     m_animatedClones.size(),
+                    kLodEnabled ? L"on" : L"off",
                     m_objects.size(),
                     m_totalClusterCount, m_totalTriangleCount);
 }
@@ -6516,7 +6619,9 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     // Workload-scaling [N] toggle.  Always shown so the user knows the
     // hotkey exists even when N=0.  Reports the count + breakdown
-    // (static clones + animated clones share-source-BLAS).
+    // (static clones + animated clones share-source-BLAS) + LOD state
+    // (auto-on at 1K/10K to keep memory + traversal cost in check by
+    // dropping both cluster-count and tris-per-cluster with distance).
     if (m_extraInstancesMode == ExtraInstancesMode::None)
     {
         swprintf_s(kbuf, L"   extra instances:  %s", ExtraInstancesModeName());
@@ -6525,8 +6630,11 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     {
         const UINT N_static_clones = (UINT)(m_objects.size() - m_sourceObjectCount);
         const UINT N_anim_clones   = (UINT)m_animatedClones.size();
-        swprintf_s(kbuf, L"   extra instances:  %s   (%u static + %u animated)",
-                   ExtraInstancesModeName(), N_static_clones, N_anim_clones);
+        const bool lodOn = (m_extraInstancesMode == ExtraInstancesMode::Thousand) ||
+                           (m_extraInstancesMode == ExtraInstancesMode::TenThousand);
+        swprintf_s(kbuf, L"   extra instances:  %s   (%u static + %u animated)   distance-LOD: %s",
+                   ExtraInstancesModeName(), N_static_clones, N_anim_clones,
+                   lodOn ? L"on" : L"off");
     }
     drawKeyLine(L"[N]", kbuf);
 

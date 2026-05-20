@@ -407,27 +407,46 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone: shadow TLAS instance.  Push it OUTWARD
-            // along the spiral radial so it sits CLEAR of the static
-            // clones (which tend to overlap densely at the inner spiral
-            // radii).  Also scale up 1.5x so the wave deformation reads
-            // clearly at the increased distance.  Inherits source's
-            // material (sentinel override) so each clone looks like the
-            // central animated ball -- same chrome+glass checker, same
-            // wave -- just at a different position.
+            // Animated clone placement -- UNMISSABLE EDITION.
             //
-            // Spiral push: ac.worldPos.x/z is the original Vogel
-            // position; scale outward by 2x and lift y by 1.5 so they
-            // sit ABOVE the static spiral too.
-            const float outwardScale = 2.0f;
+            // Earlier attempts placed anim clones at the spiral position
+            // (or 2x-spread variants of it) and the user couldn't see
+            // them: at radii 4..22 they overlapped each other AND the
+            // dense static-clone spiral, blurring into one big
+            // checker-glass blob you can't visually parse.
+            //
+            // New scheme: anim clones get their OWN deterministic ring
+            // entirely outside the static spiral.  Index k = the k'th
+            // anim clone created so far = m_animatedClones.size().
+            //
+            //   ring radius = 18.0  (well outside even N=10K static
+            //                        spiral which still has its inner
+            //                        bulk at r<15)
+            //   ring height = +2.0  (sits well above the floor, clear
+            //                        of static spiral height curve)
+            //   angle per   = 360 / max(1,N_anim) so they're spread
+            //                 evenly around the ring once N is fixed.
+            //   scale       = 1.8  (clearly bigger than static clones)
+            //
+            // Because N_anim isn't known until the loop finishes, just
+            // use a fixed angular step of 18 degrees -- guarantees first
+            // 20 anim clones are spaced 18deg apart (full ring); after
+            // 20 they wrap and overlap on later passes, but at N=10K
+            // we have 2K anim clones and the user only cares about
+            // SEEING SOMEWHERE that anim clones exist, not packing.
+            const float kAnimRingRadius = 18.0f;
+            const float kAnimRingY      = 2.0f;
+            const float kAnimRingAngStepDeg = 18.0f;
+            const UINT  kIdx = (UINT)m_animatedClones.size();
+            const float ang  = kIdx * (kAnimRingAngStepDeg * 3.14159265f / 180.0f);
             AnimatedCloneInstance ac;
             ac.worldPos             = DirectX::XMFLOAT3(
-                spiralPos.x * outwardScale,
-                spiralPos.y + 1.5f,           // lift above the static spiral
-                spiralPos.z * outwardScale);
-            ac.worldRotEuler        = randRot;
-            ac.worldScale           = randScale * 1.5f;   // 0.9..2.1 effective
-            ac.materialOverrideSlot = 0xFFFFFFFFu;        // = inherit source's material
+                kAnimRingRadius * cosf(ang),
+                kAnimRingY,
+                kAnimRingRadius * sinf(ang));
+            ac.worldRotEuler        = DirectX::XMFLOAT3(0.f, 0.f, 0.f);  // upright
+            ac.worldScale           = 1.8f;
+            ac.materialOverrideSlot = 0xFFFFFFFFu;
             m_animatedClones.push_back(ac);
             continue;
         }

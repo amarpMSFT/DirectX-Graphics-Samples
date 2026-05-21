@@ -2640,11 +2640,19 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
     // cascades into a TDR-hang).  So we precompute the per-cluster
     // local prim alongside the cid and the shader uses BOTH values.
     std::vector<XMUINT2> triToCidLocal;   // .x = cid, .y = localPrimIdxWithinCluster
-    // Size for static instances + the animated instance (if enabled).  The
-    // animated ball lives at TLAS instance index N_static and contributes
-    // one geom desc with a tri-base entry at [N_static*MaxGeoms + 0].
-    const UINT animSlots = m_animatedObjectEnabled ? 1u : 0u;
-    const UINT instCount = (UINT)m_objects.size() + animSlots;
+    // Size for static instances + the animated source instance + every
+    // anim clone (they SHARE the source's BLAS / geom-desc layout so they
+    // need an entry pointing at the same tri-base as the source).  Without
+    // anim clone entries, the trad-mode shader's
+    //   g_tradGeomTriBase.Load(InstanceIndex() * MAX_GEOMS + GeomIdx)
+    // read for an anim clone (InstanceIndex >= N_static + 1) OOBs the
+    // buffer, returns garbage, then (garbage + PrimitiveIndex) * 8 OOBs
+    // g_tradTriToCid -> garbage cid -> ClusterMeta OOB -> GPU page-fault
+    // -> DXGI_ERROR_DEVICE_HUNG (TDR).  Same OOB-read class of bug as the
+    // anim-clone InstanceID/g_materials lookup fixed in commit 414c23a.
+    const UINT animSlots      = m_animatedObjectEnabled ? 1u : 0u;
+    const UINT animCloneCount = (UINT)m_animatedClones.size();
+    const UINT instCount      = (UINT)m_objects.size() + animSlots + animCloneCount;
     std::vector<UINT>    geomTriBase(instCount * kMaxGeomsPerInstance, 0);
     triToCidLocal.reserve(m_totalTriangleCount);
 
@@ -2697,12 +2705,26 @@ void D3D12RaytracingClusteredGeometry::BuildTradCidLookup()
     if (m_animatedObjectEnabled)
     {
         constexpr UINT kAnimatedClusterIdOffset = 800;
-        geomTriBase[m_objects.size() * kMaxGeomsPerInstance + 0] = (UINT)triToCidLocal.size();
+        const UINT animSourceTriBase = (UINT)triToCidLocal.size();
+        geomTriBase[m_objects.size() * kMaxGeomsPerInstance + 0] = animSourceTriBase;
         for (const auto& cl : m_animatedObject.mesh.clusters)
         {
             const UINT triCount = (UINT)(cl.indices.size() / 3);
             for (UINT t = 0; t < triCount; ++t)
                 triToCidLocal.push_back(XMUINT2(cl.clusterID + kAnimatedClusterIdOffset, t));
+        }
+        // Anim clones share source's tradBlasGPUVA (or per-clone BLAS pool
+        // slots that were built from the source's geometry).  Either way
+        // the BLAS layout is identical to the source so anim clones use the
+        // SAME tri-base entry as the source -- give them entries that point
+        // at the source's tri-base so the trad-mode shader's
+        //   g_tradGeomTriBase[InstanceIndex * MAX_GEOMS + GeomIdx]
+        // lookup returns valid data and PrimitiveIndex resolves to the
+        // correct (cid, localPrim) pair in g_tradTriToCid.
+        const size_t baseAnimRow = m_objects.size() + 1;   // after static + source
+        for (size_t k = 0; k < m_animatedClones.size(); ++k)
+        {
+            geomTriBase[(baseAnimRow + k) * kMaxGeomsPerInstance + 0] = animSourceTriBase;
         }
     }
 
@@ -2739,12 +2761,16 @@ void D3D12RaytracingClusteredGeometry::BuildPerInstGeomMaterialTable()
 {
     auto device = m_deviceResources->GetD3DDevice();
 
-    // Include the animated instance (when enabled) -- InstanceIndex()
-    // ranges 0..N_static for the animated case, so the table must be
-    // sized to cover it.  Animated has a single region using its
-    // own per-instance material slot.
-    const UINT animSlots = m_animatedObjectEnabled ? 1u : 0u;
-    const UINT N_inst    = (UINT)m_objects.size() + animSlots;
+    // Include the animated instance + every anim clone (when enabled).
+    // InstanceIndex() ranges 0..(N_static + 1 + N_animClone - 1) so the
+    // table must cover ALL trad-instance rows.  Anim clones share the
+    // source's single material region (slot 7) -- give them the same
+    // entry as the animated source.  Without this, anim-clone shader
+    // hits would OOB-read this buffer (same TDR-causing pattern as the
+    // g_tradGeomTriBase OOB fixed in BuildTradCidLookup).
+    const UINT animSlots      = m_animatedObjectEnabled ? 1u : 0u;
+    const UINT animCloneCount = (UINT)m_animatedClones.size();
+    const UINT N_inst         = (UINT)m_objects.size() + animSlots + animCloneCount;
     std::vector<UINT> table(N_inst * kMaxGeomsPerInstance, 0);
     for (size_t oi = 0; oi < m_objects.size(); ++oi)
     {
@@ -2771,6 +2797,12 @@ void D3D12RaytracingClusteredGeometry::BuildPerInstGeomMaterialTable()
     {
         // Animated instance: single-region with the animated obj's material slot.
         table[m_objects.size() * kMaxGeomsPerInstance + 0] = m_animatedObject.instanceID;
+        // Anim clones: same material slot as the source (slot 7 anim glass).
+        const size_t baseAnimRow = m_objects.size() + 1;
+        for (size_t k = 0; k < m_animatedClones.size(); ++k)
+        {
+            table[(baseAnimRow + k) * kMaxGeomsPerInstance + 0] = m_animatedObject.instanceID;
+        }
     }
     AllocateUploadBuffer(device, table.data(),
                          table.size() * sizeof(UINT),
@@ -3744,6 +3776,30 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesTradSetup()
     auto& obj   = m_animatedObject;
     const UINT N = (UINT)m_animatedClones.size();
 
+    // SCALING GATE: DXR1 has no batched BuildRaytracingAccelerationStructure
+    // op (unlike DXR2's ExecuteIndirectRTASOperations), so trad-mode phase-2
+    // anim-clone BLAS rebuild is N serialised driver calls per frame.  At
+    // N>~200 (= [N]=1K's anim-clone count) the per-frame CPU/GPU cost +
+    // pool memory (each per-clone trad BLAS is ~2.5 MB, so N=2000 needs
+    // ~5 GB pool) overwhelm the TDR budget and risk OOM on smaller GPUs.
+    // Above the cap, anim clones fall back to sharing the source's
+    // tradBlasGPUVA -- they still ANIMATE (source's BLAS is rebuilt per
+    // frame from the deformed perFrameVertexBuffer) but every clone in
+    // excess of the cap shares the SAME instantaneous deformation as the
+    // source, identical wobble silhouettes.  Cluster mode's phase-2 path
+    // (BUILD_BLAS_FROM_CLAS via ExecuteIndirectRTASOperations) IS batched
+    // and continues to do per-clone BLASes at any N.
+    constexpr UINT kTradPerClonePoolMax = 200u;   // moderate cap; high N falls back to shared source BLAS
+    const UINT N_pooled = std::min(N, kTradPerClonePoolMax);
+    if (N_pooled == 0)
+    {
+        // Nothing to pool -- all clones will share source's BLAS in the
+        // TLAS instance writeup via the (ac.blasGPUVA == 0) -> animBlasGVA
+        // fallback.
+        SampleLog::LogF(L"[anim-clones trad phase2] N=%u: ALL clones share source's BLAS (N_pooled=0)\n", N);
+        return;
+    }
+
     // Same geom desc shape as BuildAnimatedTraditionalAS / UpdateAnimatedTradPerFrame
     // -- we just need the prebuild sizes here (driver doesn't actually
     // read VB/IB until the per-frame BuildRaytracingAccelerationStructure
@@ -3770,7 +3826,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesTradSetup()
 
     constexpr UINT64 kAlign = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;  // 256
     const UINT64 perBlasBytes = (pb.ResultDataMaxSizeInBytes + kAlign - 1) & ~(kAlign - 1);
-    const UINT64 poolBytes    = perBlasBytes * (UINT64)N;
+    const UINT64 poolBytes    = perBlasBytes * (UINT64)N_pooled;
     const UINT64 scratchBytes = std::max<UINT64>(pb.ScratchDataSizeInBytes, 256ull);
 
     AllocateUAVBuffer(device, poolBytes, &m_animClonesTradBlasPool,
@@ -3781,11 +3837,15 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesTradSetup()
                       L"Animated clones trad BLAS scratch (shared)");
 
     const D3D12_GPU_VIRTUAL_ADDRESS poolBaseGVA = m_animClonesTradBlasPool->GetGPUVirtualAddress();
-    for (UINT k = 0; k < N; ++k)
+    for (UINT k = 0; k < N_pooled; ++k)
         m_animatedClones[k].blasGPUVA = poolBaseGVA + (UINT64)k * perBlasBytes;
+    // Clones beyond the pool cap fall back to source's BLAS (0 GVA -> ternary
+    // in BuildTlasClassic picks animBlasGVA).
+    for (UINT k = N_pooled; k < N; ++k)
+        m_animatedClones[k].blasGPUVA = 0;
 
-    SampleLog::LogF(L"[anim-clones trad phase2] N=%u, per-clone BLAS=%llu bytes, pool=%.2f MB\n",
-                    N, (unsigned long long)perBlasBytes,
+    SampleLog::LogF(L"[anim-clones trad phase2] N=%u (pooled=%u, shared=%u), per-clone BLAS=%llu bytes, pool=%.2f MB\n",
+                    N, N_pooled, N - N_pooled, (unsigned long long)perBlasBytes,
                     poolBytes / (1024.0 * 1024.0));
 }
 
@@ -3909,6 +3969,9 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimesta
         cBuildDesc.ScratchAccelerationStructureData = m_animClonesTradBlasScratch->GetGPUVirtualAddress();
         for (size_t k = 0; k < m_animatedClones.size(); ++k)
         {
+            // Skip clones beyond the trad-pool cap (their blasGPUVA is 0,
+            // they share source's tradBlasGPUVA via the TLAS fallback).
+            if (m_animatedClones[k].blasGPUVA == 0) continue;
             cBuildDesc.DestAccelerationStructureData   = m_animatedClones[k].blasGPUVA;
             cBuildDesc.SourceAccelerationStructureData = 0;  // always rebuild
             m_dxrCommandList->BuildRaytracingAccelerationStructure(&cBuildDesc, 0, nullptr);
@@ -4431,12 +4494,14 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             // source's chrome+checker look exactly.
             instances[row].InstanceContributionToHitGroupIndex = contrib;
             instances[row].Flags = animFlags;
-            // Phase 2: each clone has its own BLAS in m_animClonesBlasPool;
-            // fall back to source GVA when pool is null (phase 1).
+            // Phase 2: each clone may have its own per-frame-rebuilt BLAS
+            // in m_animClonesBlasPool (cluster mode) or
+            // m_animClonesTradBlasPool (trad mode, capped at
+            // kTradPerClonePoolMax clones via BuildAnimatedClonesTradSetup).
+            // Fall back to source's animated BLAS GVA when this clone
+            // didn't get its own pool slot (ac.blasGPUVA == 0).
             instances[row].AccelerationStructure =
-                (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
-                    ? ac.blasGPUVA
-                    : animBlasGVA;
+                (ac.blasGPUVA != 0) ? ac.blasGPUVA : animBlasGVA;
             (isGlass ? nGlass : nOpaque)++;
         }
     }

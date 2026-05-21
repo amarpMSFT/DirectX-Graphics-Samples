@@ -200,11 +200,17 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
         // m_objects already holds only sources.
         return;
     }
-    // Truncate any previously-generated clones.
+    // Truncate any previously-generated clones from BOTH lists -- BEFORE
+    // any early-return path below so cycling to N=0 actually clears
+    // the previous tier's clones (was leaking 20 anim clones into the
+    // N=0 TLAS, growing it from 3.5 KB to ~10 KB and inflating the
+    // overlay's TLAS readout from 3.5 KB to 0.58 MB after a 10K -> 0
+    // cycle).
     if (m_objects.size() > m_sourceObjectCount)
     {
         m_objects.resize(m_sourceObjectCount);
     }
+    m_animatedClones.clear();
 
     const UINT N_extra = ExtraInstancesCount();
     if (N_extra == 0)
@@ -261,8 +267,7 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     const UINT   srcPoolSize    = srcStaticN + (animInPool ? 1u : 0u);
     const UINT   kAnimCycleSlot = srcStaticN;
 
-    // Reset the animated-clones list before refilling.
-    m_animatedClones.clear();
+    // (m_animatedClones already cleared above, before the N_extra==0 early-return.)
 
     // Inner-radius placement of the spiral.
     //

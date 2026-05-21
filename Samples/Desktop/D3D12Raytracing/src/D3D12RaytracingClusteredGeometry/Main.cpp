@@ -1,8 +1,4 @@
 //*********************************************************
-// Copyright (c) Microsoft. All rights reserved.
-// Licensed under the MIT License (MIT).
-//*********************************************************
-//
 // Main.cpp - DXR2 COMPRESSED1 cluster-geometry min repro.
 //
 // Single 6-cluster cube (one CLAS per face) built via DXR2's

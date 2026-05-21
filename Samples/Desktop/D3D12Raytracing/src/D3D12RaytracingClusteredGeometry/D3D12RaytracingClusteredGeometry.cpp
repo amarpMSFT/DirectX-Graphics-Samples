@@ -1220,7 +1220,29 @@ static void BuildSharedClusterTrianglesInputs(
     outLimits.MaxGeometryIndexValue                         = 0;
     outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
     outLimits.MaxTriangleCountPerCluster                    = maxTris;
-    outLimits.MaxVertexCountPerCluster                      = maxVerts;
+    // NVIDIA preview-driver COMPRESSED1 workaround: BUILD_CLAS_FROM_TRIANGLES
+    // with VERTEX_FORMAT_COMPRESSED1 silently corrupts all-but-the-first
+    // cluster's geometry when MaxVertexCountPerCluster isn't a multiple of
+    // 32 (= NVIDIA warp size; the driver appears to compute a per-cluster
+    // vertex-storage stride that overlaps adjacent clusters' storage).
+    // Bisection (RTX 4090 preview driver):
+    //   4..10  broken (only cluster 0 renders)
+    //   11..16 distorted
+    //   17..20 broken
+    //   24..31 distorted
+    //   32     ✓ correct
+    //   33     broken again
+    //   64/128/256 ✓ correct
+    // FLOAT32_3 works at any value; only COMPRESSED1 needs the bump.  See
+    // commit message for the repro + d3d12conf gap that hides this bug.
+    UINT effectiveMaxVerts = maxVerts;
+    if (!useFloat)
+    {
+        // Round up to next multiple of 32, clamped to spec max of 256.
+        effectiveMaxVerts = ((std::max<UINT>(maxVerts, 1u) + 31u) & ~31u);
+        if (effectiveMaxVerts > 256u) effectiveMaxVerts = 256u;
+    }
+    outLimits.MaxVertexCountPerCluster                      = effectiveMaxVerts;
     outLimits.MaxTotalTriangleCount                         = totalTris;
     outLimits.MaxTotalVertexCount                           = totalVerts;
     outLimits.MaxOpacityMicromapIndicesPerCluster           = 0;

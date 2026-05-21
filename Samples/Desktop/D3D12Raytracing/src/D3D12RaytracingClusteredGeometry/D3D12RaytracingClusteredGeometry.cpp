@@ -4386,37 +4386,36 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                        * rot
                        * XMMatrixTranslation(ac.worldPos.x, ac.worldPos.y, ac.worldPos.z);
             XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[row].Transform), m);
-            // InstanceID for anim clones doubles as the material-override
-            // index (matched in the override-buffer fill below).
-            instances[row].InstanceID  = ac.materialOverrideSlot;
+            // CRITICAL: InstanceID must be a VALID material slot (0..8),
+            // not the sentinel 0xFFFFFFFFu material-override value.
+            // GlassAnyHit reads g_materials[InstanceID()] -- a sentinel
+            // InstanceID truncates to 0xFFFFFF (24-bit field) and OOBs
+            // the 9-entry materials buffer, page-faulting the GPU and
+            // triggering DXGI_ERROR_DEVICE_HUNG (TDR).  Use the source
+            // animated ball's instanceID (= 7, animated glass material)
+            // so any-hit reads a valid slot.
+            //
+            // The per-instance material OVERRIDE mechanism still works
+            // via g_instanceMatOverride[InstanceIndex()] which carries
+            // ac.materialOverrideSlot (separate from InstanceID).  When
+            // it's sentinel 0xFFFFFFFFu the shader's closesthit no-ops
+            // the override and falls back to ctx.meta.materialSlot from
+            // the per-cluster table -- i.e., the source's chrome+
+            // checker look applies naturally.
+            instances[row].InstanceID  = a.instanceID;
             instances[row].InstanceMask = 0xFF;
+            // Full glass material -- now safe because any-hit reads a
+            // valid InstanceID.  Per-cluster overrides give clones the
+            // source's chrome+checker look exactly.
             instances[row].InstanceContributionToHitGroupIndex = contrib;
             instances[row].Flags = animFlags;
-            // Cluster mode: each clone has its OWN per-frame BLAS in
-            // m_animClonesBlasPool (phase-2; blasGPUVA was set by
-            // BuildAnimatedClonesSetup).
-            instances[row].InstanceID  = ac.materialOverrideSlot;
-            instances[row].InstanceMask = 0xFF;
-            // Anim clones: use OPAQUE hit group + FORCE_OPAQUE flag.
-            // The source's full glass+refraction render cost (reflect 3
-            // bounces + refract 5 bounces per hit) does NOT scale to
-            // N=20 clones -- the cascading refraction rays overrun the
-            // TDR limit (DXGI_ERROR_DEVICE_HUNG) on a 4090.  Opaque-mode
-            // anim clones still inherit the source's chrome+checker
-            // appearance via the per-cluster material overrides (because
-            // they share source's BLAS/CLAS), they just don't refract.
-            // Visually: chrome+checker wave-deformed balls -- matches
-            // user request of "balls like the middle ball" minus the
-            // see-through glass effect.
-            instances[row].InstanceContributionToHitGroupIndex = kHitGroupContribOpaque;
-            instances[row].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
             // Phase 2: each clone has its own BLAS in m_animClonesBlasPool;
             // fall back to source GVA when pool is null (phase 1).
             instances[row].AccelerationStructure =
                 (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
                     ? ac.blasGPUVA
                     : animBlasGVA;
-            ++nOpaque;
+            (isGlass ? nGlass : nOpaque)++;
         }
     }
     AllocateUploadBuffer(device, instances.data(),

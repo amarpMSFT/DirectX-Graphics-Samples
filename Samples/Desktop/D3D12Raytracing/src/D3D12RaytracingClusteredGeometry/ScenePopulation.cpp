@@ -337,11 +337,21 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     //     i=100:  y ~= +0.74
     //     i=1K:   y ~= +5.24
     //     i=10K:  y ~= +17.7
-    // y curve: bumped from -1.5 to +1.0 to lift inner clones ABOVE the
-    // floor top (floor top at y=-0.56, clone max bottom = kInnerY -
-    // 0.91 with max scale 0.7 + unit sphere mesh + 1.3 wave envelope =
-    // 0.09 with kInnerY=1.0 -- 0.65 margin above floor top).
-    const float kInnerY          =  1.00f;
+    // y curve: kInnerY chosen to make the stadium-seat curve (sqrt+linear
+    // height rise with radius) visible in the camera FOV.  Camera orbits
+    // at radius 3.5..6.5, eye y=1.5 looking at (0.5, 0, 0) with 60deg
+    // vertical FOV -- visible y above the look-at line is only ~+1.5
+    // units; visible y below is ~-5 units.  So lifting clones high up
+    // pushes outer rings ABOVE the FOV entirely.
+    //
+    // Per user request "translate all of it down somewhat -- initial
+    // objects can start slightly below the checker floor": kInnerY=-1.0
+    // puts the innermost clone CENTER below the floor top (y=-0.56) so
+    // the inner few clones overlap the floor edge -- intentional, makes
+    // the spiral 'rise out of' the floor.  Floor itself is opaque/glass
+    // so the partial intersection reads as the floor's surface being
+    // partly occluded by clones sitting on the lip.
+    const float kInnerY          = -1.00f;
     const float kHeightSqrtMul   =  0.50f;
     const float kHeightLinearMul =  0.15f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians

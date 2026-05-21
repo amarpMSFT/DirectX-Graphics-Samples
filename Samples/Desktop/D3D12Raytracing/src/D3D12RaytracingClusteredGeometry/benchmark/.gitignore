@@ -1,0 +1,9 @@
+# Per-machine sweep outputs (generated artifacts, not source).
+results/
+
+# Python bytecode caches.
+__pycache__/
+
+# Local comparison-report outputs.  The scripts produce these next to
+# themselves by default; sharing them belongs in a doc / wiki, not git.
+compare_*.html

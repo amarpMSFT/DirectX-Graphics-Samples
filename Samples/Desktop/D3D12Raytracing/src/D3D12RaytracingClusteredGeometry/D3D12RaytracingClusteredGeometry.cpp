@@ -5302,7 +5302,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // colour so the scene reads instead of going pitch black.
     XMVECTOR sunDir = XMVector3Normalize(XMVectorSet(0.45f, 0.75f, 0.50f, 0.0f));
     XMStoreFloat4(&cb.lightDir, sunDir);
-    cb.lightDir.w = 0.30f;                                          // ambient floor (was 0.15 -- bumped so opaque objects' shadowed side isn't crushed; reflective/glass surfaces still read the full sun-vs-shadow contrast via their reflection/refraction terms)
+    cb.lightDir.w = 0.40f;                                          // ambient floor
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
 }
 
@@ -5622,10 +5622,22 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         // (base+0..1 = AnimateBall.cs, base+2..3 = AS build) so the
         // overlay split between "anim CS" and "anim build" works for
         // both modes uniformly.
-        if (m_geometryMode == GeometryMode::Clusters)
-            UpdateAnimatedObjectPerFrame(base);
-        else
-            UpdateAnimatedTradPerFrame(base);
+        //
+        // SKIP the per-frame anim work entirely when paused so the
+        // wobble freezes IN LOCK-STEP with the camera (CPU-side
+        // m_animSeconds freezing already freezes the camera matrix
+        // immediately, but GPU pipeline depth made the wobble visibly
+        // lag a few frames before this gate -- now both freeze on the
+        // same frame the keypress happens).  The BLAS from the LAST
+        // dispatch stays valid; the TLAS rebuild references it
+        // unchanged.
+        if (!m_animPaused)
+        {
+            if (m_geometryMode == GeometryMode::Clusters)
+                UpdateAnimatedObjectPerFrame(base);
+            else
+                UpdateAnimatedTradPerFrame(base);
+        }
 
         cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 8);
         if (m_staticRebuildMode == StaticRebuildMode::ClasAndBlas &&

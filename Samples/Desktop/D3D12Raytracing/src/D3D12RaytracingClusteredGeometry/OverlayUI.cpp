@@ -1411,12 +1411,12 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawKeyLine(L"[ ]", kbuf);
     }
 
-    swprintf_s(kbuf, L"   ray bounces:      reflection %u   refraction %u",
-               ReflectionBounces(), RefractionBounces());
-    drawKeyLine(L", .", kbuf);
-
-    swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
-    drawKeyLine(L"[P]", kbuf);
+    // [B] BVH-build-flag preference -- applied uniformly to BOTH trad
+    // (DXR1) and cluster (DXR2) AS builds via BuildFlagModeRtas() /
+    // BuildFlagModeDxr1().  Toggling rebuilds the static AS once
+    // (unless per-frame static rebuild is already on).
+    swprintf_s(kbuf, L"   BVH build flag:   %s", BuildFlagModeName());
+    drawKeyLine(L"[B]", kbuf);
 
     // Workload-scaling [N] toggle.  Always shown so the user knows the
     // hotkey exists even when N=0.  Reports the count + breakdown
@@ -1450,12 +1450,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     }
     drawKeyLine(L"[N]", kbuf);
 
-    // [B] BVH-build-flag preference -- applied uniformly to BOTH trad
-    // (DXR1) and cluster (DXR2) AS builds via BuildFlagModeRtas() /
-    // BuildFlagModeDxr1().  Toggling rebuilds the static AS once
-    // (unless per-frame static rebuild is already on).
-    swprintf_s(kbuf, L"   BVH build flag:   %s", BuildFlagModeName());
-    drawKeyLine(L"[B]", kbuf);
+    swprintf_s(kbuf, L"   ray bounces:      reflection %u   refraction %u",
+               ReflectionBounces(), RefractionBounces());
+    drawKeyLine(L", .", kbuf);
+
+    // [space] pause toggle is the bottom of the key list -- biggest /
+    // most commonly-pressed control after the user has set up the
+    // rest of the configuration above.
+    swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
+    drawKeyLine(L"space", kbuf);
 
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.

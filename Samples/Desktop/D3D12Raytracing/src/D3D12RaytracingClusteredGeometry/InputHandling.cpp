@@ -215,7 +215,7 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
 void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
 {
     // ----- A/V/P primary toggles -----
-    if (key == 'P' || key == 'p')
+    if (key == VK_SPACE)
     {
         m_animPaused = !m_animPaused;
         SampleLog::LogF(L"[input] animation %s\n", m_animPaused ? L"PAUSED" : L"resumed");

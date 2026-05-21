@@ -764,6 +764,27 @@ void DeviceResources::InitializeAdapter(IDXGIAdapter1** ppAdapter)
         {
             m_adapterID = adapterID;
             m_adapterDescription = desc.Description;
+            // Stash adapter identity fields for the benchmark JSON / report
+            // header.  Driver UMDVersion comes from CheckInterfaceSupport;
+            // packed LARGE_INTEGER -> "A.B.C.D" canonical format Windows
+            // uses for the driver version everywhere else (dxdiag, Device
+            // Manager).  Failure -> empty string; caller uses adapter
+            // description alone in that case.
+            m_adapterVendorId            = desc.VendorId;
+            m_adapterDeviceId            = desc.DeviceId;
+            m_adapterDedicatedVideoMemory = desc.DedicatedVideoMemory;
+            LARGE_INTEGER umd = {};
+            if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+            {
+                wchar_t verBuf[64] = {};
+                swprintf_s(verBuf,
+                           L"%u.%u.%u.%u",
+                           (unsigned)HIWORD(umd.HighPart),
+                           (unsigned)LOWORD(umd.HighPart),
+                           (unsigned)HIWORD(umd.LowPart),
+                           (unsigned)LOWORD(umd.LowPart));
+                m_driverVersion = verBuf;
+            }
 #ifdef _DEBUG
             wchar_t buff[256] = {};
             swprintf_s(buff, L"Direct3D Adapter (%u): VID:%04X, PID:%04X - %ls\n", adapterID, desc.VendorId, desc.DeviceId, desc.Description);
@@ -792,6 +813,12 @@ void DeviceResources::InitializeAdapter(IDXGIAdapter1** ppAdapter)
         {
             m_adapterID          = 0;
             m_adapterDescription = warpDesc.Description;
+            m_adapterVendorId            = warpDesc.VendorId;
+            m_adapterDeviceId            = warpDesc.DeviceId;
+            m_adapterDedicatedVideoMemory = warpDesc.DedicatedVideoMemory;
+            // WARP doesn't surface a meaningful UMD version (always 0); leave
+            // m_driverVersion empty so the JSON reports "" and the report
+            // header gracefully shows "(WARP)" instead of "0.0.0.0".
         }
         else
         {

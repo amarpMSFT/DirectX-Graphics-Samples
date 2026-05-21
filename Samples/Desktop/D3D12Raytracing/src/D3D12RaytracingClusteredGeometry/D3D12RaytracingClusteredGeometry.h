@@ -282,6 +282,18 @@ private:
     UINT                                 m_logPfEveryFrames   = 0;
     UINT                                 m_logRawPfEveryFrames = 0;
     UINT                                 m_exitAfterFrames    = 0;
+    // Wall-clock benchmark mode: when m_benchSeconds > 0, the app waits for
+    // the first rendered frame post-init, then runs for m_benchSeconds
+    // wall-clock seconds, then writes a structured JSON snapshot to
+    // m_benchOutPath (adapter+driver+config+memory+timings+FPS) and posts
+    // WM_QUIT.  Wall-clock instead of frame-count because hardware FPS
+    // varies wildly across adapters (RTX 4090 ~120 fps vs WARP ~0.1 fps);
+    // a frame-count exit on slow adapters would either fire before init
+    // settled or take hours.  See WriteBenchmarkSnapshot().
+    double                               m_benchSeconds         = 0.0;
+    std::wstring                         m_benchOutPath;
+    std::chrono::steady_clock::time_point m_benchStartWallTime = std::chrono::steady_clock::time_point::min();
+    bool                                 m_benchSnapshotWritten = false;
     // Scheduled actions: each entry = (frame index, action key).  Action keys
     // are short strings matched in OnRender; supported = "alloc-implicit" /
     // "alloc-getsizes" / "alloc-compact" / "rebuild-none" / "rebuild-blas" /
@@ -1429,6 +1441,17 @@ private:
     // comment for the full mechanism.
     void StashOverlayStatsAsPrev();
     void RefreshOverlayStatsCurrent();
+    // Headless benchmark snapshot writer.  Serialises adapter+driver+config
+    // +memory+timings+FPS as a JSON object and writes it to m_benchOutPath.
+    // Called once, just before PostQuitMessage when m_benchSeconds has
+    // elapsed (or from --at <frame>:bench).  All numeric fields use
+    // canonical units (bytes for memory, microseconds for sub-ms timings,
+    // milliseconds for build-time totals, FPS as 1.0/secPerFrame).  Uses
+    // m_overlayStats as the source of truth so the JSON reports the same
+    // numbers the overlay would show -- no separate measurement path
+    // to drift out of sync.  Schema version field gates compatibility for
+    // the cross-machine comparison report.
+    void WriteBenchmarkSnapshot();
     void DumpClusterStatsAsync();
     void ReadBuildTimestamps();
     void CreateUIFont();

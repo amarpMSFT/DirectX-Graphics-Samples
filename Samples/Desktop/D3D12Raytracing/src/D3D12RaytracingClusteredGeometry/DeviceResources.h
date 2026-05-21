@@ -147,6 +147,16 @@ namespace DX
         unsigned int                GetDeviceOptions() const { return m_options; }
         LPCWSTR                     GetAdapterDescription() const { return m_adapterDescription.c_str(); }
         UINT                        GetAdapterID() const { return m_adapterID; }
+        // Adapter / driver identity captured during InitializeAdapter.  Used
+        // by the benchmark JSON dump so swept results can be tagged with the
+        // GPU + driver they ran on (essential for cross-machine comparisons).
+        // Driver version comes from IDXGIAdapter::CheckInterfaceSupport's
+        // UMDVersion (Windows User-Mode Driver), formatted as A.B.C.D.  Blank
+        // string if the query failed (e.g. WARP).
+        LPCWSTR                     GetDriverVersionString() const { return m_driverVersion.c_str(); }
+        UINT                        GetAdapterVendorId()   const { return m_adapterVendorId; }
+        UINT                        GetAdapterDeviceId()   const { return m_adapterDeviceId; }
+        UINT64                      GetDedicatedVideoMemoryBytes() const { return m_adapterDedicatedVideoMemory; }
 
         CD3DX12_CPU_DESCRIPTOR_HANDLE GetRenderTargetView() const
         {
@@ -169,6 +179,13 @@ namespace DX
         ComPtr<IDXGIAdapter1>                               m_adapter;
         UINT                                                m_adapterID;
         std::wstring                                        m_adapterDescription;
+        // Adapter / driver identity -- captured during InitializeAdapter
+        // (one-shot) and surfaced via Get* accessors for the benchmark
+        // JSON dump.  See header comment on GetDriverVersionString().
+        std::wstring                                        m_driverVersion;
+        UINT                                                m_adapterVendorId            = 0;
+        UINT                                                m_adapterDeviceId            = 0;
+        UINT64                                              m_adapterDedicatedVideoMemory = 0;
 
         // Direct3D objects.
         Microsoft::WRL::ComPtr<ID3D12Device>                m_d3dDevice;

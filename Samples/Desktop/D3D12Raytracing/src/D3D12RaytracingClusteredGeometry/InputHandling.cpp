@@ -149,6 +149,46 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             m_exitAfterFrames = (UINT)std::max(0, n);
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--extra-instances") == 0 && i + 1 < argc)
+        {
+            // [N] runtime toggle, set from CLI for headless / scripted runs.
+            // Accepts 0 / 100 / 1000 / 10000 (or 1k / 10k as a shorthand).
+            // Initial scene build picks up m_extraInstancesMode in BuildScene
+            // -> RegenerateWorkloadCloneInstances, so the clones are present
+            // from frame 1 -- no scheduled-action gymnastics needed.  This is
+            // distinct from --at <frame>:extra-NNN which fires AFTER init
+            // and incurs a per-frame stall.
+            const wchar_t* v = argv[i+1];
+            if      (_wcsicmp(v, L"0")     == 0)  m_extraInstancesMode = ExtraInstancesMode::None;
+            else if (_wcsicmp(v, L"100")   == 0)  m_extraInstancesMode = ExtraInstancesMode::Hundred;
+            else if (_wcsicmp(v, L"1000")  == 0 ||
+                     _wcsicmp(v, L"1k")    == 0)  m_extraInstancesMode = ExtraInstancesMode::Thousand;
+            else if (_wcsicmp(v, L"10000") == 0 ||
+                     _wcsicmp(v, L"10k")   == 0)  m_extraInstancesMode = ExtraInstancesMode::TenThousand;
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--bench-seconds") == 0 && i + 1 < argc)
+        {
+            // Wall-clock benchmark mode.  After init + first rendered frame,
+            // measure for N seconds, then write JSON to --bench-out and
+            // PostQuitMessage.  Wall-clock instead of frame count because
+            // FPS varies 1000x between HW (~120 fps) and WARP (~0.1 fps);
+            // a frame-count exit would either misfire on slow adapters or
+            // take hours.  Typical use: --bench-seconds 5 --bench-out result.json.
+            // The first ~2 s of the window naturally double as warmup
+            // (frame-time rolling avg + per-frame EMA need to settle before
+            // the snapshot reflects steady state).
+            m_benchSeconds = _wtof(argv[i+1]);
+            if (m_benchSeconds < 0.0) m_benchSeconds = 0.0;
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--bench-out") == 0 && i + 1 < argc)
+        {
+            // Output path for the benchmark JSON snapshot.  Required pairing
+            // with --bench-seconds; without it the snapshot is never written.
+            m_benchOutPath = argv[i+1];
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--at") == 0 && i + 1 < argc)
         {
             // Schedule an action to fire at a specific frame.  Format:

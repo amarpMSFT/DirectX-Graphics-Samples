@@ -28,6 +28,8 @@
 #include <chrono>
 #include <cmath>
 #include <random>
+#include <fstream>
+#include <sstream>
 
 using namespace std;
 using namespace DX;
@@ -254,6 +256,19 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     SampleLog::Write(L">>> CreateUIFont\n");
     CreateUIFont();
     SampleLog::Write(L">>> CreateDeviceDependentResources DONE\n");
+
+    // Apply --extra-instances <N>= 100/1k/10k from the CLI if it was set.
+    // BuildScene + BuildAccelerationStructures above don't read
+    // m_extraInstancesMode; the workload-clone path is wired through
+    // RebuildStaticAccelerationStructures which the [N] key calls.  Do
+    // the same one-shot here so headless / scripted runs honour the
+    // CLI flag without needing a scheduled [N] press.
+    if (m_extraInstancesMode != ExtraInstancesMode::None)
+    {
+        SampleLog::LogF(L">>> applying --extra-instances %ls (one-shot rebuild)\n",
+                        ExtraInstancesModeName());
+        RebuildStaticAccelerationStructures(L"--extra-instances startup");
+    }
 }
 
 void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
@@ -267,6 +282,11 @@ void D3D12RaytracingClusteredGeometry::QueryDXR2Support()
     device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5));
 
     SampleLog::LogF(L"\n[DXR2] adapter: %s\n", m_deviceResources->GetAdapterDescription());
+    SampleLog::LogF(L"  driver: %s   VID:%04X  PID:%04X   dedicatedVRAM: %.0f MB\n",
+                    *m_deviceResources->GetDriverVersionString() ? m_deviceResources->GetDriverVersionString() : L"(unknown)",
+                    m_deviceResources->GetAdapterVendorId(),
+                    m_deviceResources->GetAdapterDeviceId(),
+                    (double)m_deviceResources->GetDedicatedVideoMemoryBytes() / (1024.0 * 1024.0));
     SampleLog::LogF(L"  D3D12_RAYTRACING_TIER: 0x%X\n", (unsigned)opts5.RaytracingTier);
     SampleLog::LogF(L"  ClustersAndPTLASSupported: %s   (hr=0x%08X)\n",
                     m_clustersAndPtlasSupported ? L"YES" : L"NO", (unsigned)hr);
@@ -3507,6 +3527,13 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     SampleLog::LogF(L"[animated] cluster-path setup complete: BLAS at GVA 0x%llx, %u clusters per frame\n",
                     (unsigned long long)obj.blasGPUVA, obj.clusterCount);
 
+    // Setting enabled flag BEFORE the one-shot measure: the measure func has
+    // a defensive `if (!m_animatedObjectEnabled) return;` gate at its top.
+    // Pre-bug-fix this flag was set at the BOTTOM of BuildAnimatedObjectSetup,
+    // so the measure always early-returned and m_overlayStats.animatedPerFrame
+    // ClasActualBytes stayed at 0 in both overlay and benchmark JSON.
+    m_animatedObjectEnabled = true;
+
     // One-shot per-cluster CLAS size readback - runs synchronously, populates
     // m_overlayStats.animatedPerFrameClasActualBytes.  Costs ~1ms of extra
     // setup work per config change; zero per-frame cost.
@@ -5502,6 +5529,38 @@ void D3D12RaytracingClusteredGeometry::OnRender()
         PostQuitMessage(0);
         return;
     }
+    // Wall-clock benchmark mode: arm the start timestamp on first frame,
+    // then once m_benchSeconds has elapsed, write the JSON snapshot and
+    // quit.  Arming on frame 1 (not 0) skips the init-frame which can
+    // include AS-build amortisation in the wall-clock delta -- by frame 1
+    // OnRender has completed once and the steady-state path is active.
+    if (m_benchSeconds > 0.0)
+    {
+        // Arm on the first rendered frame (skips the init frame which can
+        // amortise AS-build work into the wall-clock delta).  Sentinel value
+        // for "not yet armed" is time_point::min() -- see header initialiser.
+        const bool armed = (m_benchStartWallTime != std::chrono::steady_clock::time_point::min());
+        if (!armed && m_framesRendered >= 1)
+        {
+            m_benchStartWallTime = std::chrono::steady_clock::now();
+            SampleLog::LogF(L"[bench] measurement window started: %.2f s wall-clock, out=%ls\n",
+                            m_benchSeconds,
+                            m_benchOutPath.empty() ? L"(no --bench-out; will skip JSON)" : m_benchOutPath.c_str());
+        }
+        else if (armed && !m_benchSnapshotWritten)
+        {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m_benchStartWallTime).count();
+            if (elapsed >= m_benchSeconds)
+            {
+                if (!m_benchOutPath.empty())
+                    WriteBenchmarkSnapshot();
+                m_benchSnapshotWritten = true;
+                PostQuitMessage(0);
+                return;
+            }
+        }
+    }
     // ----
 
     bool capture = false;
@@ -6092,3 +6151,312 @@ HRESULT D3D12RaytracingClusteredGeometry::SaveBGRAToPng(const std::wstring& path
     return cleanup(S_OK);
 }
 
+
+
+// =====================================================================================
+// WriteBenchmarkSnapshot
+//   Serialises the current overlay-snapshot state (adapter+driver+config+memory
+//   +timings+FPS) to m_benchOutPath as UTF-8 JSON.  Called once when the
+//   --bench-seconds window has elapsed, just before PostQuitMessage.
+//
+//   Design notes:
+//   * Reads exclusively from m_overlayStats (memory + per-frame timings),
+//     m_*BuildMs (static AS build times), and m_frameTimeRing (FPS).  No
+//     separate measurement path -- guarantees the JSON matches what the
+//     overlay would have shown at quit time, eliminating "the numbers in
+//     the report don't match what I saw on screen" debugging.
+//   * Mode fields use SHORT CLI-style tokens ("clusters", "fast-trace",
+//     "compact") not the verbose human-readable *Name() strings, so the
+//     JSON round-trips cleanly into config dicts the sweep driver script
+//     understands.
+//   * UTF-8 output -- wide strings converted via WideCharToMultiByte so
+//     adapter names with non-ASCII characters (TM, em-dash, vendor branding)
+//     survive serialisation.
+//   * No external JSON library -- this is a sample, not a service.  Manual
+//     std::ostringstream with hand-escaped strings is fine for ~50 well-
+//     known scalar fields; quote() handles \", \\, control chars.
+//   * Errors are logged via SampleLog and reported via exit code 1 from
+//     the wrapper script when the JSON is missing; the sample never throws.
+// =====================================================================================
+void D3D12RaytracingClusteredGeometry::WriteBenchmarkSnapshot()
+{
+    using std::chrono::system_clock;
+    using std::chrono::steady_clock;
+    using std::chrono::duration;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+
+    // Mode -> short CLI token.  Mirrors InputHandling.cpp's accepted args.
+    auto geomTok = [&]() -> const wchar_t* {
+        return m_geometryMode == GeometryMode::Clusters ? L"clusters" : L"traditional";
+    };
+    auto vtxTok = [&]() -> const wchar_t* {
+        return m_vertexMode == VertexMode::Compressed1 ? L"compressed" : L"float";
+    };
+    auto clasAllocTok = [&]() -> const wchar_t* {
+        switch (m_clasAllocMode) {
+            case ClasAllocMode::Implicit: return L"implicit";
+            case ClasAllocMode::GetSizes: return L"get-sizes";
+            case ClasAllocMode::Compact:  return L"compact";
+        }
+        return L"?";
+    };
+    auto tradAllocTok = [&]() -> const wchar_t* {
+        return m_traditionalAllocMode == TraditionalAllocMode::Compact ? L"compact" : L"implicit";
+    };
+    auto rebuildTok = [&]() -> const wchar_t* {
+        switch (m_staticRebuildMode) {
+            case StaticRebuildMode::None:        return L"none";
+            case StaticRebuildMode::BlasOnly:    return L"blas";
+            case StaticRebuildMode::ClasAndBlas: return L"clas-blas";
+        }
+        return L"?";
+    };
+    auto buildFlagTok = [&]() -> const wchar_t* {
+        switch (m_buildFlagMode) {
+            case BuildFlagMode::None:      return L"none";
+            case BuildFlagMode::FastBuild: return L"fast-build";
+            case BuildFlagMode::FastTrace: return L"fast-trace";
+        }
+        return L"?";
+    };
+    auto tradAnimTok = [&]() -> const wchar_t* {
+        return m_traditionalAnimMode == TraditionalAnimMode::Refit ? L"refit" : L"rebuild";
+    };
+    auto extraTok = [&]() -> int {
+        switch (m_extraInstancesMode) {
+            case ExtraInstancesMode::None:        return 0;
+            case ExtraInstancesMode::Hundred:     return 100;
+            case ExtraInstancesMode::Thousand:    return 1000;
+            case ExtraInstancesMode::TenThousand: return 10000;
+        }
+        return 0;
+    };
+
+    // wstring -> UTF-8 for JSON serialisation.
+    auto w2u = [](const wchar_t* w) -> std::string {
+        if (!w || !*w) return {};
+        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 1) return {};
+        std::string s(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), len, nullptr, nullptr);
+        return s;
+    };
+    // JSON string-escape: ", \, control chars (<0x20).  Handles ASCII fine;
+    // any non-ASCII byte from the UTF-8 input is passed through verbatim
+    // (modern JSON parsers accept UTF-8 in strings).
+    auto jq = [](const std::string& in) -> std::string {
+        std::string out; out.reserve(in.size() + 2);
+        out.push_back('"');
+        for (char c : in) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    if ((unsigned char)c < 0x20) {
+                        char buf[8]; sprintf_s(buf, "\\u%04X", (unsigned)(unsigned char)c);
+                        out += buf;
+                    } else {
+                        out.push_back(c);
+                    }
+            }
+        }
+        out.push_back('"');
+        return out;
+    };
+
+    // ISO 8601 timestamp (UTC).
+    auto tstamp = []() -> std::string {
+        auto now = system_clock::now();
+        auto t   = system_clock::to_time_t(now);
+        std::tm utc = {};
+        gmtime_s(&utc, &t);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &utc);
+        return buf;
+    };
+
+    // FPS / ms-per-frame: same derivation the overlay uses.  When the ring
+    // buffer hasn't filled (very-low-frame runs, or shutdown right after
+    // init), we report NaN-equivalent (0.0) and a frames_measured field so
+    // the caller can sanity-check.
+    const double secPerFrame = (m_frameTimeRingCount > 0)
+        ? (m_frameTimeRingSum / m_frameTimeRingCount) : 0.0;
+    const double fps         = (secPerFrame > 0.0) ? (1.0 / secPerFrame) : 0.0;
+    const double msPerFrame  = secPerFrame * 1000.0;
+
+    const double benchElapsed = (m_benchStartWallTime != steady_clock::time_point::min())
+        ? duration<double>(steady_clock::now() - m_benchStartWallTime).count()
+        : 0.0;
+
+    std::ostringstream o;
+    o.precision(6);
+    o << std::fixed;
+
+    auto kvStr = [&](const char* key, const std::string& val, bool last=false) {
+        o << "    \"" << key << "\": " << jq(val) << (last ? "\n" : ",\n");
+    };
+    auto kvD = [&](const char* key, double val, bool last=false) {
+        o << "    \"" << key << "\": " << val << (last ? "\n" : ",\n");
+    };
+    auto kvU = [&](const char* key, unsigned long long val, bool last=false) {
+        o << "    \"" << key << "\": " << val << (last ? "\n" : ",\n");
+    };
+    auto kvI = [&](const char* key, long long val, bool last=false) {
+        o << "    \"" << key << "\": " << val << (last ? "\n" : ",\n");
+    };
+    auto kvB = [&](const char* key, bool val, bool last=false) {
+        o << "    \"" << key << "\": " << (val ? "true" : "false") << (last ? "\n" : ",\n");
+    };
+
+    o << "{\n";
+    o << "  \"schema_version\": 1,\n";
+    o << "  \"timestamp\": " << jq(tstamp()) << ",\n";
+
+    o << "  \"adapter\": {\n";
+    kvStr("description",       w2u(m_deviceResources->GetAdapterDescription()));
+    kvStr("driver_version",    w2u(m_deviceResources->GetDriverVersionString()));
+    kvU  ("vendor_id",         m_deviceResources->GetAdapterVendorId());
+    kvU  ("device_id",         m_deviceResources->GetAdapterDeviceId());
+    kvU  ("dedicated_vram_bytes", m_deviceResources->GetDedicatedVideoMemoryBytes());
+    kvB  ("clusters_supported", m_clustersAndPtlasSupported, /*last=*/true);
+    o << "  },\n";
+
+    o << "  \"config\": {\n";
+    kvStr("geometry_mode",     w2u(geomTok()));
+    kvStr("vertex_format",     w2u(vtxTok()));
+    kvStr("clas_alloc",        w2u(clasAllocTok()));
+    kvStr("trad_alloc",        w2u(tradAllocTok()));
+    kvStr("static_rebuild",    w2u(rebuildTok()));
+    kvStr("build_flags",       w2u(buildFlagTok()));
+    kvStr("trad_anim_mode",    w2u(tradAnimTok()));
+    kvI  ("extra_instances",   (long long)extraTok());
+    kvU  ("position_truncate_bits",        m_positionTruncateBits);
+    kvU  ("compressed_bits_per_component", m_compressedBitsPerComponent);
+    kvU  ("aa_samples_per_pixel",          m_aaSamplesPerPixel);
+    kvD  ("cluster_tint",                  (double)m_clusterTint);
+    kvI  ("bounce_slider",                 (long long)m_bounceSlider);
+    kvU  ("reflection_bounces",            ReflectionBounces());
+    kvU  ("refraction_bounces",            RefractionBounces(), /*last=*/true);
+    o << "  },\n";
+
+    o << "  \"build_times_ms\": {\n";
+    kvD("static_clas", m_clasBuildMs);
+    kvD("static_blas", m_blasBuildMs);
+    kvD("tlas",        m_tlasBuildMs);
+    kvD("total",       m_totalBuildMs, /*last=*/true);
+    o << "  },\n";
+
+    o << "  \"frame_perf\": {\n";
+    kvD("fps",                  fps);
+    kvD("ms_per_frame",         msPerFrame);
+    kvU("frames_in_avg_window", m_frameTimeRingCount);
+    kvU("avg_window_size",      m_frameTimeWindow);
+    // Per-frame timing: use the EMA (alpha=0.1 ~ 10-sample smoothing) instead
+    // of m_overlayStats.pf*Ms.  The overlay-snap values require a full
+    // pfSnapTargetCount=60 sample window to populate, which at low FPS
+    // (e.g. n=1000 trad at 8 fps) takes 7.5 s -- longer than typical bench
+    // windows, so the snap values would read zero.  EMA is current after
+    // ~10 frames in any path.  pf_timing_valid still reflects whether the
+    // snap window completed, for callers that want the strict mean.
+    kvD("pf_instantiate_us",    m_pfInstantiateMs * 1000.0);
+    kvD("pf_blas_us",           m_pfBlasRebuildMs * 1000.0);
+    kvD("pf_tlas_us",           m_pfTlasRebuildMs * 1000.0);
+    kvD("pf_static_blas_us",    m_pfStaticBlasMs  * 1000.0);
+    kvD("pf_static_clas_us",    m_pfStaticClasMs  * 1000.0);
+    // Strict snap mean (over kPfSnapTargetCount samples).  May be 0 in
+    // short bench runs on slow scenes -- use the EMA values above for
+    // headline numbers; reserve these for high-precision cross-checks.
+    kvD("pf_instantiate_us_snap", m_overlayStats.pfInstantiateMs * 1000.0);
+    kvD("pf_blas_us_snap",        m_overlayStats.pfBlasRebuildMs * 1000.0);
+    kvD("pf_tlas_us_snap",        m_overlayStats.pfTlasRebuildMs * 1000.0);
+    kvB("pf_timing_valid",      m_overlayStats.pfTimingValid, /*last=*/true);
+    o << "  },\n";
+
+    // Total AS memory: shared field for cross-mode comparisons.  In cluster
+    // mode that's static CLAS actual + static BLAS + animated CLAS + animated
+    // BLAS + TLAS + clone pool.  In trad mode it's static traditional BLAS
+    // actual + animated trad BLAS + TLAS + clone pool.  Mode-specific fields
+    // are also exposed below so a wrapper can drill down.
+    UINT64 totalAsBytes = m_overlayStats.tlasBytes;
+    if (m_overlayStats.geometryMode == (int)GeometryMode::Clusters) {
+        totalAsBytes += m_overlayStats.staticClasActualBytes
+                      + m_overlayStats.staticBlasTotalBytes
+                      + m_overlayStats.animatedPerFrameClasActualBytes
+                      + m_overlayStats.animatedBlasBytes
+                      + m_overlayStats.animClonesBlasPoolBytes;
+    } else {
+        totalAsBytes += m_overlayStats.traditionalBlasActualBytes
+                      + m_overlayStats.animatedTradBlasBytes
+                      + m_overlayStats.animClonesTradBlasPoolBytes;
+    }
+
+    o << "  \"memory_bytes\": {\n";
+    kvU("total_as",                       totalAsBytes);
+    kvU("tlas",                           m_overlayStats.tlasBytes);
+    // Cluster path
+    kvU("static_clas_alloc",              m_overlayStats.staticClasAllocBytes);
+    kvU("static_clas_actual",             m_overlayStats.staticClasActualBytes);
+    kvU("static_clas_scratch",            m_overlayStats.staticClasScratchBytes);
+    kvU("static_blas_total",              m_overlayStats.staticBlasTotalBytes);
+    kvU("static_blas_scratch",            m_overlayStats.staticBlasScratchBytes);
+    kvU("static_cluster_input",           m_overlayStats.staticClusterInputBytes);
+    // Trad path
+    kvU("traditional_blas_total",         m_overlayStats.traditionalBlasTotalBytes);
+    kvU("traditional_blas_actual",        m_overlayStats.traditionalBlasActualBytes);
+    kvU("traditional_blas_scratch",       m_overlayStats.traditionalBlasScratchBytes);
+    kvU("traditional_vb",                 m_overlayStats.traditionalVbBytes);
+    kvU("traditional_ib",                 m_overlayStats.traditionalIbBytes);
+    // Animated (cluster)
+    kvU("animated_template",              m_overlayStats.animatedTemplateBytes);
+    kvU("animated_template_scratch",      m_overlayStats.animatedTemplateScratchBytes);
+    kvU("animated_template_input",        m_overlayStats.animatedTemplateInputBytes);
+    kvU("animated_rest_positions",        m_overlayStats.animatedRestPositionsBytes);
+    kvU("animated_pf_clas_alloc",         m_overlayStats.animatedPerFrameClasAllocBytes);
+    kvU("animated_pf_clas_actual",        m_overlayStats.animatedPerFrameClasActualBytes);
+    kvU("animated_pf_clas_scratch",       m_overlayStats.animatedPerFrameClasScratchBytes);
+    kvU("animated_blas",                  m_overlayStats.animatedBlasBytes);
+    kvU("animated_blas_scratch",          m_overlayStats.animatedBlasScratchBytes);
+    // Animated (trad)
+    kvU("animated_trad_blas",             m_overlayStats.animatedTradBlasBytes);
+    kvU("animated_trad_scratch",          m_overlayStats.animatedTradScratchBytes);
+    kvU("animated_trad_ib",               m_overlayStats.animatedTradIbBytes);
+    // Clone pools (animated clones get their own per-frame-rebuilt BLAS)
+    kvU("anim_clones_blas_pool",          m_overlayStats.animClonesBlasPoolBytes);
+    kvU("anim_clones_blas_scratch",       m_overlayStats.animClonesBlasScratchBytes);
+    kvU("anim_clones_trad_blas_pool",     m_overlayStats.animClonesTradBlasPoolBytes);
+    kvU("anim_clones_trad_blas_scratch",  m_overlayStats.animClonesTradBlasScratchBytes, /*last=*/true);
+    o << "  },\n";
+
+    o << "  \"scene\": {\n";
+    kvU("total_clusters",       m_overlayStats.totalClusterCount);
+    kvU("total_triangles",      m_overlayStats.totalTriangleCount);
+    kvU("anim_clones_pooled",   m_overlayStats.animClonesPooledCount, /*last=*/true);
+    o << "  },\n";
+
+    o << "  \"bench\": {\n";
+    kvD("requested_seconds",  m_benchSeconds);
+    kvD("actual_seconds",     benchElapsed);
+    kvU("frames_rendered",    m_framesRendered, /*last=*/true);
+    o << "  }\n";
+    o << "}\n";
+
+    // Write UTF-8.  std::ofstream on Windows accepts a wide path through the
+    // non-standard but universally available overload taking const wchar_t*.
+    std::ofstream out(m_benchOutPath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out)
+    {
+        SampleLog::LogF(L"[bench] FAILED to open %ls for write\n", m_benchOutPath.c_str());
+        return;
+    }
+    const std::string s = o.str();
+    out.write(s.data(), (std::streamsize)s.size());
+    out.close();
+    SampleLog::LogF(L"[bench] snapshot written: %ls  (%zu bytes)\n",
+                    m_benchOutPath.c_str(), s.size());
+}

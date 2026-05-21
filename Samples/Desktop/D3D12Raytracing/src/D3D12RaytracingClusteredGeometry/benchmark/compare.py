@@ -281,14 +281,27 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
                       key=lambda s: int(s.rsplit("-", 1)[1]))
     cb_xs = [(s, int(s.rsplit("-", 1)[1])) for s in cb_slugs]
     if len(cb_xs) >= 3:
-        defs.append(ChartDef(
-            title="COMPRESSED1 precision: CLAS bytes vs bits/component",
-            category="Precision (COMPRESSED1)",
-            description="Bytes saved as bits/component decreases. Lower bits = more compression but more precision loss.",
-            chart_type="line", x_label="Bits / component (higher = more precision)", y_label="CLAS bytes",
-            x_scale="linear", x_keys=cb_xs, metric_path=("memory_bytes", "static_clas_actual"),
-            value_formatter=fmt_bytes,
-        ))
+        # Three apples-to-apples bytes series per machine.  Each machine gets
+        # its consistent color, but with three line styles to distinguish the
+        # series.  Chart.js doesn't natively distinguish series-within-machine
+        # by style in our existing setup -- so we emit them as 3 SEPARATE
+        # charts (one per pool), each with one curve per machine.  Reader
+        # visually compares within-machine by reading down the three charts.
+        for pool_label, metric in [
+            ("static clusters",  ("memory_bytes", "static_clas_actual")),
+            ("templates",        ("memory_bytes", "animated_template")),
+            ("per-frame CLAS",   ("memory_bytes", "animated_pf_clas_actual")),
+        ]:
+            defs.append(ChartDef(
+                title=f"COMPRESSED1 precision: {pool_label} bytes vs bits/component",
+                category="Precision (COMPRESSED1)",
+                description=(f"{pool_label}: per-machine curve as bits/component varies.  "
+                             f"Three pools on three charts -- read down to compare static/templates/"
+                             f"per-frame within one machine; read across to compare machines."),
+                chart_type="line", x_label="Bits / component (higher = more precision)",
+                y_label="Bytes", x_scale="linear", x_keys=cb_xs,
+                metric_path=metric, value_formatter=fmt_bytes,
+            ))
         defs.append(ChartDef(
             title="COMPRESSED1 precision: INSTANTIATE µs vs bits/component",
             category="Precision (COMPRESSED1)",
@@ -308,24 +321,26 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
 
     # --- Precision sweeps: FLOAT32_3 truncate bits -----------------------
     # X axis = "bits KEPT" = 23 - bits_truncated.  Left-to-right = INCREASING
-    # precision (same direction as COMPRESSED1 chart).  Use a custom x_key
-    # tuple instead of the slug-int parse because the slug encodes the truncate
-    # number, not the kept number.
+    # precision (same direction as COMPRESSED1 chart).
     tr_slugs = sorted([s for s in all_slugs if s.startswith("trunc-")],
                       key=lambda s: int(s.rsplit("-", 1)[1]))
-    # x_value is bits_kept = 23 - truncated_bits
     tr_xs = [(s, 23 - int(s.rsplit("-", 1)[1])) for s in tr_slugs]
-    # Sort by bits_kept ascending so the line goes left-to-right by precision
     tr_xs.sort(key=lambda t: t[1])
     if len(tr_xs) >= 3:
-        defs.append(ChartDef(
-            title="FLOAT32_3 precision: CLAS bytes vs bits kept",
-            category="Precision (FLOAT32_3)",
-            description="X axis = mantissa bits kept (= 23 - --position-truncate N). Lower precision (left) = smaller CLAS.",
-            chart_type="line", x_label="Bits kept (higher = more precision)", y_label="CLAS bytes",
-            x_scale="linear", x_keys=tr_xs, metric_path=("memory_bytes", "static_clas_actual"),
-            value_formatter=fmt_bytes,
-        ))
+        for pool_label, metric in [
+            ("static clusters",  ("memory_bytes", "static_clas_actual")),
+            ("templates",        ("memory_bytes", "animated_template")),
+            ("per-frame CLAS",   ("memory_bytes", "animated_pf_clas_actual")),
+        ]:
+            defs.append(ChartDef(
+                title=f"FLOAT32_3 precision: {pool_label} bytes vs bits kept",
+                category="Precision (FLOAT32_3)",
+                description=(f"{pool_label}: per-machine curve as bits_kept varies "
+                             f"(= 23 - --position-truncate N)."),
+                chart_type="line", x_label="Bits kept (higher = more precision)",
+                y_label="Bytes", x_scale="linear", x_keys=tr_xs,
+                metric_path=metric, value_formatter=fmt_bytes,
+            ))
         defs.append(ChartDef(
             title="FLOAT32_3 precision: INSTANTIATE µs vs bits kept",
             category="Precision (FLOAT32_3)",

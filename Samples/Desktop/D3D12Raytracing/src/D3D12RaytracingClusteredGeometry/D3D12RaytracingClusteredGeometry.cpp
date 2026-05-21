@@ -6436,6 +6436,13 @@ void D3D12RaytracingClusteredGeometry::WriteBenchmarkSnapshot()
     o << "  \"scene\": {\n";
     kvU("total_clusters",       m_overlayStats.totalClusterCount);
     kvU("total_triangles",      m_overlayStats.totalTriangleCount);
+    // Animated mesh cluster + triangle counts (independent of the static scene
+    // cluster count above).  Useful for bytes-per-cluster math when comparing
+    // static vs animated CLAS sizes -- the animated sphere is meshed differently
+    // (envelope-padded for animation) so direct CLAS-bytes comparisons need
+    // normalisation by the cluster counts.
+    kvU("animated_clusters",    m_animatedObjectEnabled ? m_animatedObject.clusterCount : 0u);
+    kvU("animated_triangles",   m_animatedObjectEnabled ? m_animatedObject.mesh.totalTriangles : 0u);
     kvU("anim_clones_pooled",   m_overlayStats.animClonesPooledCount, /*last=*/true);
     o << "  },\n";
 

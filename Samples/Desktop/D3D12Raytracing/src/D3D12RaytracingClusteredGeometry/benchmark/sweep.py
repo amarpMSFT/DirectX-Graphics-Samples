@@ -663,39 +663,89 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     prec_float_filter = {k: v for k, v in base_default.items() if k != "position_truncate_bits"}
     prec_float_filter["vertex_format"] = "float"
     prec_float_filter["compressed_bits"] = None
-    pts_mem = []
-    pts_inst = []
-    pts_fps  = []
+    runs_prec_f = []
     for r in match(prec_float_filter):
-        b = r.config.position_truncate_bits
-        if b is None:
+        if r.config.position_truncate_bits is None:
             continue
-        bits_kept = 23 - b
-        pts_mem.append((bits_kept, _g(r.data,"memory_bytes","static_clas_actual",default=0),
-                        f"{fmt_bytes(_g(r.data,'memory_bytes','static_clas_actual',default=0))}  (truncate={b}, kept={bits_kept})"))
-        pts_inst.append((bits_kept, _g(r.data,"frame_perf","pf_instantiate_us",default=0),
-                        f"{fmt_us(_g(r.data,'frame_perf','pf_instantiate_us',default=0))}  (truncate={b})"))
-        pts_fps.append((bits_kept,  _g(r.data,"frame_perf","fps",default=0),
-                        f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps  (truncate={b})"))
-    if pts_mem:
-        for chart_title, y_lab, lab, pts, ylog in [
-            ("FLOAT32_3 precision sweep: CLAS bytes",          "CLAS bytes",        "CLAS bytes",        pts_mem,  False),
-            ("FLOAT32_3 precision sweep: INSTANTIATE time",    "INSTANTIATE (µs)", "INSTANTIATE (µs)", pts_inst, False),
-            ("FLOAT32_3 precision sweep: FPS",                  "FPS",               "FPS",               pts_fps,  False),
-        ]:
-            c = Chart(
-                title=chart_title,
-                category="Precision (FLOAT32_3)",
-                description=("X axis = position-mantissa bits KEPT (= 23 - --position-truncate N).  "
-                             "Higher = more precision.  Same reading direction as the COMPRESSED1 "
-                             "chart below: left = lower precision, right = higher.  Extreme low "
-                             "values may collapse geometry; FPS spikes at the left can mean rays "
-                             "miss everything."),
-                chart_type="line", x_label="Bits kept (higher = more precision)",
-                y_label=y_lab, y_is_log=ylog,
-            )
-            c.series[lab] = sorted(pts)
-            charts.append(c)
+        runs_prec_f.append(r)
+    if runs_prec_f:
+        # --- Cluster bytes chart: 3 lines ----------------------------------
+        # static_clas_actual    : the 8 static scene objects' CLAS, built once
+        # animated_template     : the animated sphere's cluster TEMPLATES (rest-pose
+        #                         topology), built once at setup
+        # animated_pf_clas_actual: the per-frame INSTANTIATE output (ephemeral)
+        # All three are CLAS-storage in bytes -- apples-to-apples y axis.  Showing
+        # all three lets the user see which pool each precision knob actually moves
+        # (FLOAT32_3: static + per-frame both move; templates flat.  COMPRESSED1:
+        #  static moves, templates + per-frame both flat).
+        c = Chart(
+            title="FLOAT32_3 precision: cluster bytes -- static clusters vs templates",
+            category="Precision (FLOAT32_3)",
+            description=("Three CLAS-storage pools at the default scene, all in bytes "
+                         "(apples-to-apples).  'static clusters' = the 8 static scene "
+                         "objects' CLAS (built once at init).  'templates' = the "
+                         "animated sphere's cluster TEMPLATES (rest-pose topology, "
+                         "built once at setup).  'per-frame CLAS' = the per-frame "
+                         "INSTANTIATE output for the animated sphere (rebuilt every "
+                         "frame).  X axis = position-mantissa bits KEPT "
+                         "(= 23 - --position-truncate N).  Higher = more precision.  "
+                         "Same direction as the COMPRESSED1 chart below."),
+            chart_type="line", x_label="Bits kept (higher = more precision)",
+            y_label="Bytes",
+        )
+        pts_static, pts_tmpl, pts_pf = [], [], []
+        for r in runs_prec_f:
+            b = r.config.position_truncate_bits
+            bits_kept = 23 - b
+            ys  = _g(r.data,"memory_bytes","static_clas_actual",default=0)
+            yt  = _g(r.data,"memory_bytes","animated_template",default=0)
+            ypf = _g(r.data,"memory_bytes","animated_pf_clas_actual",default=0)
+            pts_static.append((bits_kept, ys,  f"{fmt_bytes(ys)}  (truncate={b}, kept={bits_kept})"))
+            pts_tmpl.append((bits_kept,   yt,  f"{fmt_bytes(yt)}  (truncate={b}, kept={bits_kept})"))
+            pts_pf.append((bits_kept,     ypf, f"{fmt_bytes(ypf)}  (truncate={b}, kept={bits_kept})"))
+        c.series["static clusters"] = sorted(pts_static)
+        c.series["templates"]       = sorted(pts_tmpl)
+        c.series["per-frame CLAS"]  = sorted(pts_pf)
+        charts.append(c)
+
+        # --- INSTANTIATE time chart (animated-only metric) -----------------
+        c = Chart(
+            title="FLOAT32_3 precision: per-frame INSTANTIATE time (templates)",
+            category="Precision (FLOAT32_3)",
+            description=("GPU microseconds spent each frame in INSTANTIATE_CLUSTER_TEMPLATES "
+                         "for the animated sphere.  Cluster templates are decoded + per-frame "
+                         "vertex positions written; precision affects encoding cost.  Animated-"
+                         "only metric -- the static path runs INSTANTIATE once at init, not "
+                         "per frame."),
+            chart_type="line", x_label="Bits kept (higher = more precision)",
+            y_label="INSTANTIATE (µs)",
+        )
+        pts = []
+        for r in runs_prec_f:
+            b = r.config.position_truncate_bits
+            bits_kept = 23 - b
+            y = _g(r.data,"frame_perf","pf_instantiate_us",default=0)
+            pts.append((bits_kept, y, f"{fmt_us(y)}  (truncate={b})"))
+        c.series["templates"] = sorted(pts)
+        charts.append(c)
+
+        # --- FPS chart -----------------------------------------------------
+        c = Chart(
+            title="FLOAT32_3 precision: FPS",
+            category="Precision (FLOAT32_3)",
+            description=("Scene-wide FPS as precision varies.  Extreme low precision "
+                         "can collapse geometry and cause rays to miss -- FPS spikes "
+                         "are NOT perf wins, they're rendering failures."),
+            chart_type="line", x_label="Bits kept (higher = more precision)", y_label="FPS",
+        )
+        pts = []
+        for r in runs_prec_f:
+            b = r.config.position_truncate_bits
+            bits_kept = 23 - b
+            y = _g(r.data,"frame_perf","fps",default=0)
+            pts.append((bits_kept, y, f"{y:.1f} fps  (truncate={b})"))
+        c.series["FPS"] = sorted(pts)
+        charts.append(c)
 
     # =========================================================================
     # CATEGORY: Precision sweep (COMPRESSED1 bits/component)
@@ -703,35 +753,75 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     prec_cmp_filter = {k: v for k, v in base_default.items() if k != "compressed_bits"}
     prec_cmp_filter["vertex_format"] = "compressed"
     prec_cmp_filter["position_truncate_bits"] = None
-    pts_mem = []; pts_inst = []; pts_fps = []
+    runs_prec_c = []
     for r in match(prec_cmp_filter):
-        b = r.config.compressed_bits
-        if b is None:
+        if r.config.compressed_bits is None:
             continue
-        pts_mem.append((b, _g(r.data,"memory_bytes","static_clas_actual",default=0),
-                        f"{fmt_bytes(_g(r.data,'memory_bytes','static_clas_actual',default=0))}  (cb={b})"))
-        pts_inst.append((b, _g(r.data,"frame_perf","pf_instantiate_us",default=0),
-                        f"{fmt_us(_g(r.data,'frame_perf','pf_instantiate_us',default=0))}  (cb={b})"))
-        pts_fps.append((b, _g(r.data,"frame_perf","fps",default=0),
-                        f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps  (cb={b})"))
-    if pts_mem:
-        for chart_title, y_lab, lab, pts in [
-            ("COMPRESSED1 precision sweep: CLAS bytes",       "CLAS bytes",        "CLAS bytes",        pts_mem),
-            ("COMPRESSED1 precision sweep: INSTANTIATE time", "INSTANTIATE (µs)", "INSTANTIATE (µs)", pts_inst),
-            ("COMPRESSED1 precision sweep: FPS",              "FPS",               "FPS",               pts_fps),
-        ]:
-            c = Chart(
-                title=chart_title,
-                category="Precision (COMPRESSED1)",
-                description=("X axis = --compressed-bits N (bits/component for the COMPRESSED1 "
-                             "shared-exponent quantizer; valid 1..16).  Higher = more precision.  "
-                             "Same reading direction as the FLOAT32_3 chart above.  Very low "
-                             "values (<4) collapse geometry; FPS spikes can mean rays miss."),
-                chart_type="line", x_label="Bits / component (higher = more precision)",
-                y_label=y_lab,
-            )
-            c.series[lab] = sorted(pts)
-            charts.append(c)
+        runs_prec_c.append(r)
+    if runs_prec_c:
+        # --- Cluster bytes chart: 3 lines (static + templates + per-frame CLAS) ---
+        c = Chart(
+            title="COMPRESSED1 precision: cluster bytes -- static clusters vs templates",
+            category="Precision (COMPRESSED1)",
+            description=("Three CLAS-storage pools at the default scene, all in bytes "
+                         "(apples-to-apples).  'static clusters' = the 8 static scene "
+                         "objects' CLAS.  'templates' = the animated sphere's cluster "
+                         "TEMPLATES (rest-pose topology).  'per-frame CLAS' = the per-frame "
+                         "INSTANTIATE output for the animated sphere.  X axis = "
+                         "--compressed-bits N (bits/component for the COMPRESSED1 "
+                         "shared-exponent quantizer; valid 1..16).  Higher = more precision.  "
+                         "Same direction as the FLOAT32_3 chart above."),
+            chart_type="line", x_label="Bits / component (higher = more precision)",
+            y_label="Bytes",
+        )
+        pts_static, pts_tmpl, pts_pf = [], [], []
+        for r in runs_prec_c:
+            b = r.config.compressed_bits
+            ys  = _g(r.data,"memory_bytes","static_clas_actual",default=0)
+            yt  = _g(r.data,"memory_bytes","animated_template",default=0)
+            ypf = _g(r.data,"memory_bytes","animated_pf_clas_actual",default=0)
+            pts_static.append((b, ys,  f"{fmt_bytes(ys)}  (cb={b})"))
+            pts_tmpl.append((b,   yt,  f"{fmt_bytes(yt)}  (cb={b})"))
+            pts_pf.append((b,     ypf, f"{fmt_bytes(ypf)}  (cb={b})"))
+        c.series["static clusters"] = sorted(pts_static)
+        c.series["templates"]       = sorted(pts_tmpl)
+        c.series["per-frame CLAS"]  = sorted(pts_pf)
+        charts.append(c)
+
+        # --- INSTANTIATE time chart (animated-only) ---
+        c = Chart(
+            title="COMPRESSED1 precision: per-frame INSTANTIATE time (templates)",
+            category="Precision (COMPRESSED1)",
+            description=("GPU microseconds spent each frame INSTANTIATEing the animated "
+                         "sphere's cluster templates.  Animated-only metric."),
+            chart_type="line", x_label="Bits / component (higher = more precision)",
+            y_label="INSTANTIATE (µs)",
+        )
+        pts = []
+        for r in runs_prec_c:
+            b = r.config.compressed_bits
+            y = _g(r.data,"frame_perf","pf_instantiate_us",default=0)
+            pts.append((b, y, f"{fmt_us(y)}  (cb={b})"))
+        c.series["templates"] = sorted(pts)
+        charts.append(c)
+
+        # --- FPS chart ---
+        c = Chart(
+            title="COMPRESSED1 precision: FPS",
+            category="Precision (COMPRESSED1)",
+            description=("Scene-wide FPS as precision varies.  Very low values (<4) can "
+                         "collapse geometry; FPS spikes there are rendering failures, "
+                         "not perf wins."),
+            chart_type="line", x_label="Bits / component (higher = more precision)",
+            y_label="FPS",
+        )
+        pts = []
+        for r in runs_prec_c:
+            b = r.config.compressed_bits
+            y = _g(r.data,"frame_perf","fps",default=0)
+            pts.append((b, y, f"{y:.1f} fps  (cb={b})"))
+        c.series["FPS"] = sorted(pts)
+        charts.append(c)
 
     return charts
 
@@ -1053,10 +1143,13 @@ def main(argv: list[str]) -> int:
 
     if args.no_run:
         # Reuse: load any prior JSONs that match matrix slugs from the most
-        # recent results dir
+        # recent NON-EMPTY results dir.  (Earlier --no-run attempts can leave
+        # empty placeholder dirs behind; skip them so we don't accidentally
+        # report "missing JSON" against a stub.)
         existing_root_candidates = sorted(results_root.glob("*/*/"), reverse=True)
+        existing_root_candidates = [d for d in existing_root_candidates if list(d.glob("*.json"))]
         if not existing_root_candidates:
-            print("ERROR: --no-run but no existing results", file=sys.stderr)
+            print("ERROR: --no-run but no non-empty existing results dirs", file=sys.stderr)
             return 2
         base = existing_root_candidates[0]
         print(f"reusing JSONs from {base}")

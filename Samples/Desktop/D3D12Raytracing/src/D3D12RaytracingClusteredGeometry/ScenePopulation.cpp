@@ -264,13 +264,31 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // Reset the animated-clones list before refilling.
     m_animatedClones.clear();
 
-    // Compute the floor footprint so clones start just outside it.
-    // Floor is the last source object (slab at instanceID=6) with
-    // slabHalfSizeU = 3.5.  We don't know which source is the floor at
-    // this point without an explicit lookup, so just hardcode a
-    // generous inner radius matching the 3.5 floor used in SceneData.
+    // Inner-radius placement of the spiral.
+    //
+    // FLOOR-INTERSECTION FIX: the floor is a square slab with
+    // slabHalfSize=3.5, thickness 0.28, worldPos y=-0.7 -- footprint
+    // covers x,z in [-3.5..+3.5] (corner radius sqrt(3.5²+3.5²) =
+    // 4.95) with top y at -0.56 and bottom at -0.84.  Push kInnerRadius
+    // PAST the floor's corner diagonal so spiral clones never sit
+    // inside the floor footprint, AND lift the height curve's
+    // kInnerY so the LOWEST-y clone (innermost) has its mesh BOTTOM
+    // above the floor TOP at every random scale value.
+    //
+    // Min clone bottom = kInnerY - maxRadius*maxScale.  With max
+    // scale 0.7 and unit-sphere base (radius 1.0) wave envelope 1.3,
+    // worst-case mesh radius = 1.3 * 0.7 = 0.91, so clone bottom =
+    // kInnerY - 0.91.  Want > floor top (-0.56) so kInnerY > 0.35.
+    // kInnerY = 1.0 gives 0.65 margin above floor.
     const float kFloorHalf      = 3.5f;
-    const float kInnerRadius    = kFloorHalf + 1.0f;  // 1 unit margin outside the floor
+    // Margin past the floor's corner (sqrt(3.5²+3.5²) = 4.95) so even
+    // jittered positions stay clear.  5.5 leaves ~0.55 unit clearance.
+    const float kInnerRadius    = 5.5f;
+    // Radial spacing -- area per clone slot.  Tight (1.0) per earlier
+    // user feedback "near objects should be more closely packed", but
+    // see below for scale clamp that keeps adjacent clones non-overlapping
+    // at this spacing.
+    (void)kFloorHalf;
     // Radial spacing widens at higher tiers (where distance LOD is
     // active) so the lower-detail outer clones land at LARGER world
     // distances -- the smaller pixel footprint hides the LOD's
@@ -290,9 +308,11 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     // annulus area drops from ~7 sq units to ~3 sq units, doubling
     // density everywhere.
     const float kRadialSpacing  = 1.0f;
-    // Jitter scale per-clone to break the visible Vogel-spiral arms
-    // (user feedback "can see curves of empty space radiating out").
-    const float kSpiralJitterFrac = 0.30f;  // applied as ±0.5 * frac scale
+    // Per-clone position jitter -- bumps clones off the exact Vogel arms
+    // so the spiral doesn't read as visible curves of empty space.
+    // CONSERVATIVE 0.15 (was 0.30) so jittered positions stay > diameter
+    // apart for the reduced max-scale range below.
+    const float kSpiralJitterFrac = 0.15f;
     // Height curve: HYBRID sqrt + linear in (radius - innerRadius).
     // Pure-linear had near-flat per-clone dy in the first ~100
     // (constant-density Vogel packs them close together in radius;
@@ -317,7 +337,11 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     //     i=100:  y ~= +0.74
     //     i=1K:   y ~= +5.24
     //     i=10K:  y ~= +17.7
-    const float kInnerY          = -1.50f;
+    // y curve: bumped from -1.5 to +1.0 to lift inner clones ABOVE the
+    // floor top (floor top at y=-0.56, clone max bottom = kInnerY -
+    // 0.91 with max scale 0.7 + unit sphere mesh + 1.3 wave envelope =
+    // 0.09 with kInnerY=1.0 -- 0.65 margin above floor top).
+    const float kInnerY          =  1.00f;
     const float kHeightSqrtMul   =  0.50f;
     const float kHeightLinearMul =  0.15f;
     const float kGoldenAngleRad = 2.39996323f;        // golden angle in radians
@@ -356,7 +380,13 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
     constexpr UINT kCloneRngBaseSeed = 0xC10E5EEDu;
     std::uniform_int_distribution<UINT> matSlotDist(0u, (UINT)m_materials.size() - 1u);
     std::uniform_real_distribution<float> rotDist(0.0f, 6.2831853f);
-    std::uniform_real_distribution<float> scaleDist(0.6f, 1.4f);
+    // Per-clone random scale.  Range tuned so that even the LARGEST
+    // clone (max scale 0.7 × unit-sphere base × 1.3 wave envelope =
+    // 0.91 effective radius) fits comfortably within the spiral's
+    // ~1.0-unit radial spacing -- no inter-clone intersections at
+    // jittered Vogel positions.  Was 0.6..1.4 which routinely
+    // overlapped neighbours at the inner spiral radii.
+    std::uniform_real_distribution<float> scaleDist(0.40f, 0.70f);
 
     m_objects.reserve(m_sourceObjectCount + N_extra);
     for (UINT i = 0; i < N_extra; ++i)

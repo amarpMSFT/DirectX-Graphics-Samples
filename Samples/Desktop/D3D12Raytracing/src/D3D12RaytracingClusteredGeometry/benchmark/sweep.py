@@ -584,37 +584,62 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                         extra_instances=0, position_truncate_bits=None,
                         compressed_bits=None, aa_samples=None, trad_alloc="compact")
 
-    # Vertex format effect at default scene size: bar chart of static CLAS bytes + INSTANTIATE us.
     cm_runs = match({**base_default, "vertex_format": "float"})
     c1_runs = match({**base_default, "vertex_format": "compressed"})
     if cm_runs and c1_runs:
         cm = cm_runs[0]
         c1 = c1_runs[0]
+        # Split into THREE separate single-unit charts (was one chart with
+        # bytes + µs + FPS on the same y-axis -- unreadable, values spanned
+        # 5 orders of magnitude).
+        #
+        # Chart 1: bytes (multi-series OK, all same unit)
         c = Chart(
-            title="Vertex format: FLOAT32_3 vs COMPRESSED1 (default scene)",
+            title="Vertex format: storage bytes (default scene)",
             category="Vertex format",
-            description=("Bar chart contrasting key metrics between the two "
-                         "cluster vertex formats at the default scene (no clones).  "
-                         "COMPRESSED1 typically saves ~3x on CLAS bytes and "
-                         "cluster-input bytes at the cost of small INSTANTIATE "
-                         "overhead and slight precision loss.  Lower bars = better "
-                         "memory; higher bars on the FPS panel = better perf."),
-            chart_type="bar", x_label="Metric", y_label="Value",
+            description=("FLOAT32_3 vs COMPRESSED1 storage at the default scene.  "
+                         "All series in bytes (apples-to-apples).  CLAS = cluster "
+                         "leaf arrays (the BVH input).  Cluster VB+IB = source "
+                         "vertex + index buffer the cluster build reads from "
+                         "(analogous to traditional VB+IB).  BLAS = BLAS-from-CLAS "
+                         "output.  Total AS = sum of all AS-related buckets."),
+            chart_type="bar", x_label="Vertex format", y_label="Bytes",
         )
-        metrics = [
-            ("CLAS bytes",        "memory_bytes.static_clas_actual"),
-            ("Cluster input B",   "memory_bytes.static_cluster_input"),
-            ("BLAS bytes",        "memory_bytes.static_blas_total"),
-            ("Total AS bytes",    "memory_bytes.total_as"),
-            ("INSTANTIATE µs",    "frame_perf.pf_instantiate_us"),
-            ("FPS",               "frame_perf.fps"),
-        ]
         for label, run in (("FLOAT32_3", cm), ("COMPRESSED1", c1)):
             pts = []
-            for name, path in metrics:
+            for name, path in [
+                ("CLAS",                  "memory_bytes.static_clas_actual"),
+                ("Cluster VB+IB",         "memory_bytes.static_cluster_input"),
+                ("BLAS",                  "memory_bytes.static_blas_total"),
+                ("Total AS",              "memory_bytes.total_as"),
+            ]:
                 v = _g(run.data, *path.split("."), default=0)
-                pts.append((name, v, f"{name}: {v:,.2f}"))
+                pts.append((name, v, f"{label} {name}: {fmt_bytes(v)}"))
             c.series[label] = pts
+        charts.append(c)
+        # Chart 2: per-frame INSTANTIATE time (µs).
+        c = Chart(
+            title="Vertex format: per-frame INSTANTIATE time (default scene)",
+            category="Vertex format",
+            description=("Per-frame INSTANTIATE_CLUSTER_TEMPLATES microseconds.  "
+                         "COMPRESSED1 may add small overhead from per-frame "
+                         "quantizer decode."),
+            chart_type="bar", x_label="Vertex format", y_label="INSTANTIATE (µs)",
+        )
+        for label, run in (("FLOAT32_3", cm), ("COMPRESSED1", c1)):
+            v = _g(run.data, "frame_perf", "pf_instantiate_us", default=0)
+            c.series[label] = [("INSTANTIATE µs", v, f"{label}: {fmt_us(v)}")]
+        charts.append(c)
+        # Chart 3: FPS.
+        c = Chart(
+            title="Vertex format: steady-state FPS (default scene)",
+            category="Vertex format",
+            description="FPS at the default scene. Same workload, only the vertex encoding differs.",
+            chart_type="bar", x_label="Vertex format", y_label="FPS",
+        )
+        for label, run in (("FLOAT32_3", cm), ("COMPRESSED1", c1)):
+            v = _g(run.data, "frame_perf", "fps", default=0)
+            c.series[label] = [("FPS", v, f"{label}: {v:.1f} fps")]
         charts.append(c)
 
     # =========================================================================
@@ -626,25 +651,36 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         if m:
             rows.append((ca, m[0]))
     if len(rows) >= 2:
+        # Split bytes from ms (was one chart mixing them on a single y-axis).
         c = Chart(
-            title="CLAS alloc strategy: memory + build time (cluster mode, default scene)",
+            title="CLAS alloc strategy: bytes (cluster mode, default scene)",
             category="CLAS alloc",
-            description=("How CLAS allocation strategy affects bytes resident "
-                         "and build wall-clock at the default scene.  Implicit "
-                         "lets the driver pick; GetSizes does an explicit prebuild "
-                         "for exact-fit allocation (2 passes, more time, less "
-                         "memory); Compact does implicit then a post-build compact "
-                         "(extra pass, smallest result)."),
-            chart_type="bar", x_label="CLAS alloc mode", y_label="Value",
+            description=("CLAS alloc strategy at the default scene.  'CLAS alloc' "
+                         "is the bytes the driver reserved up-front; 'CLAS actual' "
+                         "is what the build actually used.  Implicit lets the driver "
+                         "pick alloc size; GetSizes does an explicit prebuild for "
+                         "exact-fit (2 passes, same actual, smaller alloc); Compact "
+                         "does implicit then a post-build move into exact-fit storage."),
+            chart_type="bar", x_label="CLAS alloc mode", y_label="Bytes",
         )
-        c.series["CLAS alloc bytes"]   = [(ca, _g(r.data,"memory_bytes","static_clas_alloc",default=0),
-                                           fmt_bytes(_g(r.data,"memory_bytes","static_clas_alloc",default=0)))
+        c.series["CLAS alloc bytes"]  = [(ca, _g(r.data,"memory_bytes","static_clas_alloc",default=0),
+                                           f"{ca} alloc: {fmt_bytes(_g(r.data,'memory_bytes','static_clas_alloc',default=0))}")
                                           for ca, r in rows]
-        c.series["CLAS actual bytes"]  = [(ca, _g(r.data,"memory_bytes","static_clas_actual",default=0),
-                                           fmt_bytes(_g(r.data,"memory_bytes","static_clas_actual",default=0)))
+        c.series["CLAS actual bytes"] = [(ca, _g(r.data,"memory_bytes","static_clas_actual",default=0),
+                                           f"{ca} actual: {fmt_bytes(_g(r.data,'memory_bytes','static_clas_actual',default=0))}")
                                           for ca, r in rows]
+        charts.append(c)
+
+        c = Chart(
+            title="CLAS alloc strategy: static CLAS build time (cluster mode, default scene)",
+            category="CLAS alloc",
+            description=("Wall-clock ms for the static-CLAS build pipeline.  "
+                         "GetSizes requires an explicit prebuild pass (slower); "
+                         "Compact adds a post-build move pass; Implicit is one pass."),
+            chart_type="bar", x_label="CLAS alloc mode", y_label="Build time (ms)",
+        )
         c.series["Static CLAS build (ms)"] = [(ca, _g(r.data,"build_times_ms","static_clas",default=0),
-                                                f"{_g(r.data,'build_times_ms','static_clas',default=0):.1f} ms")
+                                                f"{ca}: {_g(r.data,'build_times_ms','static_clas',default=0):.1f} ms")
                                               for ca, r in rows]
         charts.append(c)
 

@@ -3,23 +3,24 @@
 // Licensed under the MIT License (MIT).
 //*********************************************************
 //
-// Main.cpp - D3D12 DXR2 COMPRESSED1 cluster-geometry min repro.
+// Main.cpp - DXR2 COMPRESSED1 cluster-geometry min repro.
 //
-// Builds a single 6-cluster cube (one CLAS per face) via DXR2's
-// BUILD_CLAS_FROM_TRIANGLES + BUILD_BLAS_FROM_CLAS path, dispatches one
-// ray per pixel.
+// Single 6-cluster cube (one CLAS per face) built via DXR2's
+// BUILD_CLAS_FROM_TRIANGLES + BUILD_BLAS_FROM_CLAS path; raytraced
+// with one ray per pixel.
 //
-//   Default                 (D3D12_VERTEX_FORMAT_COMPRESSED1) : BUG - only
-//                                                                1 of 6
-//                                                                faces hits.
-//   --vertex-format float   (D3D12_VERTEX_FORMAT_FLOAT32_3   ) : OK   - full
-//                                                                cube renders.
+//   default                  -> COMPRESSED1 vertex format -> BUG on NVIDIA
+//                               preview driver: only 1 of 6 faces renders.
+//                               (Renders correctly on WARP.)
+//   --vertex-format float    -> FLOAT32_3 vertex format -> full cube
+//                               (reference / sanity check on NVIDIA).
+//   --fix                    -> sets ClusterLimits.MaxVertexCountPerCluster
+//                               = 32 (otherwise 4 = actual). Full cube
+//                               renders on NVIDIA. See readme for details.
+//   --adapter warp|hw        -> force WARP or first hardware adapter.
 //
 // Requires an experimental D3D12 build with DXR2 + lib_6_10 support; see
 // ExperimentalD3D12.props for the runtime/DXC hookup.
-//
-// Single-file repro - no DXSample / DeviceResources / DirectXTK / PCH /
-// procedural-geometry scaffolding. Goal: minimum fluff.
 //*********************************************************
 
 #define WIN32_LEAN_AND_MEAN
@@ -49,47 +50,13 @@ using Microsoft::WRL::ComPtr;
 //  Log + error helpers
 // ============================================================================
 
-// Mirror to %TEMP%\compressed1_repro.log so unattended runs leave a trace.
-// SAMPLE_LOG env var overrides the path (matches the parent sample's
-// convention so existing tooling still works).
-static std::wstring GetLogPath()
-{
-    WCHAR env[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableW(L"SAMPLE_LOG", env, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) return env;
-    WCHAR tmp[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring p = tmp;
-    if (!p.empty() && p.back() != L'\\') p += L'\\';
-    p += L"compressed1_repro.log";
-    return p;
-}
-
 static void Log(const wchar_t* fmt, ...)
 {
-    wchar_t buf[2048];
+    wchar_t buf[1024];
     va_list a; va_start(a, fmt);
     _vsnwprintf_s(buf, _TRUNCATE, fmt, a);
     va_end(a);
     OutputDebugStringW(buf);
-    // Append to log file (truncated on first call from InitLog()).
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, GetLogPath().c_str(), L"ab") == 0 && f)
-    {
-        fputws(buf, f);
-        fclose(f);
-    }
-}
-
-static void InitLog()
-{
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, GetLogPath().c_str(), L"wb") == 0 && f)
-    {
-        unsigned char bom[2] = { 0xFF, 0xFE };   // UTF-16 LE BOM
-        fwrite(bom, 1, 2, f);
-        fclose(f);
-    }
 }
 
 static void TF(HRESULT hr, const wchar_t* what = L"HRESULT failed")
@@ -105,7 +72,7 @@ static void TF(HRESULT hr, const wchar_t* what = L"HRESULT failed")
 }
 
 // ============================================================================
-//  Basic geometry types (shared between the encoder and the cube generator).
+//  Basic geometry types (shared between encoder and cube generator).
 // ============================================================================
 struct float3 { float x, y, z; };
 
@@ -165,7 +132,8 @@ namespace Compressed1
     //     pick.
     static EncodedCluster Encode(const std::vector<float3>& verts,
                                  int maxPrecisionBits = 12,
-                                 int forcedBiasedExponent = -1)    {
+                                 int forcedBiasedExponent = -1)
+    {
         EncodedCluster out;
         out.vertexCount = (unsigned)verts.size();
         if (verts.empty()) return out;
@@ -263,18 +231,10 @@ namespace Compressed1
 //  6 faces, each its own cluster: 4 verts, 2 tris (winding CCW from outside
 //  so RAY_FLAG_CULL_BACK_FACING_TRIANGLES keeps them).
 // ============================================================================
-struct Face
-{
-    std::vector<float3> positions;  // 4 corners
-};
+struct Face { std::vector<float3> positions; };  // 4 corners per face
 
-// Per-face shared index buffer: 2 tris formed by quad corners (0,1,2,3) laid
-// out as a row-major 2x2 grid, with CCW-from-outside winding.
 static constexpr uint16_t kFaceIndices[6] = { 0, 3, 2, 0, 1, 3 };
 
-// Generate a unit cube (halfExtent h) as 6 single-cluster faces. Each face's
-// CCW-from-outside winding matches the index pattern above (the axisU x
-// axisV cross product is the outward normal).
 static std::vector<Face> BuildCubeFaces(float h)
 {
     struct Basis { float3 origin, axisU, axisV; };
@@ -480,59 +440,21 @@ public:
     VertexMode mode = VertexMode::Compressed1;     // bug-repro default
     UINT compressedBits = 12;                      // COMPRESSED1 precision
 
-    // --adapter warp|hw    force a specific adapter (default: highest-perf HW)
+    // --adapter warp|hw : force a specific adapter (default = highest-perf
+    // HW, falling back to WARP if none accepts D3D12CreateDevice).
     enum class AdapterKind { Default, Warp, Hw };
     AdapterKind adapterKind = AdapterKind::Default;
 
-    // --diag    dump encoded COMPRESSED1 headers / a few bitstream bytes per
-    //           cluster + CPU-side decode roundtrip + post-build readback of
-    //           the CLAS address array
-    bool diag = false;
-
-    // ---- experimental "fix" toggles (for bisecting differences vs the
-    //      passing d3d12conf BUILD_CLAS_FROM_TRIANGLES + COMPRESSED1 test) ----
-    //
-    //   --fix-split        CPU sync (split CLAS + BLAS into 2 cmd-list submits
-    //                      with WaitForGpu between)
-    //   --fix-reupload     readback the CLAS address array and re-upload via a
-    //                      fresh CPU buffer (implies --fix-split)
-    //   --fix-explicit     EXPLICIT_DESTINATIONS for CLAS build (CPU-known
-    //                      addresses; mirrors the d3d12conf-test option)
-    //   --fix-separate-vb  give every cluster its own VB+IB resource (no
-    //                      concatenation, no offset math)
-    bool fixSplit      = false;
-    bool fixReupload   = false;
-    bool fixExplicit   = false;
-    bool fixSeparateVB = false;
-    bool fixBlasImplicit = false;    // BUILD_BLAS_FROM_CLAS mode (default EXPLICIT)
-    bool wa1BlasPerClas  = false;    // workaround: 1 BLAS per CLAS, all in TLAS
-    bool wa1ClasPerBuild = false;    // workaround: 1 CLAS per BUILD_CLAS_FROM_TRIANGLES call
-                                     //   (test whether multi-arg CLAS build only writes the first arg)
-    bool fixLooseLimits  = false;    // use 256/256/256 ClusterLimits (matches d3d12conf test)
-                                     //   instead of tight (2 tris, 4 verts) actual values
-    bool fixGeoFlagArray = false;    // supply a per-triangle GeometryIndexAndFlagsArray
-                                     //   (works around a known NVIDIA driver bug where
-                                     //   BaseGeometryIndexAndFlags is not honored when no array)
-    // Per-field ClusterLimits overrides (default = tight: 2, 4, 2N, 4N).
-    // Setting any to a non-zero value bumps that one field; --fix-loose-limits
-    // bumps all four to 256/256/256*N/256*N at once.
-    UINT overrideMaxTriPerCluster   = 0;
-    UINT overrideMaxVertPerCluster  = 0;
-    UINT overrideMaxTotalTri        = 0;
-    UINT overrideMaxTotalVert       = 0;
-
-    // ---- bug-pinpointing toggles ----
-    //   --reverse-faces    emit cube faces in reverse order (test whether the
-    //                      "1 visible face" bug is "cluster 0 always wins" or
-    //                      "the +X face always wins regardless of cluster idx")
-    //   --rotate-faces N   rotate cube face emit order by N positions
-    bool reverseFaces = false;
-    int  rotateFaces  = 0;
+    // --fix : set ClusterLimits.MaxVertexCountPerCluster = 32 (otherwise 4
+    // = actual vertex count). The NVIDIA preview driver only renders the
+    // first cluster's CLAS when this value is < 32; see readme.md for the
+    // full bisection.
+    bool fix = false;
 
     // ---- device / swapchain ----
     // (Flip-model swap chain requires BufferCount >= 2; we treat both buffers
     //  uniformly via swapChain->GetCurrentBackBufferIndex() inline at render
-    //  time, with a full WaitForGpu after every Present.  Single allocator,
+    //  time, with a full WaitForGpu after every Present. Single allocator,
     //  no per-frame pipelining - keeps the plumbing trivial.)
     static constexpr UINT kBackBufferCount = 2;
     ComPtr<IDXGIFactory4>                 factory;
@@ -564,22 +486,6 @@ public:
     ComPtr<ID3D12Resource>                clasResultBuf;
     ComPtr<ID3D12Resource>                clasScratchBuf;
     ComPtr<ID3D12Resource>                clasAddrArray;
-    // Per-cluster VBs when --fix-separate-vb is on (otherwise unused; all
-    // clusters share clusterInputBuf with offsets).
-    std::vector<ComPtr<ID3D12Resource>>   clusterVBsSep;
-    std::vector<ComPtr<ID3D12Resource>>   clusterIBsSep;
-    // --fix-reupload only: readback heap + fresh CPU-uploaded copy of the
-    // CLAS address array (so BUILD_BLAS_FROM_CLAS reads CPU-uploaded data
-    // rather than the GPU-written UAV from the prior CLAS build).
-    ComPtr<ID3D12Resource>                clasAddrReadback;
-    ComPtr<ID3D12Resource>                clasAddrFresh;
-    // --fix-explicit only: CPU-allocated CLAS storage slots whose addresses
-    // are fed both as CLAS dests and as the BLAS-from-CLAS address array.
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> explicitClasVAs;
-    ComPtr<ID3D12Resource>                explicitDestAddrUpload;
-    // --fix-geo-flag-array only: shared per-triangle array (all 2 tris get
-    // the OPAQUE flag in the upper byte, GeometryIndex=0 in lower 24 bits).
-    ComPtr<ID3D12Resource>                sharedGeoFlagArray;
     ComPtr<ID3D12Resource>                blasArgsBuf;
     ComPtr<ID3D12Resource>                blasDestAddrBuf;
     ComPtr<ID3D12Resource>                blasStorage;
@@ -614,40 +520,21 @@ public:
                 else if (_wcsicmp(argv[i+1], L"hw")   == 0) adapterKind = AdapterKind::Hw;
                 ++i;
             }
-            else if (_wcsicmp(argv[i], L"--diag")             == 0) diag             = true;
-            else if (_wcsicmp(argv[i], L"--fix-split")        == 0) fixSplit         = true;
-            else if (_wcsicmp(argv[i], L"--fix-reupload")     == 0) { fixSplit = true; fixReupload = true; }
-            else if (_wcsicmp(argv[i], L"--fix-explicit")     == 0) fixExplicit      = true;
-            else if (_wcsicmp(argv[i], L"--fix-separate-vb")  == 0) fixSeparateVB    = true;
-            else if (_wcsicmp(argv[i], L"--reverse-faces")    == 0) reverseFaces     = true;
-            else if (_wcsicmp(argv[i], L"--rotate-faces") == 0 && i + 1 < argc) { rotateFaces = _wtoi(argv[i+1]); ++i; }
-            else if (_wcsicmp(argv[i], L"--fix-blas-implicit") == 0) fixBlasImplicit = true;
-            else if (_wcsicmp(argv[i], L"--wa-1blas-per-clas") == 0) { wa1BlasPerClas = true; fixSplit = true; }
-            else if (_wcsicmp(argv[i], L"--wa-1clas-per-build") == 0) wa1ClasPerBuild = true;
-            else if (_wcsicmp(argv[i], L"--fix-loose-limits") == 0) fixLooseLimits = true;
-            else if (_wcsicmp(argv[i], L"--fix-geo-flag-array") == 0) fixGeoFlagArray = true;
-            else if (_wcsicmp(argv[i], L"--max-tri-per-cluster")  == 0 && i + 1 < argc) { overrideMaxTriPerCluster  = _wtoi(argv[i+1]); ++i; }
-            else if (_wcsicmp(argv[i], L"--max-vert-per-cluster") == 0 && i + 1 < argc) { overrideMaxVertPerCluster = _wtoi(argv[i+1]); ++i; }
-            else if (_wcsicmp(argv[i], L"--max-total-tri")        == 0 && i + 1 < argc) { overrideMaxTotalTri       = _wtoi(argv[i+1]); ++i; }
-            else if (_wcsicmp(argv[i], L"--max-total-vert")       == 0 && i + 1 < argc) { overrideMaxTotalVert      = _wtoi(argv[i+1]); ++i; }
+            else if (_wcsicmp(argv[i], L"--fix") == 0) fix = true;
         }
     }
 
     // ------------------------------------------------------------------
     void Init()
     {
-        InitLog();
         Log(L"=== compressed1 min repro ===\n");
-        Log(L"  mode            = %s\n",
+        Log(L"  mode    = %s\n",
             mode == VertexMode::Compressed1 ? L"COMPRESSED1 (default - BUG)" : L"FLOAT32_3 (correct)");
-        Log(L"  adapter         = %s\n",
+        Log(L"  adapter = %s\n",
             adapterKind == AdapterKind::Warp ? L"WARP (forced)" :
             adapterKind == AdapterKind::Hw   ? L"HW (forced)"   : L"HW (default, fallback to WARP)");
-        Log(L"  fix-split       = %d\n", (int)fixSplit);
-        Log(L"  fix-reupload    = %d\n", (int)fixReupload);
-        Log(L"  fix-explicit    = %d\n", (int)fixExplicit);
-        Log(L"  fix-separate-vb = %d\n", (int)fixSeparateVB);
-        Log(L"  diag            = %d\n", (int)diag);
+        Log(L"  fix     = %s\n",
+            fix ? L"on (MaxVertexCountPerCluster = 32)" : L"off (MaxVertexCountPerCluster = 4)");
 
         // Experimental features must be enabled BEFORE the first
         // D3D12CreateDevice (otherwise this returns DXGI_ERROR_SDK_COMPONENT_MISSING).
@@ -674,9 +561,7 @@ public:
         TF(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
 
         // Adapter pick:
-        //   --adapter warp -> EnumWarpAdapter (force the experimental WARP)
-        //   --adapter hw   -> first hardware adapter that supports D3D12 (no
-        //                     HIGH_PERFORMANCE preference, just first hit)
+        //   --adapter warp -> EnumWarpAdapter
         //   default        -> highest-perf hardware adapter, falling back to
         //                     WARP if none accepts D3D12CreateDevice
         ComPtr<IDXGIAdapter1> adapter;
@@ -784,27 +669,11 @@ public:
     // ------------------------------------------------------------------
     void BuildScene()
     {
-        cubeFaces = BuildCubeFaces(0.45f);
-        // Optional reordering for bug-pinpointing experiments. Lets us tell
-        // whether the "1 cube face visible" pattern is "cluster index 0 always
-        // wins" or "the +X face always wins regardless of cluster index".
-        if (rotateFaces)
-        {
-            const int n = (int)cubeFaces.size();
-            const int r = ((rotateFaces % n) + n) % n;
-            std::rotate(cubeFaces.begin(), cubeFaces.begin() + r, cubeFaces.end());
-            Log(L"[scene] rotated face emit order by %d (cluster 0 = face index %d in original order)\n",
-                r, r);
-        }
-        if (reverseFaces)
-        {
-            std::reverse(cubeFaces.begin(), cubeFaces.end());
-            Log(L"[scene] reversed face emit order (cluster 0 = original -Z face)\n");
-        }
+        cubeFaces    = BuildCubeFaces(0.45f);
         clusterCount = (UINT)cubeFaces.size();
 
         // Pick a scene-wide COMPRESSED1 exponent so cluster-edge vertices
-        // quantize identically (watertight at quantization).  Geometry is a
+        // quantize identically (watertight at quantization). Geometry is a
         // fixed unit cube so the max axis-extent is known a priori.
         const float maxExtent    = 0.9f;    // = 2 * halfExtent (BuildCubeFaces(0.45f))
         const float minUnit      = maxExtent / float((1ull << compressedBits) - 1);
@@ -815,78 +684,7 @@ public:
         for (const auto& f : cubeFaces)
             encoded.push_back(Compressed1::Encode(f.positions, (int)compressedBits, sharedExp));
 
-        Log(L"[scene] cube: %u clusters, %u tris.  vertex format: %s\n",
-            clusterCount, clusterCount * 2,
-            mode == VertexMode::Compressed1 ? L"COMPRESSED1 (BUG repro - default)"
-                                            : L"FLOAT32_3 (correct render)");
-
-        if (diag)
-        {
-            // Per-cluster COMPRESSED1 header + decode roundtrip vs original positions.
-            // If the encoder is broken, max-error will be much larger than 1 quantization
-            // step (~ scale = 2^(sharedExp-127)).
-            const float scale = (float)std::ldexp(1.0, sharedExp - 127);
-            Log(L"[diag] shared exponent = %d (biased)  scale = %.10g\n", sharedExp, scale);
-            for (UINT i = 0; i < clusterCount; ++i)
-            {
-                const auto& h = encoded[i].header;
-                const int e    = (int) (h.field0 & 0xFF);
-                const int aX   = (int) ((int32_t)h.field0 >> 8);     // sign-extend top 24
-                const int aY   = (int) ((int32_t)h.field1 >> 8);
-                const int aZ   = (int) ((int32_t)h.field2 >> 8);
-                const int xB   = (int) ((h.field1 & 0xF) + 1);
-                const int yB   = (int) (((h.field1 >> 4) & 0xF) + 1);
-                const int zB   = (int) ((h.field2 & 0xF) + 1);
-                Log(L"[diag]   cluster %u  exp=%d  anchor=(%d,%d,%d)  bits=(%d,%d,%d)"
-                    L"  bitstream=%zu B  total=%zu B\n",
-                    i, e, aX, aY, aZ, xB, yB, zB,
-                    encoded[i].bitstream.size(), encoded[i].TotalBytes());
-
-                // First 4 bytes of bitstream as hex (each cluster only has 2-3 bytes since
-                // 4 verts * (xB+yB+zB) bits / 8 ~= 6-8 bytes).
-                const auto& bs = encoded[i].bitstream;
-                wchar_t hex[64] = {};
-                int n = (int)std::min<size_t>(bs.size(), 12);
-                int off = 0;
-                for (int k = 0; k < n; ++k)
-                    off += swprintf_s(hex + off, _countof(hex) - off, L"%02X ", bs[k]);
-                Log(L"[diag]              bitstream[0..%d] = %s\n", n, hex);
-
-                // Decode roundtrip
-                float maxErr = 0;
-                const uint32_t nx = xB, ny = yB, nz = zB;
-                uint64_t bitOff = 0;
-                auto readBits = [&](uint32_t n) -> uint32_t {
-                    uint32_t v = 0, r = 0;
-                    while (r < n) {
-                        uint32_t bytePos = (uint32_t)(bitOff / 8);
-                        uint32_t bitInB  = (uint32_t)(bitOff & 7);
-                        uint32_t take    = std::min<uint32_t>(8 - bitInB, n - r);
-                        uint32_t mask    = (1u << take) - 1u;
-                        v |= ((bs[bytePos] >> bitInB) & mask) << r;
-                        r      += take;
-                        bitOff += take;
-                    }
-                    return v;
-                };
-                for (size_t v = 0; v < cubeFaces[i].positions.size(); ++v)
-                {
-                    uint32_t dx = readBits(nx), dy = readBits(ny), dz = readBits(nz);
-                    float px = (float)((double)(aX + (int32_t)dx) * (double)scale);
-                    float py = (float)((double)(aY + (int32_t)dy) * (double)scale);
-                    float pz = (float)((double)(aZ + (int32_t)dz) * (double)scale);
-                    const auto& orig = cubeFaces[i].positions[v];
-                    float err = std::max({ std::fabs(px - orig.x),
-                                           std::fabs(py - orig.y),
-                                           std::fabs(pz - orig.z) });
-                    maxErr = std::max(maxErr, err);
-                    Log(L"[diag]              v%zu: orig=(%.4f,%.4f,%.4f)  decoded=(%.4f,%.4f,%.4f)  err=%.6f\n",
-                        v, orig.x, orig.y, orig.z, px, py, pz, err);
-                }
-                Log(L"[diag]              max-err = %.6f  (quantization scale = %.6f)\n",
-                    maxErr, scale);
-            }
-        }
+        Log(L"[scene] cube: %u clusters, %u tris\n", clusterCount, clusterCount * 2);
     }
 
     // ------------------------------------------------------------------
@@ -901,26 +699,6 @@ public:
 
         UploadClusterInputs();
         BuildClas();
-
-        if (fixSplit)
-        {
-            // CPU-side sync between CLAS build and BLAS-from-CLAS, mirroring
-            // what the d3d12conf test does (it FlushAndFinish's after CLAS
-            // build before issuing BLAS-from-CLAS). Test whether the bug is in
-            // the GPU-pipelined CLAS-addr -> BLAS-from-CLAS path.
-            TF(cmdList->Close());
-            ID3D12CommandList* lists1[] = { cmdList.Get() };
-            queue->ExecuteCommandLists(1, lists1);
-            WaitForGpu();
-
-            // Always do the readback (and re-upload if fixReupload is set) so
-            // the diag log + wa-1blas-per-clas variants have the data they need.
-            ReadbackAndOptionallyReuploadClasAddrs();
-
-            TF(cmdAlloc->Reset());
-            TF(cmdList->Reset(cmdAlloc.Get(), nullptr));
-        }
-
         BuildBlas();
         BuildTlas();
 
@@ -928,71 +706,6 @@ public:
         ID3D12CommandList* lists[] = { cmdList.Get() };
         queue->ExecuteCommandLists(1, lists);
         WaitForGpu();
-    }
-
-    // Helpers used by --fix-reupload / --diag only.
-    void ReadbackAndOptionallyReuploadClasAddrs()
-    {
-        // 1. CopyResource from the GPU-written address-array UAV to a
-        //    READBACK heap, then map to read CPU-side.
-        TF(cmdAlloc->Reset());
-        TF(cmdList->Reset(cmdAlloc.Get(), nullptr));
-
-        if (!clasAddrReadback)
-        {
-            auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-            auto desc = CD3DX12_RESOURCE_DESC::Buffer(
-                (UINT64)clusterCount * sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
-            TF(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&clasAddrReadback)));
-            clasAddrReadback->SetName(L"CLAS addr readback");
-        }
-
-        auto barTo = CD3DX12_RESOURCE_BARRIER::Transition(clasAddrArray.Get(),
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        cmdList->ResourceBarrier(1, &barTo);
-        cmdList->CopyResource(clasAddrReadback.Get(), clasAddrArray.Get());
-        auto barFrom = CD3DX12_RESOURCE_BARRIER::Transition(clasAddrArray.Get(),
-            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdList->ResourceBarrier(1, &barFrom);
-
-        TF(cmdList->Close());
-        ID3D12CommandList* lists[] = { cmdList.Get() };
-        queue->ExecuteCommandLists(1, lists);
-        WaitForGpu();
-
-        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> addrs(clusterCount);
-        void* mapped = nullptr;
-        TF(clasAddrReadback->Map(0, nullptr, &mapped));
-        memcpy(addrs.data(), mapped, addrs.size() * sizeof(addrs[0]));
-        D3D12_RANGE noWrite = {};
-        clasAddrReadback->Unmap(0, &noWrite);
-
-        Log(L"[diag] CLAS addresses (from %s):\n",
-            fixExplicit ? L"explicit-dest passthrough" : L"BUILD_CLAS_FROM_TRIANGLES UAV");
-        UINT zeroCount = 0;
-        for (UINT i = 0; i < clusterCount; ++i)
-        {
-            Log(L"[diag]   cluster %u  GVA = 0x%016llX %s\n",
-                i, (unsigned long long)addrs[i],
-                addrs[i] == 0 ? L"  (ZERO!)" : L"");
-            if (addrs[i] == 0) zeroCount++;
-        }
-        if (zeroCount > 0)
-            Log(L"[diag]   *** %u of %u CLAS addresses are ZERO ***\n",
-                zeroCount, clusterCount);
-        else
-            Log(L"[diag]   all %u CLAS addresses present\n", clusterCount);
-
-        // 2. If --fix-reupload, materialize a fresh CPU-uploaded buffer that
-        //    BUILD_BLAS_FROM_CLAS will read instead of the UAV.
-        if (fixReupload)
-        {
-            AllocateUploadBuffer(device.Get(), addrs.data(),
-                                 addrs.size() * sizeof(addrs[0]),
-                                 &clasAddrFresh, L"CLAS addr re-uploaded");
-            Log(L"[diag]   re-uploaded %u addresses to fresh CPU buffer\n", clusterCount);
-        }
     }
 
     // ------------------------------------------------------------------
@@ -1008,120 +721,50 @@ public:
 
         struct Slot { size_t vbOff, vbSize, ibOff, ibSize; };
         std::vector<Slot> slots(clusterCount);
-
-        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vbGVA(clusterCount), ibGVA(clusterCount);
-
-        if (fixSeparateVB)
+        size_t cursor = 0;
+        for (UINT i = 0; i < clusterCount; ++i)
         {
-            // --fix-separate-vb: each cluster owns its own VB and IB resource,
-            // matching the d3d12conf test's per-cluster MakeBufferAndInit pattern.
-            // This removes any "VB GVA points into a shared buffer at an offset"
-            // as a variable from the bug.
-            clusterVBsSep.assign(clusterCount, {});
-            clusterIBsSep.assign(clusterCount, {});
-            auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-            for (UINT i = 0; i < clusterCount; ++i)
-            {
-                const size_t vbSize = useFloat
-                    ? cubeFaces[i].positions.size() * sizeof(float3)
-                    : encoded[i].TotalBytes();
-                auto vbDesc = CD3DX12_RESOURCE_DESC::Buffer(vbSize);
-                TF(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clusterVBsSep[i])));
-                uint8_t* vbMap = nullptr;
-                TF(clusterVBsSep[i]->Map(0, nullptr, reinterpret_cast<void**>(&vbMap)));
-                if (useFloat) {
-                    memcpy(vbMap, cubeFaces[i].positions.data(), vbSize);
-                } else {
-                    memcpy(vbMap, &encoded[i].header, sizeof(encoded[i].header));
-                    if (!encoded[i].bitstream.empty())
-                        memcpy(vbMap + sizeof(encoded[i].header),
-                               encoded[i].bitstream.data(), encoded[i].bitstream.size());
-                }
-                clusterVBsSep[i]->Unmap(0, nullptr);
-                vbGVA[i] = clusterVBsSep[i]->GetGPUVirtualAddress();
-
-                auto ibDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(kFaceIndices));
-                TF(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &ibDesc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clusterIBsSep[i])));
-                uint8_t* ibMap = nullptr;
-                TF(clusterIBsSep[i]->Map(0, nullptr, reinterpret_cast<void**>(&ibMap)));
-                memcpy(ibMap, kFaceIndices, sizeof(kFaceIndices));
-                clusterIBsSep[i]->Unmap(0, nullptr);
-                ibGVA[i] = clusterIBsSep[i]->GetGPUVirtualAddress();
-            }
-            Log(L"[diag] --fix-separate-vb: %u per-cluster VBs + %u per-cluster IBs\n",
-                clusterCount, clusterCount);
+            cursor = align(cursor, kAlign);
+            slots[i].vbOff  = cursor;
+            slots[i].vbSize = useFloat
+                ? cubeFaces[i].positions.size() * sizeof(float3)
+                : encoded[i].TotalBytes();
+            cursor += slots[i].vbSize;
+            cursor = align(cursor, kAlign);
+            slots[i].ibOff  = cursor;
+            slots[i].ibSize = sizeof(kFaceIndices);
+            cursor += slots[i].ibSize;
         }
-        else
+
+        auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        auto desc = CD3DX12_RESOURCE_DESC::Buffer(align(cursor, 256));
+        TF(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clusterInputBuf)));
+        clusterInputBuf->SetName(L"Cluster VB+IB");
+
+        uint8_t* mapped = nullptr;
+        TF(clusterInputBuf->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+        const D3D12_GPU_VIRTUAL_ADDRESS baseGVA = clusterInputBuf->GetGPUVirtualAddress();
+        for (UINT i = 0; i < clusterCount; ++i)
         {
-            // Default: one shared buffer with concatenated VB+IB per cluster.
-            size_t cursor = 0;
-            for (UINT i = 0; i < clusterCount; ++i)
+            if (useFloat)
             {
-                cursor = align(cursor, kAlign);
-                slots[i].vbOff  = cursor;
-                slots[i].vbSize = useFloat
-                    ? cubeFaces[i].positions.size() * sizeof(float3)
-                    : encoded[i].TotalBytes();
-                cursor += slots[i].vbSize;
-                cursor = align(cursor, kAlign);
-                slots[i].ibOff  = cursor;
-                slots[i].ibSize = sizeof(kFaceIndices);
-                cursor += slots[i].ibSize;
+                memcpy(mapped + slots[i].vbOff, cubeFaces[i].positions.data(), slots[i].vbSize);
             }
-
-            auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-            auto desc = CD3DX12_RESOURCE_DESC::Buffer(align(cursor, 256));
-            TF(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clusterInputBuf)));
-            clusterInputBuf->SetName(L"Cluster VB+IB");
-
-            uint8_t* mapped = nullptr;
-            TF(clusterInputBuf->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
-            const D3D12_GPU_VIRTUAL_ADDRESS baseGVA = clusterInputBuf->GetGPUVirtualAddress();
-            for (UINT i = 0; i < clusterCount; ++i)
+            else
             {
-                if (useFloat)
-                {
-                    memcpy(mapped + slots[i].vbOff, cubeFaces[i].positions.data(), slots[i].vbSize);
-                }
-                else
-                {
-                    memcpy(mapped + slots[i].vbOff, &encoded[i].header, sizeof(encoded[i].header));
-                    if (!encoded[i].bitstream.empty())
-                        memcpy(mapped + slots[i].vbOff + sizeof(encoded[i].header),
-                               encoded[i].bitstream.data(), encoded[i].bitstream.size());
-                }
-                memcpy(mapped + slots[i].ibOff, kFaceIndices, sizeof(kFaceIndices));
-                vbGVA[i] = baseGVA + slots[i].vbOff;
-                ibGVA[i] = baseGVA + slots[i].ibOff;
+                memcpy(mapped + slots[i].vbOff, &encoded[i].header, sizeof(encoded[i].header));
+                if (!encoded[i].bitstream.empty())
+                    memcpy(mapped + slots[i].vbOff + sizeof(encoded[i].header),
+                           encoded[i].bitstream.data(), encoded[i].bitstream.size());
             }
-            clusterInputBuf->Unmap(0, nullptr);
+            memcpy(mapped + slots[i].ibOff, kFaceIndices, sizeof(kFaceIndices));
         }
+        clusterInputBuf->Unmap(0, nullptr);
 
         // CPU-fill BUILD_CLAS_FROM_TRIANGLES_ARGS[N] (consumed by
         // ExecuteIndirectRTASOperations below).
         std::vector<D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS> args(clusterCount);
-
-        // --fix-geo-flag-array: shared per-triangle array (all clusters share
-        // the same 2-entry array - 2 tris per cluster, OPAQUE flag for both).
-        // Works around a known NVIDIA driver bug where BaseGeometryIndexAndFlags
-        // is not honored if GeometryIndexAndFlagsArray is NULL.
-        D3D12_GPU_VIRTUAL_ADDRESS geoFlagArrayGVA = 0;
-        if (fixGeoFlagArray)
-        {
-            const uint32_t perTri[2] = {
-                (uint32_t)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE,  // tri 0
-                (uint32_t)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE,  // tri 1
-            };
-            AllocateUploadBuffer(device.Get(), perTri, sizeof(perTri),
-                                 &sharedGeoFlagArray, L"GeometryIndexAndFlagsArray");
-            geoFlagArrayGVA = sharedGeoFlagArray->GetGPUVirtualAddress();
-            Log(L"[fix-geo-flag-array] shared per-tri array @ 0x%016llX  (OPAQUE flag per tri)\n",
-                (unsigned long long)geoFlagArrayGVA);
-        }
-
         for (UINT i = 0; i < clusterCount; ++i)
         {
             auto& a = args[i];
@@ -1129,19 +772,12 @@ public:
             a.ClusterID                 = i;
             a.TriangleCount             = 2;
             a.VertexCount               = 4;
-            a.BaseGeometryIndexAndFlags = fixGeoFlagArray
-                                          ? 0u                                       // flag now lives in the per-tri array
-                                          : (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
+            a.BaseGeometryIndexAndFlags = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
             a.VertexBufferStride        = useFloat ? (UINT16)sizeof(float3) : 0;
             a.IndexBufferStride         = sizeof(uint16_t);
             a.PositionTruncateBitCount  = 0;
-            a.VertexBuffer              = vbGVA[i];
-            a.IndexBuffer               = ibGVA[i];
-            if (fixGeoFlagArray)
-            {
-                a.GeometryIndexAndFlagsArray       = geoFlagArrayGVA;
-                a.GeometryIndexAndFlagsArrayStride = (UINT16)sizeof(uint32_t);
-            }
+            a.VertexBuffer              = baseGVA + slots[i].vbOff;
+            a.IndexBuffer               = baseGVA + slots[i].ibOff;
         }
         AllocateUploadBuffer(device.Get(), args.data(),
                              args.size() * sizeof(args[0]),
@@ -1160,17 +796,20 @@ public:
         D3D12_RTAS_CLUSTER_LIMITS limits = {};
         limits.MaxArgCount                                   = N;
         limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 256;
-        limits.MaxTriangleCountPerCluster = overrideMaxTriPerCluster  ? overrideMaxTriPerCluster
-                                          : (fixLooseLimits ? 256u : 2u);
-        limits.MaxVertexCountPerCluster   = overrideMaxVertPerCluster ? overrideMaxVertPerCluster
-                                          : (fixLooseLimits ? 256u : 4u);
-        limits.MaxTotalTriangleCount      = overrideMaxTotalTri  ? overrideMaxTotalTri
-                                          : (fixLooseLimits ? 256u * N : 2u * N);
-        limits.MaxTotalVertexCount        = overrideMaxTotalVert ? overrideMaxTotalVert
-                                          : (fixLooseLimits ? 256u * N : 4u * N);
-        Log(L"[limits] MaxTriPerCluster=%u  MaxVertPerCluster=%u  MaxTotalTri=%u  MaxTotalVert=%u\n",
-            limits.MaxTriangleCountPerCluster, limits.MaxVertexCountPerCluster,
-            limits.MaxTotalTriangleCount,      limits.MaxTotalVertexCount);
+        limits.MaxTriangleCountPerCluster                    = 2;
+        // ====================================================================
+        //  THE BUG:  with MaxVertexCountPerCluster < 32 (matching the actual
+        //  vertex count of 4), the NVIDIA preview driver mis-strides the per-
+        //  cluster vertex storage and only cluster 0's CLAS contains
+        //  traversable geometry. Set to 32 (NVIDIA's warp size) or higher
+        //  and the full cube renders. See readme.md for the full bisection.
+        //
+        //  The spec allows any value >= actual (and up to 256). FLOAT32_3
+        //  works at any value; COMPRESSED1 needs >= 32 on this driver.
+        // ====================================================================
+        limits.MaxVertexCountPerCluster                      = fix ? 32u : 4u;
+        limits.MaxTotalTriangleCount                         = 2 * N;
+        limits.MaxTotalVertexCount                           = 4 * N;
 
         D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clas = {};
         clas.ClusterLimits                    = limits;
@@ -1183,8 +822,7 @@ public:
         clas.OpacityMicromapIndexFormat       = D3D12_INDEX_FORMAT_NONE;
         if (useFloat) clas.MinPositionTruncateBitCount        = 0;
         else          clas.MaxCompressedClusterPositionsSize  = maxCompSize;
-        clas.Mode = fixExplicit ? D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS
-                                : D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+        clas.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
         D3D12_RTAS_OPERATION_INPUTS inputs = {};
         inputs.Type                  = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
@@ -1202,99 +840,18 @@ public:
 
         D3D12_RTAS_BATCHED_OPERATION_DATA batched = {};
         batched.AddressResolutionFlags = D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_NONE;
+        batched.BatchResultData        = clasResultBuf->GetGPUVirtualAddress();
         batched.BatchScratchData       = clasScratchBuf->GetGPUVirtualAddress();
         batched.ResultAddressArray     = { clasAddrArray->GetGPUVirtualAddress(),
                                            sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
         batched.IndirectArgumentArray  = { clasArgsBuf->GetGPUVirtualAddress(),
                                            sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS) };
 
-        if (fixExplicit)
-        {
-            // CPU-side slots within the CLAS result buffer (each CLAS at
-            // i * pre.ResultDataMaxSizeInBytes, just like the d3d12conf test
-            // at line 8492's CBLAS allocation).
-            const UINT64 perClasSize = pre.ResultDataMaxSizeInBytes;
-            explicitClasVAs.assign(N, 0);
-            for (UINT i = 0; i < N; ++i)
-                explicitClasVAs[i] = clasResultBuf->GetGPUVirtualAddress() + (UINT64)i * perClasSize;
-            AllocateUploadBuffer(device.Get(), explicitClasVAs.data(),
-                                 explicitClasVAs.size() * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
-                                 &explicitDestAddrUpload, L"CLAS explicit dest addrs");
-            // In EXPLICIT mode BatchResultData is 0; the per-arg dest is the
-            // pointed-to address array (see d3d12.h docs on EXPLICIT_DESTINATIONS).
-            batched.BatchResultData    = 0;
-            batched.ResultAddressArray = { explicitDestAddrUpload->GetGPUVirtualAddress(),
-                                           sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-            Log(L"[diag] EXPLICIT_DESTINATIONS: per-CLAS size = %llu, total = %llu B\n",
-                (unsigned long long)perClasSize, (unsigned long long)(perClasSize * N));
-        }
-        else
-        {
-            batched.BatchResultData    = clasResultBuf->GetGPUVirtualAddress();
-        }
-
         D3D12_RTAS_OPERATION_DESC op = {};
         op.Inputs                = inputs;
         op.pBatchedOperationData = &batched;
-
-        if (wa1ClasPerBuild)
-        {
-            // Issue clusterCount separate ExecuteIndirectRTASOperations calls,
-            // each with IndirectArgumentArraySize=1 covering one arg slot. If
-            // the bug is "multi-arg CLAS build only writes the first arg's
-            // CLAS for COMPRESSED1", this should fix it: every call sees only
-            // one arg, which is "the first" by definition.
-            //
-            // IMPLICIT_DESTINATIONS allocates CLAS data starting at
-            // BatchResultData. To avoid each iteration clobbering the prior
-            // one's CLAS, query a 1-arg prebuild size and give each call its
-            // own slot in the result buffer (base + i*perCallSize).
-            D3D12_RTAS_CLUSTER_LIMITS limitsOne = limits;
-            limitsOne.MaxArgCount          = 1;
-            limitsOne.MaxTotalTriangleCount = 2;
-            limitsOne.MaxTotalVertexCount   = 4;
-            D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasOne = clas;
-            clasOne.ClusterLimits = limitsOne;
-            D3D12_RTAS_OPERATION_INPUTS inputsOne = inputs;
-            inputsOne.pClusterTrianglesDesc = &clasOne;
-            D3D12_RTAS_OPERATION_PREBUILD_INFO preOne = {};
-            dxr2Device->GetRTASOperationPrebuildInfo(&inputsOne, &preOne);
-            // Re-allocate the result buffer at N * per-call size so each call
-            // has a non-overlapping region.
-            const UINT64 perCallSize = preOne.ResultDataMaxSizeInBytes;
-            AllocateUAVBuffer(device.Get(), perCallSize * N, &clasResultBuf,
-                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-                L"CLAS result (per-call slots)");
-            // Scratch from the original 6-arg prebuild is plenty for 1 arg too.
-            const D3D12_GPU_VIRTUAL_ADDRESS resultBase  = clasResultBuf->GetGPUVirtualAddress();
-            const D3D12_GPU_VIRTUAL_ADDRESS clasArgsBase = clasArgsBuf->GetGPUVirtualAddress();
-            const UINT argStride = (UINT)sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS);
-            const D3D12_GPU_VIRTUAL_ADDRESS addrArrayBase = clasAddrArray->GetGPUVirtualAddress();
-            batched.IndirectArgumentArraySize = 1;
-            for (UINT i = 0; i < N; ++i)
-            {
-                batched.BatchResultData = resultBase + (UINT64)i * perCallSize;
-                batched.IndirectArgumentArray.StartAddress = clasArgsBase + (UINT64)i * argStride;
-                batched.IndirectArgumentArray.StrideInBytes = argStride;
-                batched.ResultAddressArray.StartAddress = addrArrayBase + (UINT64)i * sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-                batched.ResultAddressArray.StrideInBytes = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-                dxr2CmdList->ExecuteIndirectRTASOperations(1, &op,
-                    D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
-                D3D12_RESOURCE_BARRIER perBars[] = {
-                    CD3DX12_RESOURCE_BARRIER::UAV(clasResultBuf.Get()),
-                    CD3DX12_RESOURCE_BARRIER::UAV(clasScratchBuf.Get()),
-                    CD3DX12_RESOURCE_BARRIER::UAV(clasAddrArray.Get()),
-                };
-                cmdList->ResourceBarrier(_countof(perBars), perBars);
-            }
-            Log(L"[wa-1clas-per-build] %u single-arg builds, perCallSize=%llu, total=%llu B\n",
-                N, (unsigned long long)perCallSize, (unsigned long long)(perCallSize * N));
-        }
-        else
-        {
-            dxr2CmdList->ExecuteIndirectRTASOperations(1, &op,
-                D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
-        }
+        dxr2CmdList->ExecuteIndirectRTASOperations(1, &op,
+            D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
 
         D3D12_RESOURCE_BARRIER bars[] = {
             CD3DX12_RESOURCE_BARRIER::UAV(clasResultBuf.Get()),
@@ -1306,18 +863,10 @@ public:
     // ------------------------------------------------------------------
     void BuildBlas()
     {
-        if (wa1BlasPerClas)
-        {
-            BuildBlasOnePerClas();
-            return;
-        }
-
         D3D12_RTAS_CLAS_INPUTS_DESC blas = {};
         blas.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
         blas.MaxArgCount        = 1;
-        blas.Mode               = fixBlasImplicit
-                                  ? D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS
-                                  : D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
+        blas.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
         blas.MaxTotalClasCount  = clusterCount;
         blas.MaxClasCountPerArg = clusterCount;
 
@@ -1337,35 +886,15 @@ public:
         D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS arg = {};
         arg.ClasAddressCount  = clusterCount;
         arg.ClasAddressStride = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-        // --fix-reupload: read CPU-uploaded addresses (mirroring the d3d12conf
-        // test pattern) instead of the GPU-written UAV from the prior CLAS build.
-        arg.ClasAddressArray  = fixReupload && clasAddrFresh
-            ? clasAddrFresh->GetGPUVirtualAddress()
-            : clasAddrArray->GetGPUVirtualAddress();
+        arg.ClasAddressArray  = clasAddrArray->GetGPUVirtualAddress();
         AllocateUploadBuffer(device.Get(), &arg, sizeof(arg),  &blasArgsBuf,    L"BLAS arg");
         AllocateUploadBuffer(device.Get(), &blasGPUVA, sizeof(blasGPUVA), &blasDestAddrBuf, L"BLAS dest");
 
         D3D12_RTAS_BATCHED_OPERATION_DATA batched = {};
         batched.BatchScratchData      = blasScratchBuf->GetGPUVirtualAddress();
+        batched.ResultAddressArray    = { blasDestAddrBuf->GetGPUVirtualAddress(),
+                                          sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
         batched.IndirectArgumentArray = { blasArgsBuf->GetGPUVirtualAddress(), sizeof(arg) };
-        if (fixBlasImplicit)
-        {
-            // IMPLICIT: a single result-buffer base, driver picks per-arg offsets,
-            // writes them to ResultAddressArray.
-            batched.BatchResultData    = blasStorage->GetGPUVirtualAddress();
-            // Need an output addr-array UAV for the driver to write into.
-            AllocateUAVBuffer(device.Get(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
-                              &blasDestAddrBuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                              L"BLAS dest addrs (implicit)");
-            batched.ResultAddressArray = { blasDestAddrBuf->GetGPUVirtualAddress(),
-                                           sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-        }
-        else
-        {
-            // EXPLICIT: per-arg destination addresses are CPU-known and uploaded.
-            batched.ResultAddressArray = { blasDestAddrBuf->GetGPUVirtualAddress(),
-                                           sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-        }
 
         D3D12_RTAS_OPERATION_DESC op = {};
         op.Inputs                = inputs;
@@ -1377,136 +906,26 @@ public:
         cmdList->ResourceBarrier(1, &bar);
     }
 
-    // Workaround mode: build clusterCount separate BLASes, each containing
-    // exactly 1 CLAS. (Tests the hypothesis "NVIDIA BLAS-from-CLAS only
-    // consumes the first ClasAddressArray entry for COMPRESSED1".)
-    std::vector<ComPtr<ID3D12Resource>>          waBlasStores;
-    std::vector<D3D12_GPU_VIRTUAL_ADDRESS>       waBlasGVAs;
-
-    void BuildBlasOnePerClas()
-    {
-        // Caller (BuildAccelerationStructures) has already done split + readback
-        // (we force-set fixSplit when wa1BlasPerClas in ParseCommandLine).
-        // cmdList is already open + empty here.
-
-        // Re-read the addresses from clasAddrReadback (populated by the split-
-        // mode CLAS readback).
-        void* mapped = nullptr;
-        TF(clasAddrReadback->Map(0, nullptr, &mapped));
-        std::vector<D3D12_GPU_VIRTUAL_ADDRESS> clasGVAs(clusterCount);
-        memcpy(clasGVAs.data(), mapped, clasGVAs.size() * sizeof(clasGVAs[0]));
-        D3D12_RANGE noWrite = {};
-        clasAddrReadback->Unmap(0, &noWrite);
-
-        D3D12_RTAS_CLAS_INPUTS_DESC blas = {};
-        blas.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
-        blas.MaxArgCount        = 1;
-        blas.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
-        blas.MaxTotalClasCount  = 1;
-        blas.MaxClasCountPerArg = 1;
-
-        D3D12_RTAS_OPERATION_INPUTS inputs = {};
-        inputs.Type      = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
-        inputs.pClasDesc = &blas;
-
-        D3D12_RTAS_OPERATION_PREBUILD_INFO pre = {};
-        dxr2Device->GetRTASOperationPrebuildInfo(&inputs, &pre);
-
-        AllocateUAVBuffer(device.Get(), std::max<UINT64>(pre.ScratchDataSizeInBytes, 256ull),
-            &blasScratchBuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"BLAS scratch (per-cluster)");
-
-        waBlasStores.assign(clusterCount, {});
-        waBlasGVAs.assign(clusterCount, 0);
-        for (UINT i = 0; i < clusterCount; ++i)
-        {
-            AllocateUAVBuffer(device.Get(), pre.ResultDataMaxSizeInBytes, &waBlasStores[i],
-                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, L"Per-cluster BLAS");
-            waBlasGVAs[i] = waBlasStores[i]->GetGPUVirtualAddress();
-
-            // Per-arg CLAS-address-array buffer (single CLAS).
-            ComPtr<ID3D12Resource> clasAddrBuf;
-            AllocateUploadBuffer(device.Get(), &clasGVAs[i], sizeof(clasGVAs[i]),
-                                 &clasAddrBuf, L"single CLAS addr");
-            // Per-arg BLAS-from-CLAS args.
-            D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS arg = {};
-            arg.ClasAddressCount  = 1;
-            arg.ClasAddressStride = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
-            arg.ClasAddressArray  = clasAddrBuf->GetGPUVirtualAddress();
-            ComPtr<ID3D12Resource> argBuf;
-            AllocateUploadBuffer(device.Get(), &arg, sizeof(arg), &argBuf, L"single BLAS arg");
-            ComPtr<ID3D12Resource> destBuf;
-            AllocateUploadBuffer(device.Get(), &waBlasGVAs[i], sizeof(waBlasGVAs[i]),
-                                 &destBuf, L"single BLAS dest");
-
-            D3D12_RTAS_BATCHED_OPERATION_DATA batched = {};
-            batched.BatchScratchData      = blasScratchBuf->GetGPUVirtualAddress();
-            batched.ResultAddressArray    = { destBuf->GetGPUVirtualAddress(), sizeof(D3D12_GPU_VIRTUAL_ADDRESS) };
-            batched.IndirectArgumentArray = { argBuf->GetGPUVirtualAddress(), sizeof(arg) };
-
-            D3D12_RTAS_OPERATION_DESC op = {};
-            op.Inputs                = inputs;
-            op.pBatchedOperationData = &batched;
-            dxr2CmdList->ExecuteIndirectRTASOperations(1, &op,
-                D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
-
-            // Scratch is shared across all 6 per-cluster BLAS builds; need a
-            // UAV barrier between them so the next iteration sees the prior
-            // build complete + scratch free for reuse.
-            D3D12_RESOURCE_BARRIER scratchBar = CD3DX12_RESOURCE_BARRIER::UAV(blasScratchBuf.Get());
-            cmdList->ResourceBarrier(1, &scratchBar);
-
-            // Keep the small upload buffers alive across the loop iteration
-            // until execute+wait; need to add them to a holder.
-            waUploadKeepalive.push_back(clasAddrBuf);
-            waUploadKeepalive.push_back(argBuf);
-            waUploadKeepalive.push_back(destBuf);
-        }
-
-        // UAV barrier on all per-cluster BLAS storage.
-        std::vector<D3D12_RESOURCE_BARRIER> bars;
-        for (auto& b : waBlasStores)
-            bars.push_back(CD3DX12_RESOURCE_BARRIER::UAV(b.Get()));
-        cmdList->ResourceBarrier((UINT)bars.size(), bars.data());
-
-        TF(cmdList->Close());
-        ID3D12CommandList* lists[] = { cmdList.Get() };
-        queue->ExecuteCommandLists(1, lists);
-        WaitForGpu();
-
-        TF(cmdAlloc->Reset());
-        TF(cmdList->Reset(cmdAlloc.Get(), nullptr));
-
-        Log(L"[wa-1blas-per-clas] built %u single-CLAS BLASes\n", clusterCount);
-    }
-
-    std::vector<ComPtr<ID3D12Resource>> waUploadKeepalive;
-
     // ------------------------------------------------------------------
     void BuildTlas()
     {
-        const UINT numInstances = wa1BlasPerClas ? clusterCount : 1u;
-        std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances(numInstances);
-        for (UINT i = 0; i < numInstances; ++i)
-        {
-            auto& inst = instances[i];
-            inst = {};
-            inst.Transform[0][0] = 1.0f;
-            inst.Transform[1][1] = 1.0f;
-            inst.Transform[2][2] = 1.0f;
-            inst.InstanceID                          = i;
-            inst.InstanceMask                        = 0xFF;
-            inst.InstanceContributionToHitGroupIndex = 0;
-            inst.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
-            inst.AccelerationStructure               = wa1BlasPerClas ? waBlasGVAs[i] : blasGPUVA;
-        }
-        AllocateUploadBuffer(device.Get(), instances.data(),
-                             instances.size() * sizeof(instances[0]),
+        D3D12_RAYTRACING_INSTANCE_DESC inst = {};
+        // Identity transform (row-major 3x4): the cube is already at origin.
+        inst.Transform[0][0] = 1.0f;
+        inst.Transform[1][1] = 1.0f;
+        inst.Transform[2][2] = 1.0f;
+        inst.InstanceID                          = 0;
+        inst.InstanceMask                        = 0xFF;
+        inst.InstanceContributionToHitGroupIndex = 0;
+        inst.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+        inst.AccelerationStructure               = blasGPUVA;
+        AllocateUploadBuffer(device.Get(), &inst, sizeof(inst),
                              &tlasInstanceBuf, L"TLAS instance");
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasIn = {};
         tlasIn.Type          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
         tlasIn.DescsLayout   = D3D12_ELEMENTS_LAYOUT_ARRAY;
-        tlasIn.NumDescs      = numInstances;
+        tlasIn.NumDescs      = 1;
         tlasIn.Flags         = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
         tlasIn.InstanceDescs = tlasInstanceBuf->GetGPUVirtualAddress();
 
@@ -1694,9 +1113,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow)
         app.ParseCommandLine(argc, argv);
         LocalFree(argv);
 
-        const wchar_t* title = (app.mode == App::VertexMode::Compressed1)
-            ? L"DXR2 COMPRESSED1 repro - 1 face visible (BUG)"
-            : L"DXR2 COMPRESSED1 repro - full cube (--vertex-format float)";
+        wchar_t title[160];
+        _snwprintf_s(title, _TRUNCATE,
+            L"DXR2 COMPRESSED1 repro - %ls%ls",
+            app.mode == App::VertexMode::Compressed1
+                ? (app.fix ? L"COMPRESSED1 + --fix"
+                           : L"COMPRESSED1 (default - BUG)")
+                : L"FLOAT32_3 (reference)",
+            app.adapterKind == App::AdapterKind::Warp ? L" [WARP]" : L"");
         CreateAppWindow(hInst, title);
 
         app.Init();

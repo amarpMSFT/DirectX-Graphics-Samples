@@ -69,6 +69,21 @@ D3D12RaytracingClusteredGeometry::D3D12RaytracingClusteredGeometry(UINT width, U
 
 void D3D12RaytracingClusteredGeometry::OnInit()
 {
+    // Enable DRED (Device Removed Extended Data) BEFORE device creation so
+    // any TDR/device-removed events capture GPU breadcrumbs + page-fault
+    // info into the log.  Costs ~0 perf and is invaluable for diagnosing
+    // GPU hangs during TLAS/BLAS work.
+    {
+        ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+        HRESULT hrDred = D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings));
+        if (SUCCEEDED(hrDred) && dredSettings) {
+            dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            SampleLog::Write(L"OnInit: DRED enabled (breadcrumbs + page-fault)\n");
+        } else {
+            SampleLog::LogF(L"OnInit: DRED unavailable hr=0x%08X\n", (unsigned)hrDred);
+        }
+    }
     // ---- DXR2 experimental-features opt-in ----
     // The runtime requires D3D12RaytracingExperiment to be enabled BEFORE any
     // D3D12CreateDevice call in this process. Without it, ClustersAndPTLAS
@@ -4382,15 +4397,26 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
             // BuildAnimatedClonesSetup).
             instances[row].InstanceID  = ac.materialOverrideSlot;
             instances[row].InstanceMask = 0xFF;
-            instances[row].InstanceContributionToHitGroupIndex = contrib;
-            instances[row].Flags = animFlags;
+            // Anim clones: use OPAQUE hit group + FORCE_OPAQUE flag.
+            // The source's full glass+refraction render cost (reflect 3
+            // bounces + refract 5 bounces per hit) does NOT scale to
+            // N=20 clones -- the cascading refraction rays overrun the
+            // TDR limit (DXGI_ERROR_DEVICE_HUNG) on a 4090.  Opaque-mode
+            // anim clones still inherit the source's chrome+checker
+            // appearance via the per-cluster material overrides (because
+            // they share source's BLAS/CLAS), they just don't refract.
+            // Visually: chrome+checker wave-deformed balls -- matches
+            // user request of "balls like the middle ball" minus the
+            // see-through glass effect.
+            instances[row].InstanceContributionToHitGroupIndex = kHitGroupContribOpaque;
+            instances[row].Flags = D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
             // Phase 2: each clone has its own BLAS in m_animClonesBlasPool;
             // fall back to source GVA when pool is null (phase 1).
             instances[row].AccelerationStructure =
                 (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
                     ? ac.blasGPUVA
                     : animBlasGVA;
-            (isGlass ? nGlass : nOpaque)++;
+            ++nOpaque;
         }
     }
     AllocateUploadBuffer(device, instances.data(),
@@ -4452,23 +4478,9 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
 {
     if (!m_tlasBuffer || !m_tlasScratchBuffer || !m_tlasInstanceDescs) return;
-    // ⚠ CRITICAL BUG (next to fix): N_total here OMITS m_animatedClones.size()
-    // so per-frame TLAS rebuild only includes the first (N_static + N_anim)
-    // instances -- the N_animClone anim-clone instance descs written into
-    // m_tlasInstanceDescs by BuildTlasClassic are NEVER ENROLLED in the
-    // per-frame TLAS, so anim clones don't render.
-    //
-    // The intuitive fix (add + m_animatedClones.size()) triggers TDR
-    // (DXGI_ERROR_DEVICE_HUNG) even when clones reference a known-good
-    // BLAS (source's or a static obj's).  Cause unknown -- requires
-    // further investigation:
-    //   - Initial BuildTlasClassic with full N_total works
-    //   - Per-frame TLAS rebuild with full N_total + ANY mask=0xFF anim
-    //     clone instance causes the GPU to hang during ray traversal
-    //   - Setting mask=0 (skip during traversal) avoids the TDR
-    //   - Bug reproduces with N=1 anim clone too -- not a scale issue
     const UINT N_total = (UINT)m_objects.size()
-        + (m_animatedObjectEnabled ? 1u : 0u);
+        + (m_animatedObjectEnabled ? 1u : 0u)
+        + (UINT)m_animatedClones.size();
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
     tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -5771,6 +5783,51 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
 
 void D3D12RaytracingClusteredGeometry::OnDeviceLost()
 {
+    // Dump DRED breadcrumbs + page-fault info to identify what GPU command hung.
+    auto device = m_deviceResources->GetD3DDevice();
+    if (device) {
+        ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+        HRESULT hrDred = device->QueryInterface(IID_PPV_ARGS(&dred));
+        if (SUCCEEDED(hrDred) && dred) {
+            SampleLog::Write(L"[DRED] === Device removed, extracting GPU breadcrumbs ===\n");
+            // Auto-breadcrumbs: list of last GPU operations per command list
+            D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bcOut = {};
+            HRESULT hrBC = dred->GetAutoBreadcrumbsOutput1(&bcOut);
+            if (SUCCEEDED(hrBC) && bcOut.pHeadAutoBreadcrumbNode) {
+                int nodeIdx = 0;
+                for (auto* node = bcOut.pHeadAutoBreadcrumbNode; node; node = node->pNext, ++nodeIdx) {
+                    UINT lastOp = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+                    UINT totalOps = node->BreadcrumbCount;
+                    SampleLog::LogF(L"[DRED] node %d: list=%s, breadcrumbs %u/%u\n",
+                        nodeIdx,
+                        node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"(unnamed)",
+                        lastOp, totalOps);
+                    // Print operations near the last one (in case op N didn't finish, op N-1 was the previous one)
+                    UINT from = (lastOp > 5) ? lastOp - 5 : 0;
+                    UINT to   = std::min<UINT>(lastOp + 1, totalOps);
+                    for (UINT i = from; i < to; ++i) {
+                        SampleLog::LogF(L"[DRED]   op[%u] = %d %s\n",
+                            i, (int)node->pCommandHistory[i],
+                            (i == lastOp) ? L"<-- LAST EXECUTED" : L"");
+                    }
+                }
+            } else {
+                SampleLog::LogF(L"[DRED] no breadcrumbs (hr=0x%08X)\n", (unsigned)hrBC);
+            }
+            // Page fault info: VA + nearby allocations
+            D3D12_DRED_PAGE_FAULT_OUTPUT pfOut = {};
+            HRESULT hrPF = dred->GetPageFaultAllocationOutput(&pfOut);
+            if (SUCCEEDED(hrPF)) {
+                SampleLog::LogF(L"[DRED] PageFault VA=0x%llX\n",
+                    (unsigned long long)pfOut.PageFaultVA);
+                int allocIdx = 0;
+                for (auto* a = pfOut.pHeadExistingAllocationNode; a; a = a->pNext, ++allocIdx) {
+                    SampleLog::LogF(L"[DRED] existing alloc[%d]: name=%s type=%d\n",
+                        allocIdx, a->ObjectNameW ? a->ObjectNameW : L"(unnamed)", (int)a->AllocationType);
+                }
+            }
+        }
+    }
     OnDestroy();
 }
 

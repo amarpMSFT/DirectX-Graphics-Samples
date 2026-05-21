@@ -644,6 +644,25 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     auto fmt2 = [](wchar_t* dst, size_t cch, const wchar_t* f, double v) {
         swprintf_s(dst, cch, f, v); return dst;
     };
+    // Smart size formatter: prints "X.XX MB" when value rounds to >= 0.01 MB
+    // at the displayed precision, otherwise falls back to "X.XX KB" so a
+    // sub-10KB allocation (e.g. TLAS at low N, materials buffer) doesn't
+    // disappear as "0.00 MB".  Caller passes the raw byte count so we always
+    // pick the right unit for the actual value (delta colouring still uses
+    // MB pairs separately so cross-unit transitions colour correctly).
+    auto fmtSize = [](wchar_t* dst, size_t cch, UINT64 bytes) {
+        const double mb = bytes / (1024.0 * 1024.0);
+        if (mb >= 0.01) swprintf_s(dst, cch, L"%.2f MB", mb);
+        else            swprintf_s(dst, cch, L"%.2f KB", bytes / 1024.0);
+        return dst;
+    };
+    // Same smart unit picker but taking the already-summed MB value (for
+    // multi-term sums like total scratch = template + per-frame + BLAS).
+    auto fmtMb = [](wchar_t* dst, size_t cch, double mb) {
+        if (mb >= 0.01) swprintf_s(dst, cch, L"%.2f MB", mb);
+        else            swprintf_s(dst, cch, L"%.2f KB", mb * 1024.0);
+        return dst;
+    };
     wchar_t fnum[64];   // scratch for formatted numbers
 
     wchar_t buf[256];
@@ -740,10 +759,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
         XMFLOAT2 c = pos;
         drawSeg(L"  BLASes ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
-        drawSeg(L" MB alloc  (", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
-        drawSeg(L" MB actual, avg ", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClasAllocBytes), c, deltaColour(allocMb, prevAllocMb));
+            drawSeg(L" alloc  (", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClasActualBytes), c, deltaColour(actualMb, prevActMb));
+            drawSeg(L" actual, avg ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", avgKb), c, deltaColour(avgKb, prevAvgKb));
         drawSeg(L" KB/geom)", c, kSubtle);
         pos.y += kLineH;
@@ -757,15 +776,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradTotalMb), c, deltaColour(tradTotalMb, prevTotalMb));
-        drawSeg(L" MB  (BLASes)", c, kSubtle);
+        drawSeg(fmtMb(fnum, _countof(fnum), tradTotalMb), c, deltaColour(tradTotalMb, prevTotalMb));
+            drawSeg(L"  (BLASes)", c, kSubtle);
         pos.y += kLineH;
         c = pos;
         drawSeg(L"  scratch ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
-        drawSeg(L" MB    inputs (vb+ib) ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
-        drawSeg(L" MB", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.traditionalBlasScratchBytes), c, deltaColour(scratchMb, prevScrMb));
+            drawSeg(L"    inputs (vb+ib) ", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClusterInputBytes), c, deltaColour(inputsMb, prevInpMb));
         pos.y += kLineH;
     }
     else
@@ -800,10 +818,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
         XMFLOAT2 c = pos;
         drawSeg(L"  CLASes ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", allocMb), c, deltaColour(allocMb, prevAllocMb));
-        drawSeg(L" MB alloc  (", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", actualMb), c, deltaColour(actualMb, prevActMb));
-        drawSeg(L" MB actual, avg ", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClasAllocBytes), c, deltaColour(allocMb, prevAllocMb));
+            drawSeg(L" alloc  (", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClasActualBytes), c, deltaColour(actualMb, prevActMb));
+            drawSeg(L" actual, avg ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", avgKb), c, deltaColour(avgKb, prevAvgKb));
         drawSeg(L" KB/cl)", c, kSubtle);
         pos.y += kLineH;
@@ -814,8 +832,7 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         // trad (which has just BLAS) needs both lines visible.
         c = pos;
         drawSeg(L"  BLASes ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", blasMb), c, deltaColour(blasMb, prevBlasMb));
-        drawSeg(L" MB", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticBlasTotalBytes), c, deltaColour(blasMb, prevBlasMb));
         pos.y += kLineH;
 
         // Section subtotal (cross-mode delta vs m_overlayStatsPrev -- so a
@@ -828,8 +845,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double prevTotalMb = sectionStaticTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
         c = pos;
         drawSeg(L"  total ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clTotalMb), c, deltaColour(clTotalMb, prevTotalMb));
-        drawSeg(L" MB  (CLASes + BLASes)", c, kSubtle);
+        drawSeg(fmtMb(fnum, _countof(fnum), clTotalMb), c, deltaColour(clTotalMb, prevTotalMb));
+            drawSeg(L"  (CLASes + BLASes)", c, kSubtle);
         pos.y += kLineH;
         // Scratch + inputs: outside the BVH total above (scratch is
         // workspace the driver re-uses across builds; inputs are the
@@ -837,10 +854,9 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         // because they're conceptually the "supporting" memory.
         c = pos;
         drawSeg(L"  scratch ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scratchMb), c, deltaColour(scratchMb, prevScrMb));
-        drawSeg(L" MB    inputs ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
-        drawSeg(L" MB", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.traditionalBlasScratchBytes), c, deltaColour(scratchMb, prevScrMb));
+            drawSeg(L"    inputs ", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.staticClusterInputBytes), c, deltaColour(inputsMb, prevInpMb));
         pos.y += kLineH;
     }
     pos.y += kSectionGap;
@@ -908,8 +924,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
             XMFLOAT2 c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-            drawSeg(L" MB  (source)", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.animatedBlasBytes), c, deltaColour(aBlasMb, prevABlas));
+            drawSeg(L"  (source)", c, kSubtle);
             pos.y += kLineH;
             if (s.animClonesPooledCount > 0 || p.animClonesPooledCount > 0)
             {
@@ -931,15 +947,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradAnimTotalMb), c, deltaColour(tradAnimTotalMb, prevAnimTotalMb));
-            drawSeg(L" MB  (source BLAS + clones pool)", c, kSubtle);
+            drawSeg(fmtMb(fnum, _countof(fnum), tradAnimTotalMb), c, deltaColour(tradAnimTotalMb, prevAnimTotalMb));
+            drawSeg(L"  (source BLAS + clones pool)", c, kSubtle);
             pos.y += kLineH;
             c = pos;
             drawSeg(L"  scratch ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb + cScrMb), c, deltaColour(aScrMb + cScrMb, prevAScr + prevCScr));
-            drawSeg(L" MB    inputs (ib + rest) ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aInputsMb), c, deltaColour(aInputsMb, prevAInp));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(fmtMb(fnum, _countof(fnum), aScrMb + cScrMb), c, deltaColour(aScrMb + cScrMb, prevAScr + prevCScr));
+            drawSeg(L"    inputs (ib + rest) ", c, kSubtle);
+            drawSeg(fmtMb(fnum, _countof(fnum), aInputsMb), c, deltaColour(aInputsMb, prevAInp));
             pos.y += kLineH;
             pos.y += kSectionGap;
         }
@@ -979,22 +994,21 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
             XMFLOAT2 c = pos;
             drawSeg(L"  templates ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tplMb), c, deltaColour(tplMb, prevTplMb));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.animatedTemplateBytes), c, deltaColour(tplMb, prevTplMb));
             pos.y += kLineH;
 
             c = pos;
             drawSeg(L"  per-frame CLASes ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfMb), c, deltaColour(pfMb, prevPfMb));
-            drawSeg(L" MB alloc  (", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", pfActMb), c, deltaColour(pfActMb, prevPfAct));
-            drawSeg(L" MB actual)", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.animatedPerFrameClasAllocBytes), c, deltaColour(pfMb, prevPfMb));
+            drawSeg(L" alloc  (", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.animatedPerFrameClasActualBytes), c, deltaColour(pfActMb, prevPfAct));
+            drawSeg(L" actual)", c, kSubtle);
             pos.y += kLineH;
 
             c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-            drawSeg(L" MB  (source)", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.animatedBlasBytes), c, deltaColour(aBlasMb, prevABlas));
+            drawSeg(L"  (source)", c, kSubtle);
             pos.y += kLineH;
             if (s.animClonesPooledCount > 0 || p.animClonesPooledCount > 0)
             {
@@ -1014,15 +1028,14 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
-            drawSeg(L" MB  (templates + CLASes + source BLAS + clones pool)", c, kSubtle);
+            drawSeg(fmtMb(fnum, _countof(fnum), clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
+            drawSeg(L"  (templates + CLASes + source BLAS + clones pool)", c, kSubtle);
             pos.y += kLineH;
             c = pos;
             drawSeg(L"  scratch ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", scrMb), c, deltaColour(scrMb, prevScrMb));
-            drawSeg(L" MB    inputs (hint+rest) ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", inputsMb), c, deltaColour(inputsMb, prevInpMb));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(fmtMb(fnum, _countof(fnum), scrMb), c, deltaColour(scrMb, prevScrMb));
+            drawSeg(L"    inputs (hint+rest) ", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), s.staticClusterInputBytes), c, deltaColour(inputsMb, prevInpMb));
             pos.y += kLineH;
             pos.y += kSectionGap;
         }
@@ -1069,19 +1082,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         const double tlasMb  = s.tlasBytes / (1024.0 * 1024.0);
         XMFLOAT2 c = pos;
         drawSeg(L"  AS memory ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", grandMb), c, deltaColourU(grandTotal, prevGrandTotal));
-        drawSeg(L" MB   (static ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", statMb), c, deltaColourU(staticTotal, prevStaticTotal));
-        drawSeg(L" MB", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), grandTotal), c, deltaColourU(grandTotal, prevGrandTotal));
+            drawSeg(L"   (static ", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), staticTotal), c, deltaColourU(staticTotal, prevStaticTotal));
         if (animatedTotal > 0 || prevAnimatedTotal > 0)
         {
             drawSeg(L" + animated ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", animMb), c, deltaColourU(animatedTotal, prevAnimatedTotal));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(fmtSize(fnum, _countof(fnum), animatedTotal), c, deltaColourU(animatedTotal, prevAnimatedTotal));
         }
         drawSeg(L" + TLAS ", c, kSubtle);
-        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tlasMb), c, deltaColourU(s.tlasBytes, p.tlasBytes));
-        drawSeg(L" MB)", c, kSubtle);
+        drawSeg(fmtSize(fnum, _countof(fnum), s.tlasBytes), c, deltaColourU(s.tlasBytes, p.tlasBytes));
+            drawSeg(L")", c, kSubtle);
         pos.y += kLineH;
         pos.y += kSectionGap;
     }

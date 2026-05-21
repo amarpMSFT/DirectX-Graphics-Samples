@@ -4337,7 +4337,10 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(a.worldPos.x, a.worldPos.y, a.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[N_static].Transform), m);
         instances[N_static].InstanceID  = a.instanceID;
-        instances[N_static].InstanceMask= 0xFF;
+        // ⚠ DIAGNOSTIC: mask=0 hides the central animated source ball too,
+        // so the user sees ONLY the 20 anim clones at spiral positions.
+        // Revert to 0xFF when done.
+        instances[N_static].InstanceMask= 0x00;
         // Animated object has no ClusterObject scene config yet; treat by
         // material only (currently refractive glass -> GlassHitGroup).
         const auto& aMat = m_materials[a.instanceID];

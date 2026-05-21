@@ -407,20 +407,22 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone: lives in the SAME spiral as the static
-            // clones (every 5th slot in the cycle is the anim variant
-            // -- exactly as if it were "part of the static sequence",
-            // just animated).  Same spiralPos formula, same per-clone
-            // random scale, no random rotation (so the wave deformation
-            // reads the same way on every clone, matching the source).
+            // Animated clone: EXACTLY as if it were one of the static
+            // clones in the sequence -- same spiralPos formula (Vogel
+            // sunflower starting at innerR=4.5, area-equivalent spacing
+            // expanding outward via r=sqrt(innerR^2 + i*spacing^2)),
+            // same per-clone random rotation + scale, same height
+            // curve.  The ONLY difference vs a static clone at this
+            // position is that this slot is animated (shared CLAS so
+            // it wave-deforms in lock-step with the central source).
             //
-            // Sentinel material override => inherit source's per-cluster
-            // chrome+glass checker so each clone looks just like the
-            // central animated ball, at a different spiral position.
+            // Sentinel material override => inherit source's chrome+
+            // glass checker so each clone visually matches the central
+            // animated ball.
             AnimatedCloneInstance ac;
             ac.worldPos             = spiralPos;
-            ac.worldRotEuler        = DirectX::XMFLOAT3(0.f, 0.f, 0.f);
-            ac.worldScale           = randScale;
+            ac.worldRotEuler        = randRot;        // same as static would get
+            ac.worldScale           = randScale;      // same as static would get
             ac.materialOverrideSlot = 0xFFFFFFFFu;
             m_animatedClones.push_back(ac);
             continue;

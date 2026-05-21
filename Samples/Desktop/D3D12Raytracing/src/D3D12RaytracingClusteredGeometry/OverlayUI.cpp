@@ -1080,13 +1080,8 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             drawSeg(L" MB", c, kSubtle);
         }
         drawSeg(L" + TLAS ", c, kSubtle);
-        // TLAS is tiny (~3.5 KB for our 9-instance scene; reaches ~3 MB
-        // at 10K instances).  Stick with KB so values < 1 MB don't show as
-        // 0.00 MB; values >= 1 MB still read fine as e.g. "3019.3 KB".
-        wchar_t tlasBuf[32];
-        swprintf_s(tlasBuf, L"%.1f KB", s.tlasBytes / 1024.0);
-        drawSeg(tlasBuf, c, deltaColourU(s.tlasBytes, p.tlasBytes));
-        drawSeg(L")", c, kSubtle);
+        drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tlasMb), c, deltaColourU(s.tlasBytes, p.tlasBytes));
+        drawSeg(L" MB)", c, kSubtle);
         pos.y += kLineH;
         pos.y += kSectionGap;
     }

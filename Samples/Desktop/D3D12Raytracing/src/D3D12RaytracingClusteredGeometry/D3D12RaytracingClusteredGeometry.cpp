@@ -5302,7 +5302,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // colour so the scene reads instead of going pitch black.
     XMVECTOR sunDir = XMVector3Normalize(XMVectorSet(0.45f, 0.75f, 0.50f, 0.0f));
     XMStoreFloat4(&cb.lightDir, sunDir);
-    cb.lightDir.w = 0.15f;                                          // ambient floor (0.15 - middle setting; tried 0.08 punchy, reverted)
+    cb.lightDir.w = 0.30f;                                          // ambient floor (was 0.15 -- bumped so opaque objects' shadowed side isn't crushed; reflective/glass surfaces still read the full sun-vs-shadow contrast via their reflection/refraction terms)
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
 }
 

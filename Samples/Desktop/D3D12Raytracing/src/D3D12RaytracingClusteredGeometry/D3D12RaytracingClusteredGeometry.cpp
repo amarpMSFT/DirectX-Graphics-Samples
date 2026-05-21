@@ -3883,10 +3883,12 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimesta
         cl4_ts->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, pfTimestampBase + 0);
     cl->SetComputeRootSignature(m_animComputeRS.Get());
     cl->SetPipelineState(m_animComputePSO.Get());
-    struct { float t; UINT vertexCount; } params = {
-        (float)m_animSeconds, obj.totalVertexCount,
-    };
-    cl->SetComputeRoot32BitConstants(0, 2, &params, 0);
+    // Anim params written into mapped CB by UpdateSceneConstantBuffer
+    // each frame.  CB-via-CBV means GPU reads latest content at execute
+    // time, so a frozen t propagates to all in-flight frames immediately
+    // (matches the camera CB's behaviour -- the pre-pause-fix asymmetry
+    // was that camera was mapped but CS used root constants).
+    cl->SetComputeRootConstantBufferView (0, m_animParamsBuf->GetGPUVirtualAddress());
     cl->SetComputeRootShaderResourceView (1, obj.restPositionsBuffer ->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(2, obj.perFrameVertexBuffer->GetGPUVirtualAddress());
     const UINT groups = (obj.totalVertexCount + 63u) / 64u;
@@ -4154,10 +4156,8 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
     // ------------------------------------------------------------------
     cl->SetComputeRootSignature(m_animComputeRS.Get());
     cl->SetPipelineState(m_animComputePSO.Get());
-    struct { float t; UINT vertexCount; } params = {
-        (float)m_animSeconds, obj.totalVertexCount,
-    };
-    cl->SetComputeRoot32BitConstants(0, 2, &params, 0);
+    // CBV (mapped) -- see comment at the other dispatch site above.
+    cl->SetComputeRootConstantBufferView (0, m_animParamsBuf->GetGPUVirtualAddress());
     cl->SetComputeRootShaderResourceView (1, obj.restPositionsBuffer ->GetGPUVirtualAddress());
     cl->SetComputeRootUnorderedAccessView(2, obj.perFrameVertexBuffer->GetGPUVirtualAddress());
     const UINT kThreadsPerGroup = 64;
@@ -4969,7 +4969,12 @@ void D3D12RaytracingClusteredGeometry::CreateAnimationComputePipeline()
     auto device = m_deviceResources->GetD3DDevice();
 
     CD3DX12_ROOT_PARAMETER rootParams[3] = {};
-    rootParams[0].InitAsConstants(2, /*shaderReg*/0);                  // b0 = { float t, uint vertexCount }
+    rootParams[0].InitAsConstantBufferView(/*shaderReg*/0);            // b0 = mapped CBV { float t, uint vertexCount }; CB lets the time
+                                                                       // value propagate to ALL in-flight frames immediately when CPU
+                                                                       // writes it (unlike root constants which bake-in per frame --
+                                                                       // that asymmetry made wobble visibly lag the camera for ~3
+                                                                       // frames after pause, since the camera CB was already mapped
+                                                                       // and the CS time wasn't).
     rootParams[1].InitAsShaderResourceView(0);                         // t0 = ByteAddressBuffer rest positions
     rootParams[2].InitAsUnorderedAccessView(0);                        // u0 = RWByteAddressBuffer anim positions
 
@@ -4999,6 +5004,22 @@ void D3D12RaytracingClusteredGeometry::CreateAnimationComputePipeline()
 
     SampleLog::LogF(L"[anim-cs] compute PSO built (%zu bytes of CS bytecode)\n",
                     (size_t)ARRAYSIZE(g_pAnimateBall));
+
+    // Allocate the persistent-mapped CB that AnimateBall.hlsl reads its
+    // (time, vertexCount) inputs from.  256-byte aligned per D3D12 CBV
+    // alignment requirement.
+    {
+        auto uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        auto bufDesc    = CD3DX12_RESOURCE_DESC::Buffer(256);
+        ThrowIfFailed(device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&m_animParamsBuf)));
+        m_animParamsBuf->SetName(L"Anim params CB (t + vertexCount)");
+        CD3DX12_RANGE noRead(0, 0);
+        ThrowIfFailed(m_animParamsBuf->Map(0, &noRead, reinterpret_cast<void**>(&m_animParamsMapped)));
+        *m_animParamsMapped = { 0.0f, 0u, 0u, 0u };
+    }
 }
 
 // =====================================================================
@@ -5304,6 +5325,17 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     XMStoreFloat4(&cb.lightDir, sunDir);
     cb.lightDir.w = 0.40f;                                          // ambient floor
     memcpy(m_sceneCBMapped, &cb, sizeof(cb));
+
+    // Anim params CB (mapped) -- written here every frame so the latest
+    // (frozen-when-paused) t propagates to all in-flight CS dispatches
+    // immediately, matching the camera CB's semantics.  Used by
+    // UpdateAnimatedObjectPerFrame's CS dispatch via root CBV (NOT
+    // 32-bit root constants which would bake in stale values).
+    if (m_animParamsMapped)
+    {
+        m_animParamsMapped->t           = (float)m_animSeconds;
+        m_animParamsMapped->vertexCount = m_animatedObjectEnabled ? m_animatedObject.totalVertexCount : 0u;
+    }
 }
 
 // =====================================================================================
@@ -5623,21 +5655,18 @@ void D3D12RaytracingClusteredGeometry::DoRender()
         // overlay split between "anim CS" and "anim build" works for
         // both modes uniformly.
         //
-        // SKIP the per-frame anim work entirely when paused so the
-        // wobble freezes IN LOCK-STEP with the camera (CPU-side
-        // m_animSeconds freezing already freezes the camera matrix
-        // immediately, but GPU pipeline depth made the wobble visibly
-        // lag a few frames before this gate -- now both freeze on the
-        // same frame the keypress happens).  The BLAS from the LAST
-        // dispatch stays valid; the TLAS rebuild references it
-        // unchanged.
-        if (!m_animPaused)
-        {
-            if (m_geometryMode == GeometryMode::Clusters)
-                UpdateAnimatedObjectPerFrame(base);
-            else
-                UpdateAnimatedTradPerFrame(base);
-        }
+        // PAUSE BEHAVIOUR: this update runs every frame, paused or not.
+        // The CS reads its time from a mapped CB (m_animParamsBuf,
+        // populated in UpdateSceneConstantBuffer); when paused, the
+        // CPU-side m_animSeconds freezes, the CB content freezes, and
+        // every in-flight CS dispatch reads the FROZEN time at execute
+        // time.  Vertex buffer therefore freezes the same instant the
+        // camera does (camera is in m_sceneCB, same propagation
+        // mechanism).
+        if (m_geometryMode == GeometryMode::Clusters)
+            UpdateAnimatedObjectPerFrame(base);
+        else
+            UpdateAnimatedTradPerFrame(base);
 
         cl4->EndQuery(m_pfQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, base + 8);
         if (m_staticRebuildMode == StaticRebuildMode::ClasAndBlas &&
@@ -5807,6 +5836,11 @@ void D3D12RaytracingClusteredGeometry::OnDestroy()
     {
         m_sceneCB->Unmap(0, nullptr);
         m_sceneCBMapped = nullptr;
+    }
+    if (m_animParamsBuf && m_animParamsMapped)
+    {
+        m_animParamsBuf->Unmap(0, nullptr);
+        m_animParamsMapped = nullptr;
     }
 
     // Animated object: release all its GPU resources.  Args buffers are

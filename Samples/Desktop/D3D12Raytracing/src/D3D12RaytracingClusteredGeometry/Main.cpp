@@ -508,6 +508,18 @@ public:
     bool wa1BlasPerClas  = false;    // workaround: 1 BLAS per CLAS, all in TLAS
     bool wa1ClasPerBuild = false;    // workaround: 1 CLAS per BUILD_CLAS_FROM_TRIANGLES call
                                      //   (test whether multi-arg CLAS build only writes the first arg)
+    bool fixLooseLimits  = false;    // use 256/256/256 ClusterLimits (matches d3d12conf test)
+                                     //   instead of tight (2 tris, 4 verts) actual values
+    bool fixGeoFlagArray = false;    // supply a per-triangle GeometryIndexAndFlagsArray
+                                     //   (works around a known NVIDIA driver bug where
+                                     //   BaseGeometryIndexAndFlags is not honored when no array)
+    // Per-field ClusterLimits overrides (default = tight: 2, 4, 2N, 4N).
+    // Setting any to a non-zero value bumps that one field; --fix-loose-limits
+    // bumps all four to 256/256/256*N/256*N at once.
+    UINT overrideMaxTriPerCluster   = 0;
+    UINT overrideMaxVertPerCluster  = 0;
+    UINT overrideMaxTotalTri        = 0;
+    UINT overrideMaxTotalVert       = 0;
 
     // ---- bug-pinpointing toggles ----
     //   --reverse-faces    emit cube faces in reverse order (test whether the
@@ -565,6 +577,9 @@ public:
     // are fed both as CLAS dests and as the BLAS-from-CLAS address array.
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> explicitClasVAs;
     ComPtr<ID3D12Resource>                explicitDestAddrUpload;
+    // --fix-geo-flag-array only: shared per-triangle array (all 2 tris get
+    // the OPAQUE flag in the upper byte, GeometryIndex=0 in lower 24 bits).
+    ComPtr<ID3D12Resource>                sharedGeoFlagArray;
     ComPtr<ID3D12Resource>                blasArgsBuf;
     ComPtr<ID3D12Resource>                blasDestAddrBuf;
     ComPtr<ID3D12Resource>                blasStorage;
@@ -609,6 +624,12 @@ public:
             else if (_wcsicmp(argv[i], L"--fix-blas-implicit") == 0) fixBlasImplicit = true;
             else if (_wcsicmp(argv[i], L"--wa-1blas-per-clas") == 0) { wa1BlasPerClas = true; fixSplit = true; }
             else if (_wcsicmp(argv[i], L"--wa-1clas-per-build") == 0) wa1ClasPerBuild = true;
+            else if (_wcsicmp(argv[i], L"--fix-loose-limits") == 0) fixLooseLimits = true;
+            else if (_wcsicmp(argv[i], L"--fix-geo-flag-array") == 0) fixGeoFlagArray = true;
+            else if (_wcsicmp(argv[i], L"--max-tri-per-cluster")  == 0 && i + 1 < argc) { overrideMaxTriPerCluster  = _wtoi(argv[i+1]); ++i; }
+            else if (_wcsicmp(argv[i], L"--max-vert-per-cluster") == 0 && i + 1 < argc) { overrideMaxVertPerCluster = _wtoi(argv[i+1]); ++i; }
+            else if (_wcsicmp(argv[i], L"--max-total-tri")        == 0 && i + 1 < argc) { overrideMaxTotalTri       = _wtoi(argv[i+1]); ++i; }
+            else if (_wcsicmp(argv[i], L"--max-total-vert")       == 0 && i + 1 < argc) { overrideMaxTotalVert      = _wtoi(argv[i+1]); ++i; }
         }
     }
 
@@ -1082,6 +1103,25 @@ public:
         // CPU-fill BUILD_CLAS_FROM_TRIANGLES_ARGS[N] (consumed by
         // ExecuteIndirectRTASOperations below).
         std::vector<D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS> args(clusterCount);
+
+        // --fix-geo-flag-array: shared per-triangle array (all clusters share
+        // the same 2-entry array - 2 tris per cluster, OPAQUE flag for both).
+        // Works around a known NVIDIA driver bug where BaseGeometryIndexAndFlags
+        // is not honored if GeometryIndexAndFlagsArray is NULL.
+        D3D12_GPU_VIRTUAL_ADDRESS geoFlagArrayGVA = 0;
+        if (fixGeoFlagArray)
+        {
+            const uint32_t perTri[2] = {
+                (uint32_t)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE,  // tri 0
+                (uint32_t)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE,  // tri 1
+            };
+            AllocateUploadBuffer(device.Get(), perTri, sizeof(perTri),
+                                 &sharedGeoFlagArray, L"GeometryIndexAndFlagsArray");
+            geoFlagArrayGVA = sharedGeoFlagArray->GetGPUVirtualAddress();
+            Log(L"[fix-geo-flag-array] shared per-tri array @ 0x%016llX  (OPAQUE flag per tri)\n",
+                (unsigned long long)geoFlagArrayGVA);
+        }
+
         for (UINT i = 0; i < clusterCount; ++i)
         {
             auto& a = args[i];
@@ -1089,12 +1129,19 @@ public:
             a.ClusterID                 = i;
             a.TriangleCount             = 2;
             a.VertexCount               = 4;
-            a.BaseGeometryIndexAndFlags = (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
+            a.BaseGeometryIndexAndFlags = fixGeoFlagArray
+                                          ? 0u                                       // flag now lives in the per-tri array
+                                          : (UINT)D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE;
             a.VertexBufferStride        = useFloat ? (UINT16)sizeof(float3) : 0;
             a.IndexBufferStride         = sizeof(uint16_t);
             a.PositionTruncateBitCount  = 0;
             a.VertexBuffer              = vbGVA[i];
             a.IndexBuffer               = ibGVA[i];
+            if (fixGeoFlagArray)
+            {
+                a.GeometryIndexAndFlagsArray       = geoFlagArrayGVA;
+                a.GeometryIndexAndFlagsArrayStride = (UINT16)sizeof(uint32_t);
+            }
         }
         AllocateUploadBuffer(device.Get(), args.data(),
                              args.size() * sizeof(args[0]),
@@ -1113,10 +1160,17 @@ public:
         D3D12_RTAS_CLUSTER_LIMITS limits = {};
         limits.MaxArgCount                                   = N;
         limits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 256;
-        limits.MaxTriangleCountPerCluster                    = 2;
-        limits.MaxVertexCountPerCluster                      = 4;
-        limits.MaxTotalTriangleCount                         = 2 * N;
-        limits.MaxTotalVertexCount                           = 4 * N;
+        limits.MaxTriangleCountPerCluster = overrideMaxTriPerCluster  ? overrideMaxTriPerCluster
+                                          : (fixLooseLimits ? 256u : 2u);
+        limits.MaxVertexCountPerCluster   = overrideMaxVertPerCluster ? overrideMaxVertPerCluster
+                                          : (fixLooseLimits ? 256u : 4u);
+        limits.MaxTotalTriangleCount      = overrideMaxTotalTri  ? overrideMaxTotalTri
+                                          : (fixLooseLimits ? 256u * N : 2u * N);
+        limits.MaxTotalVertexCount        = overrideMaxTotalVert ? overrideMaxTotalVert
+                                          : (fixLooseLimits ? 256u * N : 4u * N);
+        Log(L"[limits] MaxTriPerCluster=%u  MaxVertPerCluster=%u  MaxTotalTri=%u  MaxTotalVert=%u\n",
+            limits.MaxTriangleCountPerCluster, limits.MaxVertexCountPerCluster,
+            limits.MaxTotalTriangleCount,      limits.MaxTotalVertexCount);
 
         D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clas = {};
         clas.ClusterLimits                    = limits;
@@ -1190,26 +1244,42 @@ public:
             // the bug is "multi-arg CLAS build only writes the first arg's
             // CLAS for COMPRESSED1", this should fix it: every call sees only
             // one arg, which is "the first" by definition.
+            //
+            // IMPLICIT_DESTINATIONS allocates CLAS data starting at
+            // BatchResultData. To avoid each iteration clobbering the prior
+            // one's CLAS, query a 1-arg prebuild size and give each call its
+            // own slot in the result buffer (base + i*perCallSize).
+            D3D12_RTAS_CLUSTER_LIMITS limitsOne = limits;
+            limitsOne.MaxArgCount          = 1;
+            limitsOne.MaxTotalTriangleCount = 2;
+            limitsOne.MaxTotalVertexCount   = 4;
+            D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasOne = clas;
+            clasOne.ClusterLimits = limitsOne;
+            D3D12_RTAS_OPERATION_INPUTS inputsOne = inputs;
+            inputsOne.pClusterTrianglesDesc = &clasOne;
+            D3D12_RTAS_OPERATION_PREBUILD_INFO preOne = {};
+            dxr2Device->GetRTASOperationPrebuildInfo(&inputsOne, &preOne);
+            // Re-allocate the result buffer at N * per-call size so each call
+            // has a non-overlapping region.
+            const UINT64 perCallSize = preOne.ResultDataMaxSizeInBytes;
+            AllocateUAVBuffer(device.Get(), perCallSize * N, &clasResultBuf,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                L"CLAS result (per-call slots)");
+            // Scratch from the original 6-arg prebuild is plenty for 1 arg too.
+            const D3D12_GPU_VIRTUAL_ADDRESS resultBase  = clasResultBuf->GetGPUVirtualAddress();
             const D3D12_GPU_VIRTUAL_ADDRESS clasArgsBase = clasArgsBuf->GetGPUVirtualAddress();
             const UINT argStride = (UINT)sizeof(D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS);
             const D3D12_GPU_VIRTUAL_ADDRESS addrArrayBase = clasAddrArray->GetGPUVirtualAddress();
-            // Force IndirectArgumentArraySize=1 by overriding the per-call args
-            // pointer (point each call at a different arg slot) and using
-            // batched.IndirectArgumentArraySize = 1.
             batched.IndirectArgumentArraySize = 1;
-            for (UINT i = 0; i < clusterCount; ++i)
+            for (UINT i = 0; i < N; ++i)
             {
+                batched.BatchResultData = resultBase + (UINT64)i * perCallSize;
                 batched.IndirectArgumentArray.StartAddress = clasArgsBase + (UINT64)i * argStride;
                 batched.IndirectArgumentArray.StrideInBytes = argStride;
-                // The driver writes one CLAS address per call; offset within
-                // the global addr array so we still get a contiguous result
-                // array we can feed to BUILD_BLAS_FROM_CLAS.
                 batched.ResultAddressArray.StartAddress = addrArrayBase + (UINT64)i * sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
                 batched.ResultAddressArray.StrideInBytes = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
                 dxr2CmdList->ExecuteIndirectRTASOperations(1, &op,
                     D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
-                // UAV barrier on the result/scratch/addr array between calls so
-                // the next build sees this one's writes complete.
                 D3D12_RESOURCE_BARRIER perBars[] = {
                     CD3DX12_RESOURCE_BARRIER::UAV(clasResultBuf.Get()),
                     CD3DX12_RESOURCE_BARRIER::UAV(clasScratchBuf.Get()),
@@ -1217,8 +1287,8 @@ public:
                 };
                 cmdList->ResourceBarrier(_countof(perBars), perBars);
             }
-            Log(L"[wa-1clas-per-build] issued %u single-arg BUILD_CLAS_FROM_TRIANGLES calls\n",
-                clusterCount);
+            Log(L"[wa-1clas-per-build] %u single-arg builds, perCallSize=%llu, total=%llu B\n",
+                N, (unsigned long long)perCallSize, (unsigned long long)(perCallSize * N));
         }
         else
         {

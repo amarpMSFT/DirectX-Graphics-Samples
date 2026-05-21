@@ -1077,6 +1077,17 @@ private:
         UINT64 animatedTradBlasBytes     = 0;
         UINT64 animatedTradScratchBytes  = 0;
         UINT64 animatedTradIbBytes       = 0;    // flat IB (cluster-major) -- input data, not BVH
+        // Phase-2 anim clones: per-clone BLAS POOL storage (each anim clone
+        // has its own per-frame-rebuilt BLAS).  Tracked separately so the
+        // ANIMATED section can show the per-source memory vs the pool
+        // memory split.  Mode-exclusive: cluster mode uses
+        // animClonesBlasPoolBytes (BUILD_BLAS_FROM_CLAS dest pool),
+        // trad mode uses animClonesTradBlasPoolBytes (DXR1 dest pool).
+        UINT64 animClonesBlasPoolBytes      = 0;
+        UINT64 animClonesBlasScratchBytes   = 0;
+        UINT64 animClonesTradBlasPoolBytes  = 0;
+        UINT64 animClonesTradBlasScratchBytes = 0;
+        UINT   animClonesPooledCount        = 0;   // how many clones got per-clone BLAS (rest share source's)
         // Last selected trad-mode anim update strategy (0=rebuild, 1=refit).
         // Snapshotted so the overlay's "[F]" line tracks the live state.
         int    animatedTradModeIsRefit   = 0;

@@ -127,6 +127,22 @@ void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
         s.animatedTradScratchBytes         = a.tradBlasScratchBytes;
         s.animatedTradIbBytes              = sizeOf(a.tradIndexBuffer);
         s.animatedTradModeIsRefit          = (m_traditionalAnimMode == TraditionalAnimMode::Refit) ? 1 : 0;
+        // Phase-2 anim clones: per-clone BLAS pool + scratch.  Mode-
+        // exclusive -- only one of these is non-zero at a time depending
+        // on m_geometryMode.
+        s.animClonesBlasPoolBytes        = sizeOf(m_animClonesBlasPool);
+        s.animClonesBlasScratchBytes     = sizeOf(m_animClonesBlasScratchBuffer);
+        s.animClonesTradBlasPoolBytes    = sizeOf(m_animClonesTradBlasPool);
+        s.animClonesTradBlasScratchBytes = sizeOf(m_animClonesTradBlasScratch);
+        // Count of clones that actually got their own per-clone BLAS slot
+        // (the rest share source's BLAS via the TLAS fallback).  In cluster
+        // mode all clones are pooled; in trad mode it's capped at
+        // kTradPerClonePoolMax via BuildAnimatedClonesTradSetup.
+        s.animClonesPooledCount =
+            (m_geometryMode == GeometryMode::Clusters)
+                ? (m_animClonesBlasPool ? (UINT)m_animatedClones.size() : 0u)
+                : (UINT)std::count_if(m_animatedClones.begin(), m_animatedClones.end(),
+                                      [](const AnimatedCloneInstance& c) { return c.blasGPUVA != 0; });
     }
     else
     {
@@ -137,6 +153,9 @@ void D3D12RaytracingClusteredGeometry::RefreshOverlayStatsCurrent()
         s.animatedPerFrameClasActualBytes = 0;
         s.animatedTradBlasBytes = s.animatedTradScratchBytes = s.animatedTradIbBytes = 0;
         s.animatedTradModeIsRefit = 0;
+        s.animClonesBlasPoolBytes = s.animClonesBlasScratchBytes = 0;
+        s.animClonesTradBlasPoolBytes = s.animClonesTradBlasScratchBytes = 0;
+        s.animClonesPooledCount = 0;
     }
 
     s.tlasBytes            = sizeOf(m_tlasBuffer);
@@ -828,9 +847,13 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
 
     // ----- ANIMATED section -----
     auto sectionAnimatedTotalBytes = [](const OverlayStats& x) -> UINT64 {
+        // Resident BVH memory for the animated source AND every anim clone.
+        // Cluster path: templates + per-frame CLAS + source BLAS + per-clone BLAS pool.
+        // Trad   path: source DXR1 BLAS + per-clone DXR1 BLAS pool.
         return (x.geometryMode == (int)GeometryMode::Clusters)
-            ? (x.animatedTemplateBytes + x.animatedPerFrameClasAllocBytes + x.animatedBlasBytes)
-            : x.animatedTradBlasBytes;
+            ? (x.animatedTemplateBytes + x.animatedPerFrameClasAllocBytes
+               + x.animatedBlasBytes   + x.animClonesBlasPoolBytes)
+            : (x.animatedTradBlasBytes + x.animClonesTradBlasPoolBytes);
     };
     if (m_animatedObjectEnabled)
     {
@@ -875,24 +898,45 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevAScr  = p.animatedTradScratchBytes / (1024.0 * 1024.0);
             const double aInputsMb = (s.animatedTradIbBytes + s.animatedRestPositionsBytes) / (1024.0 * 1024.0);
             const double prevAInp  = (p.animatedTradIbBytes + p.animatedRestPositionsBytes) / (1024.0 * 1024.0);
+            // Phase-2 anim-clones trad pool (1 DXR1 BLAS per pooled clone,
+            // rebuilt each frame).  Counted as resident memory; the
+            // scratch is shared across the per-clone builds.
+            const double cBlasMb   = s.animClonesTradBlasPoolBytes    / (1024.0 * 1024.0);
+            const double prevCBlas = p.animClonesTradBlasPoolBytes    / (1024.0 * 1024.0);
+            const double cScrMb    = s.animClonesTradBlasScratchBytes / (1024.0 * 1024.0);
+            const double prevCScr  = p.animClonesTradBlasScratchBytes / (1024.0 * 1024.0);
 
             XMFLOAT2 c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(L" MB  (source)", c, kSubtle);
             pos.y += kLineH;
+            if (s.animClonesPooledCount > 0 || p.animClonesPooledCount > 0)
+            {
+                c = pos;
+                wchar_t poolLabel[64];
+                swprintf_s(poolLabel, L"  clones pool ");
+                drawSeg(poolLabel, c, kSubtle);
+                drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", cBlasMb), c, deltaColour(cBlasMb, prevCBlas));
+                wchar_t poolCount[64];
+                swprintf_s(poolCount, L" MB  (%u pooled clones; rest share source's BLAS)",
+                           s.animClonesPooledCount);
+                drawSeg(poolCount, c, kSubtle);
+                pos.y += kLineH;
+            }
             // Cross-mode section subtotal + label.  Trad's resident
-            // animated memory is just the per-frame-rebuilt BLAS.
+            // animated memory = source BLAS + per-clone BLAS pool (when
+            // phase-2 is active).  Scratch broken out below.
             const double tradAnimTotalMb = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", tradAnimTotalMb), c, deltaColour(tradAnimTotalMb, prevAnimTotalMb));
-            drawSeg(L" MB  (BLAS)", c, kSubtle);
+            drawSeg(L" MB  (source BLAS + clones pool)", c, kSubtle);
             pos.y += kLineH;
             c = pos;
             drawSeg(L"  scratch ", c, kSubtle);
-            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb), c, deltaColour(aScrMb, prevAScr));
+            drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aScrMb + cScrMb), c, deltaColour(aScrMb + cScrMb, prevAScr + prevCScr));
             drawSeg(L" MB    inputs (ib + rest) ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aInputsMb), c, deltaColour(aInputsMb, prevAInp));
             drawSeg(L" MB", c, kSubtle);
@@ -909,15 +953,22 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             const double prevPfAct = p.animatedPerFrameClasActualBytes  / (1024.0 * 1024.0);
             const double aBlasMb   = s.animatedBlasBytes                / (1024.0 * 1024.0);
             const double prevABlas = p.animatedBlasBytes                / (1024.0 * 1024.0);
+            const double cPoolMb   = s.animClonesBlasPoolBytes          / (1024.0 * 1024.0);
+            const double prevCPool = p.animClonesBlasPoolBytes          / (1024.0 * 1024.0);
+            const double cScrMb    = s.animClonesBlasScratchBytes       / (1024.0 * 1024.0);
+            const double prevCScr  = p.animClonesBlasScratchBytes       / (1024.0 * 1024.0);
             // Scratch = template build + per-frame CLAS + BLAS-from-CLAS
             // scratch summed (all three are workspace re-used across
-            // builds, all three are resident).
+            // builds, all three are resident).  Also include the anim-
+            // clones BLAS-from-CLAS scratch when phase 2 is active.
             const double scrMb     = (s.animatedTemplateScratchBytes
                                     + s.animatedPerFrameClasScratchBytes
-                                    + s.animatedBlasScratchBytes) / (1024.0 * 1024.0);
+                                    + s.animatedBlasScratchBytes
+                                    + s.animClonesBlasScratchBytes) / (1024.0 * 1024.0);
             const double prevScrMb = (p.animatedTemplateScratchBytes
                                     + p.animatedPerFrameClasScratchBytes
-                                    + p.animatedBlasScratchBytes) / (1024.0 * 1024.0);
+                                    + p.animatedBlasScratchBytes
+                                    + p.animClonesBlasScratchBytes) / (1024.0 * 1024.0);
             // Inputs = templateInputBuffer (hint vertex+index source for
             // BUILD_CLUSTER_TEMPLATES) + restPositionsBuffer (read every
             // frame by AnimateBall.cs).  Both immutable post-init.
@@ -943,17 +994,28 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
             c = pos;
             drawSeg(L"  BLAS ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", aBlasMb), c, deltaColour(aBlasMb, prevABlas));
-            drawSeg(L" MB", c, kSubtle);
+            drawSeg(L" MB  (source)", c, kSubtle);
             pos.y += kLineH;
+            if (s.animClonesPooledCount > 0 || p.animClonesPooledCount > 0)
+            {
+                c = pos;
+                drawSeg(L"  clones pool ", c, kSubtle);
+                drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", cPoolMb), c, deltaColour(cPoolMb, prevCPool));
+                wchar_t poolCount[64];
+                swprintf_s(poolCount, L" MB  (%u per-clone BLAS slots)", s.animClonesPooledCount);
+                drawSeg(poolCount, c, kSubtle);
+                pos.y += kLineH;
+            }
             // Cross-mode section subtotal + label.  Cluster path's
             // resident animated memory = templates + per-frame CLAS
-            // alloc + BLAS-from-CLAS.  Scratch/inputs broken out below.
+            // alloc + source BLAS + per-clone BLAS pool.  Scratch
+            // and inputs broken out below.
             const double clAnimTotalMb   = sectionAnimatedTotalBytes(s) / (1024.0 * 1024.0);
             const double prevAnimTotalMb = sectionAnimatedTotalBytes(m_overlayStatsPrev) / (1024.0 * 1024.0);
             c = pos;
             drawSeg(L"  total ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", clAnimTotalMb), c, deltaColour(clAnimTotalMb, prevAnimTotalMb));
-            drawSeg(L" MB  (templates + CLASes + BLAS)", c, kSubtle);
+            drawSeg(L" MB  (templates + CLASes + source BLAS + clones pool)", c, kSubtle);
             pos.y += kLineH;
             c = pos;
             drawSeg(L"  scratch ", c, kSubtle);
@@ -969,18 +1031,22 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     // ----- TOTAL section -----
     {
         const auto& p = m_overlayStatsPrev;
-        // animatedTotal = cluster-path templates + per-frame CLAS + BLAS
-        //                 OR trad-path animated BLAS (the single per-
-        //                 frame-rebuilt DXR1 BLAS) -- they're mutually
-        //                 exclusive since only one mode is active.
+        // animatedTotal = cluster-path templates + per-frame CLAS + source BLAS +
+        //                 per-clone BLAS pool
+        //                 OR trad-path source BLAS + per-clone BLAS pool
+        //                 (mode-exclusive: only one mode's fields are non-zero).
         const UINT64 animatedTotal     = s.animatedTemplateBytes
                                        + s.animatedPerFrameClasAllocBytes
                                        + s.animatedBlasBytes
-                                       + s.animatedTradBlasBytes;
+                                       + s.animatedTradBlasBytes
+                                       + s.animClonesBlasPoolBytes
+                                       + s.animClonesTradBlasPoolBytes;
         const UINT64 prevAnimatedTotal = p.animatedTemplateBytes
                                        + p.animatedPerFrameClasAllocBytes
                                        + p.animatedBlasBytes
-                                       + p.animatedTradBlasBytes;
+                                       + p.animatedTradBlasBytes
+                                       + p.animClonesBlasPoolBytes
+                                       + p.animClonesTradBlasPoolBytes;
         // TOTAL line shows the bytes currently RESIDENT in GPU memory.
         // For Compact traditional, the worst-case temp buffer is freed
         // after the build, so the resident total uses the compacted
@@ -1006,17 +1072,17 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", grandMb), c, deltaColourU(grandTotal, prevGrandTotal));
         drawSeg(L" MB   (static ", c, kSubtle);
         drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", statMb), c, deltaColourU(staticTotal, prevStaticTotal));
+        drawSeg(L" MB", c, kSubtle);
         if (animatedTotal > 0 || prevAnimatedTotal > 0)
         {
             drawSeg(L" + animated ", c, kSubtle);
             drawSeg(fmt2(fnum, _countof(fnum), L"%.2f", animMb), c, deltaColourU(animatedTotal, prevAnimatedTotal));
+            drawSeg(L" MB", c, kSubtle);
         }
         drawSeg(L" + TLAS ", c, kSubtle);
-        // TLAS is tiny (~3.5 KB for our 9-instance scene; would reach
-        // ~64 KB at ~1000 instances) -- formatting in MB rounds to 0.00
-        // for any realistic scene.  Force KB so the number is readable.
-        // 1 decimal so 3.5 doesn't truncate to "3"; >= 1 MB would show
-        // as e.g. "1228.8 KB" which is fine.
+        // TLAS is tiny (~3.5 KB for our 9-instance scene; reaches ~3 MB
+        // at 10K instances).  Stick with KB so values < 1 MB don't show as
+        // 0.00 MB; values >= 1 MB still read fine as e.g. "3019.3 KB".
         wchar_t tlasBuf[32];
         swprintf_s(tlasBuf, L"%.1f KB", s.tlasBytes / 1024.0);
         drawSeg(tlasBuf, c, deltaColourU(s.tlasBytes, p.tlasBytes));

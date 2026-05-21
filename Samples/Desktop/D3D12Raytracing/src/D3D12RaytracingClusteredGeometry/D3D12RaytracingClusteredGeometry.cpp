@@ -1257,7 +1257,7 @@ static void BuildSharedClusterTrianglesInputs(
     // intrinsic can read them back. Per-cluster ClusterFlags can override with
     // D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_DISALLOW_DATA_ACCESS to opt some
     // clusters out (we don't).
-    outClasDesc.Flags                               = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    outClasDesc.Flags                               = self.BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
                                                                : D3D12_VERTEX_FORMAT_COMPRESSED1;
     outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
@@ -1856,7 +1856,7 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
     }
 
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
+    blasDesc.Flags              = BuildFlagModeRtas();  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
     blasDesc.MaxArgCount        = N_obj;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = totalClas;
@@ -1892,7 +1892,7 @@ void D3D12RaytracingClusteredGeometry::BuildBlasFromClasIndirect()
         if (auto it = blasSizeByClusterCount.find(clusterCount); it != blasSizeByClusterCount.end())
             return it->second;
         D3D12_RTAS_CLAS_INPUTS_DESC d = {};
-        d.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+        d.Flags              = BuildFlagModeRtas();
         d.MaxArgCount        = 1;
         d.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
         d.MaxTotalClasCount  = clusterCount;
@@ -2295,7 +2295,7 @@ void D3D12RaytracingClusteredGeometry::BuildTraditionalStaticAS()
         // toggle (animated path, future) can update without rebuild;
         // ALLOW_COMPACTION only when we actually want to compact (the
         // flag has a small build-cost on some drivers).
-        inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+        inputs.Flags          = BuildFlagModeDxr1()
                               | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE
                               | (wantCompact
                                    ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
@@ -2827,7 +2827,7 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticBlasPerFrame()
     }
 
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.Flags              = BuildFlagModeRtas();
     blasDesc.MaxArgCount        = N_obj;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = totalClas;
@@ -3184,7 +3184,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 
     D3D12_RTAS_CLUSTER_TEMPLATE_TRIANGLES_INPUTS_DESC tplDesc = {};
     tplDesc.ClusterLimits             = limits;
-    tplDesc.Flags                     = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    tplDesc.Flags                     = BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     tplDesc.Mode                      = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     tplDesc.VertexHintFormat          = D3D12_VERTEX_FORMAT_FLOAT32_3;
     tplDesc.VertexInstantiationFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
@@ -3402,7 +3402,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     // ------------------------------------------------------------------
     D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
     instDesc.ClusterLimits     = limits;
-    instDesc.Flags             = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    instDesc.Flags             = BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     instDesc.Mode              = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
 
@@ -3445,7 +3445,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
 
     // BLAS-from-CLAS prebuild & alloc (single BLAS, EXPLICIT_DESTINATIONS).
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
+    blasDesc.Flags              = BuildFlagModeRtas();  // ALLOW_DATA_ACCESS is NOT permitted here - it's a per-CLAS property set at the CLAS-from-triangles build above, and the BLAS-from-CLAS must read it consistently across all referenced CLAS
     blasDesc.MaxArgCount        = 1;
     blasDesc.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
     blasDesc.MaxTotalClasCount  = obj.clusterCount;
@@ -3557,7 +3557,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesSetup()
     // (MaxArgCount=M) gives the batch-total scratch sizing.
     auto prebuild = [&](UINT maxArgCount, UINT totalClas) {
         D3D12_RTAS_CLAS_INPUTS_DESC d = {};
-        d.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+        d.Flags              = BuildFlagModeRtas();
         d.MaxArgCount        = maxArgCount;
         d.Mode               = D3D12_RTAS_OPERATION_MODE_EXPLICIT_DESTINATIONS;
         d.MaxTotalClasCount  = totalClas;
@@ -3720,7 +3720,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedTraditionalAS()
     inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs       = 1;
     inputs.pGeometryDescs = &geomDesc;
-    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+    inputs.Flags          = BuildFlagModeDxr1()
                           | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
@@ -3820,7 +3820,7 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedClonesTradSetup()
     inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs       = 1;
     inputs.pGeometryDescs = &geomDesc;
-    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    inputs.Flags          = BuildFlagModeDxr1();
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO pb = {};
     m_dxrDevice->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &pb);
 
@@ -3925,7 +3925,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimesta
     inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     inputs.NumDescs       = 1;
     inputs.pGeometryDescs = &geomDesc;
-    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+    inputs.Flags          = BuildFlagModeDxr1()
                           | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
     const bool wantRefit = (m_traditionalAnimMode == TraditionalAnimMode::Refit)
                             && obj.tradBlasInitialized;
@@ -3963,7 +3963,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedTradPerFrame(UINT pfTimesta
         cInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
         cInputs.NumDescs       = 1;
         cInputs.pGeometryDescs = &geomDesc;
-        cInputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        cInputs.Flags          = BuildFlagModeDxr1();
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC cBuildDesc = {};
         cBuildDesc.Inputs                          = cInputs;
         cBuildDesc.ScratchAccelerationStructureData = m_animClonesTradBlasScratch->GetGPUVirtualAddress();
@@ -4034,7 +4034,7 @@ void D3D12RaytracingClusteredGeometry::MeasureAnimatedClasBytesOneShot()
 
     D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
     instDesc.ClusterLimits      = limits;
-    instDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    instDesc.Flags              = BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     instDesc.Mode               = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
 
@@ -4191,7 +4191,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
 
     D3D12_RTAS_INSTANTIATE_CLUSTER_TEMPLATE_INPUTS_DESC instDesc = {};
     instDesc.ClusterLimits      = limits;
-    instDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    instDesc.Flags              = BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     instDesc.Mode               = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     instDesc.VertexSourceFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
 
@@ -4248,7 +4248,7 @@ void D3D12RaytracingClusteredGeometry::UpdateAnimatedObjectPerFrame(UINT pfTimes
     //    perFrameClasAddressArray (the SAME animated CLAS).
     // ------------------------------------------------------------------
     D3D12_RTAS_CLAS_INPUTS_DESC blasDesc = {};
-    blasDesc.Flags              = D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    blasDesc.Flags              = BuildFlagModeRtas();
     const UINT M_blasArgs = m_animClonesBlasPool
         ? (1u + (UINT)m_animatedClones.size())
         : 1u;
@@ -4530,7 +4530,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
     tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tlasInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     tlasInputs.NumDescs       = N_total;
-    tlasInputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    tlasInputs.Flags          = BuildFlagModeDxr1();
     tlasInputs.InstanceDescs  = m_tlasInstanceDescs->GetGPUVirtualAddress();
 
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
@@ -4572,7 +4572,7 @@ void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
     tlasInputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     tlasInputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
     tlasInputs.NumDescs       = N_total;
-    tlasInputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    tlasInputs.Flags          = BuildFlagModeDxr1();
     tlasInputs.InstanceDescs  = m_tlasInstanceDescs->GetGPUVirtualAddress();
 
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
@@ -5428,6 +5428,24 @@ void D3D12RaytracingClusteredGeometry::OnRender()
                      _wcsicmp(act, L"extra-10000")       == 0)
             {   m_extraInstancesMode = ExtraInstancesMode::TenThousand;
                 RebuildStaticAccelerationStructures(L"scheduled extra-10k"); }
+            else if (_wcsicmp(act, L"flags-none")        == 0)
+            {   m_buildFlagMode = BuildFlagMode::None;
+                if (m_staticRebuildMode == StaticRebuildMode::None)
+                    RebuildStaticAccelerationStructures(L"scheduled flags-none");
+                else
+                    CaptureOverlayStatsSnapshot(); }
+            else if (_wcsicmp(act, L"flags-fast-build")  == 0)
+            {   m_buildFlagMode = BuildFlagMode::FastBuild;
+                if (m_staticRebuildMode == StaticRebuildMode::None)
+                    RebuildStaticAccelerationStructures(L"scheduled flags-fast-build");
+                else
+                    CaptureOverlayStatsSnapshot(); }
+            else if (_wcsicmp(act, L"flags-fast-trace")  == 0)
+            {   m_buildFlagMode = BuildFlagMode::FastTrace;
+                if (m_staticRebuildMode == StaticRebuildMode::None)
+                    RebuildStaticAccelerationStructures(L"scheduled flags-fast-trace");
+                else
+                    CaptureOverlayStatsSnapshot(); }
             else if (_wcsicmp(act, L"log")               == 0)
             {   SampleLog::LogF(L"[scheduled-snap frame=%u alloc=%ls rebuild=%ls] "
                                 L"inst=%.3fus animBlas=%.3fus tlas=%.3fus "

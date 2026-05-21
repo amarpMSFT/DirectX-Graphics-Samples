@@ -1450,6 +1450,13 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
     }
     drawKeyLine(L"[N]", kbuf);
 
+    // [B] BVH-build-flag preference -- applied uniformly to BOTH trad
+    // (DXR1) and cluster (DXR2) AS builds via BuildFlagModeRtas() /
+    // BuildFlagModeDxr1().  Toggling rebuilds the static AS once
+    // (unless per-frame static rebuild is already on).
+    swprintf_s(kbuf, L"   BVH build flag:   %s", BuildFlagModeName());
+    drawKeyLine(L"[B]", kbuf);
+
     // Flush any pending drawSeg whose right-pad we haven't decided yet
     // -- it's the last segment of the overlay, so it gets the right-pad.
     flushPending();

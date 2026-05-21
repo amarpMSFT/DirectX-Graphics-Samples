@@ -90,6 +90,17 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             else if (_wcsicmp(argv[i+1], L"traditional") == 0) m_geometryMode = GeometryMode::Traditional;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--build-flags") == 0 && i + 1 < argc)
+        {
+            // [B] runtime toggle, set from CLI for headless / scripted runs.
+            //   none       - D3D12_..._FLAG_NONE   (driver default, typically biased to FAST_TRACE)
+            //   fast-build - PREFER_FAST_BUILD / FAST_BUILD
+            //   fast-trace - PREFER_FAST_TRACE / FAST_TRACE (default)
+            if      (_wcsicmp(argv[i+1], L"none")       == 0) m_buildFlagMode = BuildFlagMode::None;
+            else if (_wcsicmp(argv[i+1], L"fast-build") == 0) m_buildFlagMode = BuildFlagMode::FastBuild;
+            else if (_wcsicmp(argv[i+1], L"fast-trace") == 0) m_buildFlagMode = BuildFlagMode::FastTrace;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--trad-alloc") == 0 && i + 1 < argc)
         {
             // [A] runtime toggle in traditional mode, set from CLI.  Mirrors
@@ -312,6 +323,27 @@ void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
         }
         SampleLog::LogF(L"[input] extra instances -> %s\n", ExtraInstancesModeName());
         RebuildStaticAccelerationStructures(L"extra-instances toggle");
+    }
+    else if (key == 'B' || key == 'b')
+    {
+        // [B] cycles BVH-build-flag preference: NONE -> FAST_BUILD ->
+        // FAST_TRACE -> ...  Applies to BOTH trad (DXR1) and cluster
+        // (DXR2) paths uniformly via BuildFlagModeRtas() /
+        // BuildFlagModeDxr1() helpers.  Re-trigger rebuild ONLY when
+        // static-rebuild mode is None -- per-frame rebuild modes
+        // (BlasOnly / ClasAndBlas) will pick up the new flag next
+        // frame on their own.
+        switch (m_buildFlagMode)
+        {
+        case BuildFlagMode::None:      m_buildFlagMode = BuildFlagMode::FastBuild; break;
+        case BuildFlagMode::FastBuild: m_buildFlagMode = BuildFlagMode::FastTrace; break;
+        case BuildFlagMode::FastTrace: m_buildFlagMode = BuildFlagMode::None;      break;
+        }
+        SampleLog::LogF(L"[input] BVH build flag -> %s\n", BuildFlagModeName());
+        if (m_staticRebuildMode == StaticRebuildMode::None)
+            RebuildStaticAccelerationStructures(L"build-flag toggle");
+        else
+            CaptureOverlayStatsSnapshot();
     }
     // ----- ',' / '.' = bounce-depth slider.  See m_bounceSlider in the
     //   header for the canonical mapping table.  Slider direction has a

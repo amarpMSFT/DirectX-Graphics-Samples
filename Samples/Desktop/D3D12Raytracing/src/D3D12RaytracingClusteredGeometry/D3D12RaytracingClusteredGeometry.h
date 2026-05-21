@@ -419,6 +419,74 @@ private:
         }
         return L"?";
     }
+
+    // ---------- BVH-build flag selector ----------
+    // The fundamental tradeoff knob for BVH builds in BOTH trad and
+    // cluster paths: do you want the BUILD to be fast (PREFER_FAST_BUILD
+    // / FAST_BUILD -- shallow BVH, cheap to construct, more expensive
+    // to traverse), the TRACE to be fast (PREFER_FAST_TRACE / FAST_TRACE
+    // -- the driver spends more time choosing splits to produce a tight
+    // BVH that traverses cheaply), or NONE (driver picks a default,
+    // typically biased toward FAST_TRACE).  This sample defaults to
+    // FAST_TRACE so the per-frame DispatchRays cost shows the BVH at
+    // its sharpest -- the toggle lets you measure exactly what that
+    // optimisation buys you vs the alternative.
+    //
+    // The triad maps cleanly across both modes:
+    //   trad (DXR1) BuildRaytracingAccelerationStructure flags use
+    //     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_*
+    //   cluster (DXR2) ExecuteIndirectRTASOperations flags use
+    //     D3D12_RTAS_OPERATION_FLAG_*
+    // BuildFlagModeDxr1() / BuildFlagModeRtas() return the right enum
+    // for each path; ALLOW_UPDATE (trad anim refit) and
+    // ALLOW_DATA_ACCESS (cluster CLAS / template) are OR-ed in
+    // separately where the build needs them.
+    //
+    // Toggling this MUST trigger a full RebuildStaticAccelerationStructures
+    // since every BLAS / CLAS / template was built with the previous
+    // flag value baked into its BVH.
+    enum class BuildFlagMode : UINT {
+        None      = 0,
+        FastBuild = 1,
+        FastTrace = 2,
+    };
+    BuildFlagMode m_buildFlagMode = BuildFlagMode::FastTrace;
+public:
+    const wchar_t* BuildFlagModeName() const
+    {
+        // Show the API-specific enum name so toggling [T] cluster<->trad
+        // makes the active build flag's identity clear (DXR2 calls the
+        // "fast build" variant FAST_OPERATION; DXR1 calls it FAST_BUILD).
+        const bool isCluster = (m_geometryMode == GeometryMode::Clusters);
+        switch (m_buildFlagMode)
+        {
+        case BuildFlagMode::None:      return L"NONE";
+        case BuildFlagMode::FastBuild: return isCluster ? L"FAST_OPERATION" : L"FAST_BUILD";
+        case BuildFlagMode::FastTrace: return L"FAST_TRACE";
+        }
+        return L"?";
+    }
+    D3D12_RTAS_OPERATION_FLAGS BuildFlagModeRtas() const
+    {
+        switch (m_buildFlagMode)
+        {
+        case BuildFlagMode::None:      return D3D12_RTAS_OPERATION_FLAG_NONE;
+        case BuildFlagMode::FastBuild: return D3D12_RTAS_OPERATION_FLAG_FAST_OPERATION;   // DXR2's "fast build" is named FAST_OPERATION
+        case BuildFlagMode::FastTrace: return D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+        }
+        return D3D12_RTAS_OPERATION_FLAG_FAST_TRACE;
+    }
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS BuildFlagModeDxr1() const
+    {
+        switch (m_buildFlagMode)
+        {
+        case BuildFlagMode::None:      return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE;
+        case BuildFlagMode::FastBuild: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+        case BuildFlagMode::FastTrace: return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        }
+        return D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    }
+private:
     // Per-instance material override buffer: one UINT per TLAS instance.
     // Sentinel 0xFFFFFFFF = "use ctx.meta.materialSlot (per-cluster CPU-
     // baked default)".  Any other value = use g_materials[value] uniformly

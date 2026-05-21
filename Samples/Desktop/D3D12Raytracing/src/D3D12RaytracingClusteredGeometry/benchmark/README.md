@@ -18,23 +18,23 @@ report with grouped charts.
 ## Quick start
 
 ```powershell
-# Full sweep on this machine (~3 minutes, 26 runs, skips 10K trad to save time):
-python sweep.py --no-10k-trad
+# Full sweep on this machine (~3 minutes, 28 runs):
+python sweep.py
 
-# 30-second smoke test (12 runs, no precision sweeps):
-python sweep.py --quick --no-10k --bench-seconds 3
+# 30-second smoke test (12 runs, no precision sweeps, no 10K):
+python sweep.py --quick
 
-# Custom exe + custom output path:
-python sweep.py --exe C:\my\app.exe --out my_report.html
-
-# Reuse most-recent JSONs and just rebuild the HTML (useful while iterating
-# on the chart definitions; no exe re-runs):
+# Just rebuild HTML from the most-recent JSONs (no exe re-runs):
 python sweep.py --no-run
 ```
 
 Output lands in `results\<adapter_safe_name>\<timestamp>\`:
 * `report.html` — the self-contained report
 * one `*.json` per run — the raw measurement data
+
+Advanced flags exist (`--bench-seconds N`, `--exe PATH`, `--out HTML`, `--no-10k`,
+`--no-10k-trad`, `--init-timeout N`, `--verbose`) but the defaults are
+chosen for "just run it" -- skim `python sweep.py --help` if you need them.
 
 ## Cross-machine comparison
 

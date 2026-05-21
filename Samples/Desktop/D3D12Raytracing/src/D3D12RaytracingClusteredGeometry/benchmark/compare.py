@@ -113,6 +113,10 @@ class ChartDef:
     chart_type: str           # "line" or "bar"
     x_label: str
     y_label: str
+    # x_scale: 'category' (evenly-spaced discrete labels), 'linear' (numeric),
+    # 'log' (numeric, x>0).  Scaling charts use 'category' so 0/100/1k/10k
+    # space out evenly; precision sweeps use 'linear' for true numeric spacing.
+    x_scale: str = "linear"
     y_is_log: bool = False
     # x_keys: ordered list of (slug, x_value) pairs to plot. Each machine's
     # series shows the y value for the matching slug.
@@ -154,7 +158,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
                          "are usually adapter-architecture / driver-allocator "
                          "specific (e.g. NVIDIA vs Intel vs WARP)."),
             chart_type="line", x_label="Extra instances", y_label="Total AS (bytes)",
-            y_is_log=True, x_keys=xs,
+            x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("memory_bytes", "total_as"),
             value_formatter=fmt_bytes,
         ))
@@ -165,7 +169,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
                          "Where machines diverge most is in the parallel "
                          "compaction passes."),
             chart_type="line", x_label="Extra instances", y_label="Build time (ms)",
-            y_is_log=True, x_keys=xs,
+            x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("build_times_ms", "total"),
             value_formatter=lambda v: f"{v:.1f} ms",
         ))
@@ -176,7 +180,8 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
                          "(consumer vs workstation vs WARP) more sharply than "
                          "memory does."),
             chart_type="line", x_label="Extra instances", y_label="FPS",
-            x_keys=xs, metric_path=("frame_perf", "fps"),
+            x_scale="category", x_keys=xs,
+            metric_path=("frame_perf", "fps"),
             value_formatter=lambda v: f"{v:.1f} fps",
         ))
         defs.append(ChartDef(
@@ -184,7 +189,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             category="Scaling -- per-frame ops",
             description="Microseconds GPU spent rebuilding TLAS each frame.  Lower is better.",
             chart_type="line", x_label="Extra instances", y_label="TLAS rebuild (µs)",
-            y_is_log=True, x_keys=xs,
+            x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("frame_perf", "pf_tlas_us"),
             value_formatter=fmt_us,
         ))
@@ -194,7 +199,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             description=("Cluster mode: BUILD_BLAS_FROM_CLAS.  Traditional: full "
                          "DXR1 BLAS rebuild.  Lower is better."),
             chart_type="line", x_label="Extra instances", y_label="Anim BLAS (µs)",
-            y_is_log=True, x_keys=xs,
+            x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("frame_perf", "pf_blas_us"),
             value_formatter=fmt_us,
         ))
@@ -270,6 +275,8 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
         ))
 
     # --- Precision sweeps: COMPRESSED1 bits/component --------------------
+    # X axis = bits/component.  Higher = more precision.  Left-to-right
+    # reads as INCREASING precision (matches the FLOAT32_3 chart below).
     cb_slugs = sorted([s for s in all_slugs if s.startswith("vtx-compressed_cb-")],
                       key=lambda s: int(s.rsplit("-", 1)[1]))
     cb_xs = [(s, int(s.rsplit("-", 1)[1])) for s in cb_slugs]
@@ -278,31 +285,62 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             title="COMPRESSED1 precision: CLAS bytes vs bits/component",
             category="Precision (COMPRESSED1)",
             description="Bytes saved as bits/component decreases. Lower bits = more compression but more precision loss.",
-            chart_type="line", x_label="Bits / component", y_label="CLAS bytes",
-            x_keys=cb_xs, metric_path=("memory_bytes", "static_clas_actual"),
+            chart_type="line", x_label="Bits / component (higher = more precision)", y_label="CLAS bytes",
+            x_scale="linear", x_keys=cb_xs, metric_path=("memory_bytes", "static_clas_actual"),
             value_formatter=fmt_bytes,
+        ))
+        defs.append(ChartDef(
+            title="COMPRESSED1 precision: INSTANTIATE µs vs bits/component",
+            category="Precision (COMPRESSED1)",
+            description="Per-frame INSTANTIATE cost as precision varies. Should be roughly flat (constant work per cluster) -- spikes can indicate driver paths.",
+            chart_type="line", x_label="Bits / component (higher = more precision)", y_label="INSTANTIATE (µs)",
+            x_scale="linear", x_keys=cb_xs, metric_path=("frame_perf", "pf_instantiate_us"),
+            value_formatter=fmt_us,
         ))
         defs.append(ChartDef(
             title="COMPRESSED1 precision: FPS vs bits/component",
             category="Precision (COMPRESSED1)",
             description="Watch for FPS spikes at very low bits -- can indicate geometry collapse making rays miss.",
-            chart_type="line", x_label="Bits / component", y_label="FPS",
-            x_keys=cb_xs, metric_path=("frame_perf", "fps"),
+            chart_type="line", x_label="Bits / component (higher = more precision)", y_label="FPS",
+            x_scale="linear", x_keys=cb_xs, metric_path=("frame_perf", "fps"),
             value_formatter=lambda v: f"{v:.1f} fps",
         ))
 
-    # --- Precision sweeps: FLOAT32_3 truncate bits ----------------------
+    # --- Precision sweeps: FLOAT32_3 truncate bits -----------------------
+    # X axis = "bits KEPT" = 23 - bits_truncated.  Left-to-right = INCREASING
+    # precision (same direction as COMPRESSED1 chart).  Use a custom x_key
+    # tuple instead of the slug-int parse because the slug encodes the truncate
+    # number, not the kept number.
     tr_slugs = sorted([s for s in all_slugs if s.startswith("trunc-")],
                       key=lambda s: int(s.rsplit("-", 1)[1]))
-    tr_xs = [(s, int(s.rsplit("-", 1)[1])) for s in tr_slugs]
+    # x_value is bits_kept = 23 - truncated_bits
+    tr_xs = [(s, 23 - int(s.rsplit("-", 1)[1])) for s in tr_slugs]
+    # Sort by bits_kept ascending so the line goes left-to-right by precision
+    tr_xs.sort(key=lambda t: t[1])
     if len(tr_xs) >= 3:
         defs.append(ChartDef(
-            title="FLOAT32_3 precision: CLAS bytes vs truncate bits",
+            title="FLOAT32_3 precision: CLAS bytes vs bits kept",
             category="Precision (FLOAT32_3)",
-            description="Bytes after CLAS quantizer.  Higher truncate = lower mantissa bits = better compression.",
-            chart_type="line", x_label="Bits truncated", y_label="CLAS bytes",
-            x_keys=tr_xs, metric_path=("memory_bytes", "static_clas_actual"),
+            description="X axis = mantissa bits kept (= 23 - --position-truncate N). Lower precision (left) = smaller CLAS.",
+            chart_type="line", x_label="Bits kept (higher = more precision)", y_label="CLAS bytes",
+            x_scale="linear", x_keys=tr_xs, metric_path=("memory_bytes", "static_clas_actual"),
             value_formatter=fmt_bytes,
+        ))
+        defs.append(ChartDef(
+            title="FLOAT32_3 precision: INSTANTIATE µs vs bits kept",
+            category="Precision (FLOAT32_3)",
+            description="Per-frame INSTANTIATE cost as truncation varies. Should be roughly flat.",
+            chart_type="line", x_label="Bits kept (higher = more precision)", y_label="INSTANTIATE (µs)",
+            x_scale="linear", x_keys=tr_xs, metric_path=("frame_perf", "pf_instantiate_us"),
+            value_formatter=fmt_us,
+        ))
+        defs.append(ChartDef(
+            title="FLOAT32_3 precision: FPS vs bits kept",
+            category="Precision (FLOAT32_3)",
+            description="Extreme low precision (left, ~3 bits kept) collapses geometry; glass refraction goes wrong -- FPS can drop or spike.",
+            chart_type="line", x_label="Bits kept (higher = more precision)", y_label="FPS",
+            x_scale="linear", x_keys=tr_xs, metric_path=("frame_perf", "fps"),
+            value_formatter=lambda v: f"{v:.1f} fps",
         ))
 
     return defs
@@ -364,8 +402,13 @@ def render_html(machines: list[MachineReport], defs: list[ChartDef]) -> str:
                     yv = _g(m.runs[slug].data, *cdef.metric_path, default=None)
                     if yv is None:
                         continue
-                    key = str(xv) if cdef.chart_type == "bar" else xv
-                    data.append({"x": key if cdef.chart_type == "bar" else xv, "y": yv})
+                    # Category x scale: pass string labels so 0/100/1k/10k
+                    # space evenly.  Linear/log x scale: pass the raw number.
+                    if cdef.chart_type == "bar" or cdef.x_scale == "category":
+                        key_for_data = str(xv)
+                    else:
+                        key_for_data = xv
+                    data.append({"x": key_for_data, "y": yv})
                     tips[str(xv)] = (cdef.value_formatter(yv) if cdef.value_formatter else f"{yv}")
                 if not data:
                     continue
@@ -381,11 +424,22 @@ def render_html(machines: list[MachineReport], defs: list[ChartDef]) -> str:
                 })
             if not datasets:
                 continue
+            # Resolve x scale type: bar charts always 'category';
+            # line charts use ChartDef.x_scale ('linear'/'log'/'category').
+            if cdef.chart_type == "bar":
+                x_type = "category"
+            elif cdef.x_scale == "log":
+                x_type = "logarithmic"
+            elif cdef.x_scale == "category":
+                x_type = "category"
+            else:
+                x_type = "linear"
             opts = {
                 "responsive": True,
                 "maintainAspectRatio": False,
                 "scales": {
                     "x": {
+                        "type": x_type,
                         "title": {"display": True, "text": cdef.x_label, "color": "#9da7b3"},
                         "ticks": {"color": "#9da7b3"},
                         "grid": {"color": "#22272e"},

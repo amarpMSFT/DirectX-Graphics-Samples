@@ -150,13 +150,15 @@ def build_sweep_matrix(quick: bool, include_10k_trad: bool) -> list[RunConfig]:
     runs: list[RunConfig] = []
 
     # --- 1. Scene scaling --------------------------------------------------
-    scales = [0, 100, 1000] + ([10000] if include_10k_trad and not quick else [])
-    for n in scales:
+    # Cluster mode at 10K is fast (~5s init); trad mode at 10K is slow
+    # (~60-90s init) and dominates wall-clock.  Include cluster 10K by default;
+    # gate trad 10K on include_10k_trad.  --quick skips 10K entirely.
+    cluster_scales = [0, 100, 1000] + ([10000] if not quick else [])
+    trad_scales    = [0, 100, 1000] + ([10000] if (include_10k_trad and not quick) else [])
+    for n in cluster_scales:
         runs.append(RunConfig(geometry_mode="clusters",    extra_instances=n))
-        # Skip the trad 10K config unless explicitly opted in -- 60-90 s init,
-        # dominates the sweep wall-clock.
-        if not (n == 10000 and not include_10k_trad):
-            runs.append(RunConfig(geometry_mode="traditional", extra_instances=n))
+    for n in trad_scales:
+        runs.append(RunConfig(geometry_mode="traditional", extra_instances=n))
 
     # --- 2. Orthogonal at default scene size (clusters, extra=0) ----------
     runs.append(RunConfig(vertex_format="compressed"))
@@ -265,7 +267,13 @@ class Chart:
     chart_type: str            # "line" or "bar"
     x_label: str
     y_label: str
-    x_is_log: bool = False
+    # x_scale: 'linear' (default, evenly spaced numeric ticks), 'log' (for
+    # exponentially-distributed numeric data; rejects x<=0), or 'category'
+    # (for set-of-discrete-labels where positions should be evenly spaced
+    # regardless of numeric distance -- 0/100/1k/10k is exponential, so on
+    # a linear axis the 0 and 100 would cluster against the left edge).
+    x_scale: str = "linear"
+    x_is_log: bool = False     # kept for back-compat; equivalent to x_scale='log'
     y_is_log: bool = False
     # series: dict from series_label -> list of (x_value, y_value, hover_text)
     series: dict[str, list[tuple[Any, float, str]]] = field(default_factory=dict)
@@ -399,7 +407,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "BLAS-from-CLAS; the traditional (DXR1) path stores a full "
                      "monolithic BLAS per unique object."),
         chart_type="line", x_label="Extra instances (clones)", y_label="Total AS memory (bytes)",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
         pts = []
@@ -421,7 +429,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "Measured once at startup; per-frame anim work excluded.  "
                      "Lower is better."),
         chart_type="line", x_label="Extra instances (clones)", y_label="Build time (ms)",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
         pts = []
@@ -442,7 +450,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "better.  Reflects total per-frame cost including ray "
                      "traversal, shading, AS rebuilds (anim BLAS), and present."),
         chart_type="line", x_label="Extra instances (clones)", y_label="FPS",
-        x_is_log=False, y_is_log=False,
+        x_scale="category",
     )
     for mode in ("clusters", "traditional"):
         pts = []
@@ -463,7 +471,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "by the per-frame snap window.  Includes all clones since "
                      "TLAS NumDescs must cover every instance.  Lower is better."),
         chart_type="line", x_label="Extra instances (clones)", y_label="TLAS rebuild (µs)",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
         pts = []
@@ -486,7 +494,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "same field (pf_blas_us); the meaning depends on the path. "
                      "Lower is better."),
         chart_type="line", x_label="Extra instances (clones)", y_label="Anim BLAS (µs)",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
         pts = []
@@ -508,7 +516,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "Sensitive to vertex format + precision since it re-encodes "
                      "per-frame.  Lower is better."),
         chart_type="line", x_label="Extra instances (clones)", y_label="INSTANTIATE (µs)",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     pts = []
     for r in match({**scale_filter, "geometry_mode": "clusters", "trad_alloc": "compact"}):
@@ -530,7 +538,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "is geometry-mode-independent.  Use as a sanity check "
                      "that your sweep actually scaled."),
         chart_type="line", x_label="Extra instances (clones)", y_label="Count",
-        x_is_log=False, y_is_log=True,
+        x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
         for field_, label_suffix in (("total_clusters", " clusters"), ("total_triangles", " triangles")):
@@ -647,9 +655,11 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     # CATEGORY: Precision sweep (FLOAT32_3 truncate bits)
     # =========================================================================
     # NOTE: drop position_truncate_bits from the filter so runs WITH the field
-    # set are picked up (base_default has it set to None for orthogonal-cards;
-    # the precision sweep is the one case where we want only the runs that DID
-    # set it).
+    # set are picked up.
+    # X axis: "bits KEPT" = 23 - bits_truncated.  So left-to-right means
+    # INCREASING precision -- same reading direction as the COMPRESSED1 chart.
+    # Default truncate=0 (full 23 bits) -> rightmost; truncate=20 (3 bits kept)
+    # -> leftmost.
     prec_float_filter = {k: v for k, v in base_default.items() if k != "position_truncate_bits"}
     prec_float_filter["vertex_format"] = "float"
     prec_float_filter["compressed_bits"] = None
@@ -660,9 +670,13 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         b = r.config.position_truncate_bits
         if b is None:
             continue
-        pts_mem.append((b, _g(r.data,"memory_bytes","static_clas_actual",default=0), fmt_bytes(_g(r.data,"memory_bytes","static_clas_actual",default=0))))
-        pts_inst.append((b, _g(r.data,"frame_perf","pf_instantiate_us",default=0), fmt_us(_g(r.data,"frame_perf","pf_instantiate_us",default=0))))
-        pts_fps.append((b,  _g(r.data,"frame_perf","fps",default=0), f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps"))
+        bits_kept = 23 - b
+        pts_mem.append((bits_kept, _g(r.data,"memory_bytes","static_clas_actual",default=0),
+                        f"{fmt_bytes(_g(r.data,'memory_bytes','static_clas_actual',default=0))}  (truncate={b}, kept={bits_kept})"))
+        pts_inst.append((bits_kept, _g(r.data,"frame_perf","pf_instantiate_us",default=0),
+                        f"{fmt_us(_g(r.data,'frame_perf','pf_instantiate_us',default=0))}  (truncate={b})"))
+        pts_fps.append((bits_kept,  _g(r.data,"frame_perf","fps",default=0),
+                        f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps  (truncate={b})"))
     if pts_mem:
         for chart_title, y_lab, lab, pts, ylog in [
             ("FLOAT32_3 precision sweep: CLAS bytes",          "CLAS bytes",        "CLAS bytes",        pts_mem,  False),
@@ -672,13 +686,13 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
             c = Chart(
                 title=chart_title,
                 category="Precision (FLOAT32_3)",
-                description=("--position-truncate N zeroes the low N bits of each "
-                             "FLOAT32_3 position mantissa, increasing CLAS quantizer "
-                             "efficiency.  X axis = bits zeroed (0 = full precision; "
-                             "23 = signs+exponent only).  Extreme truncations (>16) "
-                             "may collapse geometry to a point -- FPS can spike "
-                             "because rays miss everything; don't read it as a perf win."),
-                chart_type="line", x_label="Bits truncated", y_label=y_lab, y_is_log=ylog,
+                description=("X axis = position-mantissa bits KEPT (= 23 - --position-truncate N).  "
+                             "Higher = more precision.  Same reading direction as the COMPRESSED1 "
+                             "chart below: left = lower precision, right = higher.  Extreme low "
+                             "values may collapse geometry; FPS spikes at the left can mean rays "
+                             "miss everything."),
+                chart_type="line", x_label="Bits kept (higher = more precision)",
+                y_label=y_lab, y_is_log=ylog,
             )
             c.series[lab] = sorted(pts)
             charts.append(c)
@@ -694,9 +708,12 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         b = r.config.compressed_bits
         if b is None:
             continue
-        pts_mem.append((b, _g(r.data,"memory_bytes","static_clas_actual",default=0), fmt_bytes(_g(r.data,"memory_bytes","static_clas_actual",default=0))))
-        pts_inst.append((b, _g(r.data,"frame_perf","pf_instantiate_us",default=0), fmt_us(_g(r.data,"frame_perf","pf_instantiate_us",default=0))))
-        pts_fps.append((b, _g(r.data,"frame_perf","fps",default=0), f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps"))
+        pts_mem.append((b, _g(r.data,"memory_bytes","static_clas_actual",default=0),
+                        f"{fmt_bytes(_g(r.data,'memory_bytes','static_clas_actual',default=0))}  (cb={b})"))
+        pts_inst.append((b, _g(r.data,"frame_perf","pf_instantiate_us",default=0),
+                        f"{fmt_us(_g(r.data,'frame_perf','pf_instantiate_us',default=0))}  (cb={b})"))
+        pts_fps.append((b, _g(r.data,"frame_perf","fps",default=0),
+                        f"{_g(r.data,'frame_perf','fps',default=0):.1f} fps  (cb={b})"))
     if pts_mem:
         for chart_title, y_lab, lab, pts in [
             ("COMPRESSED1 precision sweep: CLAS bytes",       "CLAS bytes",        "CLAS bytes",        pts_mem),
@@ -706,11 +723,12 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
             c = Chart(
                 title=chart_title,
                 category="Precision (COMPRESSED1)",
-                description=("--compressed-bits N sets bits/component for the "
-                             "COMPRESSED1 shared-exponent quantizer.  Higher = "
-                             "more precision; valid range 1..16.  Very low values "
-                             "(<4) collapse geometry; FPS spikes can mean rays miss."),
-                chart_type="line", x_label="Bits / component", y_label=y_lab,
+                description=("X axis = --compressed-bits N (bits/component for the COMPRESSED1 "
+                             "shared-exponent quantizer; valid 1..16).  Higher = more precision.  "
+                             "Same reading direction as the FLOAT32_3 chart above.  Very low "
+                             "values (<4) collapse geometry; FPS spikes can mean rays miss."),
+                chart_type="line", x_label="Bits / component (higher = more precision)",
+                y_label=y_lab,
             )
             c.series[lab] = sorted(pts)
             charts.append(c)
@@ -786,8 +804,11 @@ def render_html(charts: list[Chart], runs: list[RunResult], adapter_info: dict,
             datasets = []
             for j, (label, pts) in enumerate(c.series.items()):
                 color = PALETTE[j % len(PALETTE)]
-                # For bar charts the x is a string label; for line it's numeric.
-                if c.chart_type == "bar":
+                # For category x scale, x values become string labels (evenly
+                # spaced regardless of numeric distance) -- otherwise 0/100/1k
+                # collapse against the left edge on a linear scale.  For bar
+                # charts same thing.  For linear/log x scales we pass numbers.
+                if c.chart_type == "bar" or c.x_scale == "category":
                     data = [{"x": str(x), "y": y} for x, y, _t in pts]
                 else:
                     data = [{"x": x, "y": y} for x, y, _t in pts]
@@ -804,11 +825,24 @@ def render_html(charts: list[Chart], runs: list[RunResult], adapter_info: dict,
             tip_map = {}
             for label, pts in c.series.items():
                 tip_map[label] = {str(x): t for x, _y, t in pts}
+            # Resolve x scale type: bar charts always use 'category';
+            # line charts use Chart.x_scale, with x_is_log as legacy alias for 'log'.
+            if c.chart_type == "bar":
+                x_type = "category"
+            elif c.x_is_log:
+                x_type = "logarithmic"
+            elif c.x_scale == "log":
+                x_type = "logarithmic"
+            elif c.x_scale == "category":
+                x_type = "category"
+            else:
+                x_type = "linear"
             opts = {
                 "responsive": True,
                 "maintainAspectRatio": False,
                 "scales": {
                     "x": {
+                        "type": x_type,
                         "title": {"display": True, "text": c.x_label, "color": "#9da7b3"},
                         "ticks": {"color": "#9da7b3"},
                         "grid": {"color": "#22272e"},
@@ -827,8 +861,6 @@ def render_html(charts: list[Chart], runs: list[RunResult], adapter_info: dict,
                     },
                 },
             }
-            if c.x_is_log:
-                opts["scales"]["x"]["type"] = "logarithmic"
 
             chart_js_blocks.append(f'''
 (function() {{

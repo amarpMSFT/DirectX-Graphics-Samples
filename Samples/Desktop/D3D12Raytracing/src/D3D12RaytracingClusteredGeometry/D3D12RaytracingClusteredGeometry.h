@@ -1312,8 +1312,18 @@ private:
     UINT                                 m_frameTimeRingIdx   = 0;
     UINT                                 m_frameTimeRingCount = 0;
     double                               m_frameTimeRingSum   = 0.0;       // sum of valid entries
-    double    m_animSeconds       = 0.0;          // wall-clock pan time (frame-rate independent)
+    double    m_animSeconds       = 0.0;          // wall-clock anim time (drives AnimateBall.cs); freezable with [M]
     bool      m_animPaused        = false;
+    // Camera-pan time + pause state, decoupled from animation time so a bench
+    // run can lock the camera at a fixed viewpoint (eliminating per-frame
+    // glass/refraction overlap variance) while still measuring per-frame AS
+    // rebuild costs (animated CLAS / BLAS).  Both times tick at the same wall-
+    // clock rate when both are unpaused, so a fresh run with neither paused
+    // matches the historical (single m_animSeconds) behaviour.  [Space] toggles
+    // camera; [M] toggles animation.  --camera-paused / --anim-paused CLI flags
+    // start either or both frozen.
+    double    m_cameraSeconds     = 0.0;
+    bool      m_cameraPaused      = false;
 
     // Screenshot capture (--screenshot N path.png).
     int          m_screenshotFrame     = -1;

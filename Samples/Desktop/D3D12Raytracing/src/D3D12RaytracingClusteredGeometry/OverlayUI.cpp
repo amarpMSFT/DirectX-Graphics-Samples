@@ -1454,10 +1454,15 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
                ReflectionBounces(), RefractionBounces());
     drawKeyLine(L", .", kbuf);
 
-    // [space] pause toggle is the bottom of the key list -- biggest /
-    // most commonly-pressed control after the user has set up the
-    // rest of the configuration above.
+    // [M] animation + [Space] camera pause -- two independent toggles
+    // (decoupled in the pause-fix refactor).  Side-by-side at the bottom of
+    // the key list.  [Space] is the absolute bottom because it's the most
+    // common interactive press (freezing the camera to study a frame); [M]
+    // sits just above it for the secondary "freeze the wobble" control.
     swprintf_s(kbuf, L"   animation:        %s", m_animPaused ? L"PAUSED" : L"playing");
+    drawKeyLine(L"[M]", kbuf);
+
+    swprintf_s(kbuf, L"   camera pan:       %s", m_cameraPaused ? L"PAUSED" : L"playing");
     drawKeyLine(L"space", kbuf);
 
     // Flush any pending drawSeg whose right-pad we haven't decided yet

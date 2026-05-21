@@ -189,6 +189,35 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             m_benchOutPath = argv[i+1];
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--camera-paused") == 0)
+        {
+            // Lock the camera at the current m_cameraSeconds value (=0 by
+            // default; combine with --camera-seconds N to pick a specific
+            // orbit angle).  Equivalent to hitting [Space] interactively.
+            // Bench-mode-friendly: per-frame cost stops depending on which
+            // glass surfaces are currently overlapping in screen space, so
+            // FPS measurements stabilise.  Animation still runs unless
+            // --anim-paused is also passed.
+            m_cameraPaused = true;
+        }
+        else if (_wcsicmp(argv[i], L"--anim-paused") == 0)
+        {
+            // Freeze the animated-ball wobble (m_animSeconds stops advancing).
+            // Equivalent to hitting [M] interactively.  Per-frame INSTANTIATE /
+            // BLAS-from-CLAS still happen but with frozen vertex positions.
+            m_animPaused = true;
+        }
+        else if (_wcsicmp(argv[i], L"--camera-seconds") == 0 && i + 1 < argc)
+        {
+            // Set the initial camera orbit time (in seconds along the 30 s
+            // yaw / 19 s dolly Lissajous).  Combine with --camera-paused
+            // to lock at a specific viewpoint.  Same time value the
+            // [Space] freezer sees; useful for picking a viewpoint that
+            // shows lots of scene at large clone counts (try ~7.5 for
+            // quarter-orbit side view, ~15 for halfway-around).
+            m_cameraSeconds = _wtof(argv[i+1]);
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--at") == 0 && i + 1 < argc)
         {
             // Schedule an action to fire at a specific frame.  Format:
@@ -254,8 +283,22 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
 // ---- OnKeyDown -------------------------------------------
 void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
 {
-    // ----- A/V/P primary toggles -----
+    // ----- Space / M = camera pan + animation toggle.  Decoupled in the
+    //   pause-fix refactor: pre-decoupling Space toggled m_animSeconds which
+    //   drove BOTH camera orbit and per-vertex animation, so freezing one
+    //   froze the other.  Now Space toggles ONLY camera (m_cameraSeconds),
+    //   M toggles ONLY animation (m_animSeconds).  Useful for the bench
+    //   script: --camera-paused locks viewpoint -> stable per-frame cost,
+    //   while animation keeps running so per-frame anim AS rebuilds are
+    //   still measured.  Interactive use: hit Space to study a frame
+    //   without losing animation, hit M to freeze the wobble without
+    //   stopping the orbit.
     if (key == VK_SPACE)
+    {
+        m_cameraPaused = !m_cameraPaused;
+        SampleLog::LogF(L"[input] camera pan %s\n", m_cameraPaused ? L"PAUSED" : L"resumed");
+    }
+    else if (key == 'M' || key == 'm')
     {
         m_animPaused = !m_animPaused;
         SampleLog::LogF(L"[input] animation %s\n", m_animPaused ? L"PAUSED" : L"resumed");

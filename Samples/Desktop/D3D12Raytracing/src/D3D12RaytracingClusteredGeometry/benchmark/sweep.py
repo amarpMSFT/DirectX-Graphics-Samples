@@ -206,12 +206,19 @@ def run_one(exe: pathlib.Path, cfg: RunConfig, out_dir: pathlib.Path,
     """Spawn the exe once for `cfg`, wait for it to exit with the JSON written,
     return the parsed result.  Init timeout accommodates trad-mode 10K which
     can take 60+ seconds before the bench window even begins.
+
+    Always passes --camera-paused: the camera's orbital pan changes screen-
+    space overlap between glass surfaces every frame, which changes per-frame
+    ray count -> per-frame cost varies enough to add noise to FPS / per-frame
+    timing samples.  Locking the camera (animation keeps running so per-frame
+    AS rebuilds are still measured) makes the measurement reproducible.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / f"{cfg.slug()}.json"
     if out_json.exists():
         out_json.unlink()
     cmd = [str(exe)] + cfg.to_cli() + [
+        "--camera-paused",
         "--bench-seconds", str(bench_seconds),
         "--bench-out", str(out_json),
     ]

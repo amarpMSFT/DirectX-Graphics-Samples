@@ -5290,8 +5290,10 @@ UINT D3D12RaytracingClusteredGeometry::AllocateDescriptor(D3D12_CPU_DESCRIPTOR_H
 }
 
 // =====================================================================================
-// Time-based camera orbit. Uses m_animSeconds (accumulated wall-clock) so the
-// pan rate is independent of frame rate, and pauses cleanly with the 'P' key.
+// Time-based camera orbit. Uses m_cameraSeconds (accumulated wall-clock, decoupled
+// from m_animSeconds since the pause-fix) so [Space] freezes camera independently
+// of [M] freezing animation -- the bench script can lock camera for stable
+// per-frame cost while still measuring the per-frame animated AS rebuilds.
 // =====================================================================================
 void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
 {
@@ -5308,7 +5310,7 @@ void D3D12RaytracingClusteredGeometry::UpdateSceneConstantBuffer()
     // farther back than the rest position -- it only swings closer to the
     // scene, framing interior cluster detail at the inner peak.  Range:
     // [kBaseRadius - kDollyAmp, kBaseRadius].
-    const double t           = m_animSeconds;
+    const double t           = m_cameraSeconds;
     const float  angle       = float(t * (2.0 * M_PI / 30.0));
     constexpr float kBaseRadius  = 6.5f;     // outermost orbit distance (= rest position)
     constexpr float kDollyAmp    = 3.0f;     // inward swing magnitude; radius sweeps 3.5..6.5
@@ -5373,6 +5375,8 @@ void D3D12RaytracingClusteredGeometry::OnUpdate()
     m_timer.Tick();
     if (!m_animPaused)
         m_animSeconds += m_timer.GetElapsedSeconds();
+    if (!m_cameraPaused)
+        m_cameraSeconds += m_timer.GetElapsedSeconds();
     UpdateSceneConstantBuffer();
 
     // Wall-clock frame-time measurement for the overlay's FPS / ms-per-frame
@@ -5408,7 +5412,12 @@ void D3D12RaytracingClusteredGeometry::OnRender()
     // is at the right angle when we capture).
     if (m_screenshotAtSeconds >= 0 && !m_screenshotTaken && m_framesRendered == 0)
     {
-        m_animSeconds = m_screenshotAtSeconds;
+        // --screenshot-at <seconds>: jump CAMERA orbit to <seconds> on the
+        // first frame.  Doesn't touch m_animSeconds (the animated-ball wobble);
+        // pre-decoupling this set m_animSeconds because they were the same
+        // clock, but the orbit angle is the only thing screenshot users care
+        // about so just set the camera clock.
+        m_cameraSeconds = m_screenshotAtSeconds;
         UpdateSceneConstantBuffer();
     }
 

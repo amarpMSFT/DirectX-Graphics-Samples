@@ -290,7 +290,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
         for pool_label, metric in [
             ("static clusters",  ("memory_bytes", "static_clas_actual")),
             ("templates",        ("memory_bytes", "animated_template")),
-            ("per-frame CLAS",   ("memory_bytes", "animated_pf_clas_actual")),
+            ("template instances",   ("memory_bytes", "animated_pf_clas_actual")),
         ]:
             defs.append(ChartDef(
                 title=f"COMPRESSED1 precision: {pool_label} bytes vs bits/component",
@@ -330,7 +330,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
         for pool_label, metric in [
             ("static clusters",  ("memory_bytes", "static_clas_actual")),
             ("templates",        ("memory_bytes", "animated_template")),
-            ("per-frame CLAS",   ("memory_bytes", "animated_pf_clas_actual")),
+            ("template instances",   ("memory_bytes", "animated_pf_clas_actual")),
         ]:
             defs.append(ChartDef(
                 title=f"FLOAT32_3 precision: {pool_label} bytes vs bits kept",

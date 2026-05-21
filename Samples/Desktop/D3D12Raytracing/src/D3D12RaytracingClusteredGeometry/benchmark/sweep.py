@@ -168,6 +168,10 @@ def build_sweep_matrix(quick: bool, include_10k_trad: bool) -> list[RunConfig]:
 
     for bf in ("none", "fast-build"):  # fast-trace is the default
         runs.append(RunConfig(build_flags=bf))
+        # Trad-mode variant so the build-flag analysis can also chart
+        # traditional BLAS size + build time per flag.  Each one is a quick
+        # ~6s run; adds 2 to the matrix.
+        runs.append(RunConfig(geometry_mode="traditional", build_flags=bf))
 
     if not quick:
         # Precision sweep -- FLOAT32_3.  Default position_truncate_bits=0.
@@ -507,52 +511,62 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     if any(c.series.values()):
         charts.append(c)
 
-    # --- Per-frame INSTANTIATE (cluster-only) -----------------------------
+    # --- Per-frame INSTANTIATE: INTENTIONALLY OMITTED from the scaling group.
+    # Data is constant ~12µs across scene scale -- the cluster path only runs
+    # INSTANTIATE for the source animated sphere (768 clusters / 16384 tris);
+    # animated clones share the source's per-frame CLAS via TLAS instancing,
+    # so scale doesn't add INSTANTIATE work.  Putting it on a scaling chart
+    # produces a flat-line non-signal.  Per-frame INSTANTIATE is still charted
+    # in the Precision categories where it shows real precision sensitivity.
+
+    # --- Scene cluster count vs scene size --------------------------------
+    # Cluster + trad modes use IDENTICAL geometry so cluster/triangle counts
+    # match across modes.  Earlier version emitted both lines; the second
+    # was hidden behind the first (same y values).  Just plot one series.
     c = Chart(
-        title="Per-frame INSTANTIATE_CLUSTER_TEMPLATES time vs scene size (cluster mode)",
+        title="Scene cluster count vs scene size",
         category="Scaling",
-        description=("Cluster-mode-only: GPU time for the per-frame INSTANTIATE "
-                     "op that materialises animated CLAS from rest-pose templates.  "
-                     "Sensitive to vertex format + precision since it re-encodes "
-                     "per-frame.  Lower is better."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="INSTANTIATE (µs)",
+        description=("Total cluster count in the active scene.  Counts are "
+                     "identical between cluster mode and traditional mode "
+                     "(both modes consume the same source geometry; trad mode "
+                     "happens to also report cluster counts even though they "
+                     "don't drive the BVH layout there).  Y axis is logarithmic. "
+                     "If clones use lower LOD than the base scene, you'd see "
+                     "sublinear growth -- in this sample they don't, so the "
+                     "curve scales near-linearly with clone count."),
+        chart_type="line", x_label="Extra instances (clones)", y_label="Clusters",
         x_scale="category", y_is_log=True,
     )
     pts = []
     for r in match({**scale_filter, "geometry_mode": "clusters", "trad_alloc": "compact"}):
         x = r.config.extra_instances
-        y = _g(r.data, "frame_perf", "pf_instantiate_us", default=0)
-        pts.append((x, y, fmt_us(y)))
+        y = _g(r.data, "scene", "total_clusters", default=0)
+        pts.append((x, y, f"{y:,} clusters"))
     pts.sort()
     if pts:
         c.series["clusters"] = pts
         charts.append(c)
 
-    # --- Cluster + triangle count vs scene size (sanity / cross-check) ----
+    # --- Scene triangle count vs scene size -------------------------------
     c = Chart(
-        title="Cluster count and triangle count vs scene size",
+        title="Scene triangle count vs scene size",
         category="Scaling",
-        description=("Total clusters in the active geometry mode (cluster mode "
-                     "reports real clusters; trad mode reports 0 since it has "
-                     "no concept of clusters at the BVH level).  Triangle count "
-                     "is geometry-mode-independent.  Use as a sanity check "
-                     "that your sweep actually scaled."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Count",
+        description=("Total triangle count.  Same caveat as clusters: identical "
+                     "across cluster + trad modes.  Y axis logarithmic.  Compare "
+                     "this curve's slope to the cluster-count curve above to see "
+                     "if clones use higher or lower triangles-per-cluster than "
+                     "the base scene."),
+        chart_type="line", x_label="Extra instances (clones)", y_label="Triangles",
         x_scale="category", y_is_log=True,
     )
-    for mode in ("clusters", "traditional"):
-        for field_, label_suffix in (("total_clusters", " clusters"), ("total_triangles", " triangles")):
-            if mode == "traditional" and field_ == "total_clusters":
-                continue
-            pts = []
-            for r in match({**scale_filter, "geometry_mode": mode, "trad_alloc": "compact"}):
-                x = r.config.extra_instances
-                y = _g(r.data, "scene", field_, default=0)
-                pts.append((x, y, f"{y:,}"))
-            pts.sort()
-            if pts:
-                c.series[f"{mode}: {field_}"] = pts
-    if any(c.series.values()):
+    pts = []
+    for r in match({**scale_filter, "geometry_mode": "clusters", "trad_alloc": "compact"}):
+        x = r.config.extra_instances
+        y = _g(r.data, "scene", "total_triangles", default=0)
+        pts.append((x, y, f"{y:,} triangles"))
+    pts.sort()
+    if pts:
+        c.series["triangles"] = pts
         charts.append(c)
 
     # =========================================================================
@@ -628,28 +642,93 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         charts.append(c)
 
     # =========================================================================
-    # CATEGORY: BVH build flags
+    # CATEGORY: BVH build flags -- one chart per metric (separated y axes)
     # =========================================================================
-    rows = []
-    for bf in ("none", "fast-build", "fast-trace"):
-        m = match({**base_default, "vertex_format": "float", "build_flags": bf})
-        if m:
-            rows.append((bf, m[0]))
-    if len(rows) >= 2:
-        c = Chart(
-            title="BVH build flags: FPS + build time + BLAS bytes (cluster mode, default scene)",
-            category="Build flags",
-            description=("Effect of the cluster-path BUILD_BLAS_FROM_CLAS flag "
-                         "(NONE / FAST_BUILD / FAST_TRACE).  FAST_TRACE typically "
-                         "produces the best traversal perf (highest FPS) at the cost "
-                         "of slower build; FAST_BUILD is the reverse.  NONE lets the "
-                         "driver pick, usually = FAST_TRACE."),
-            chart_type="bar", x_label="Build flag", y_label="Value",
-        )
-        c.series["FPS"] = [(bf, _g(r.data,"frame_perf","fps",default=0), f"{_g(r.data,'frame_perf','fps',default=0):.1f}") for bf, r in rows]
-        c.series["BLAS build (ms)"] = [(bf, _g(r.data,"build_times_ms","static_blas",default=0), f"{_g(r.data,'build_times_ms','static_blas',default=0):.2f} ms") for bf, r in rows]
-        c.series["BLAS bytes"] = [(bf, _g(r.data,"memory_bytes","static_blas_total",default=0), fmt_bytes(_g(r.data,"memory_bytes","static_blas_total",default=0))) for bf, r in rows]
-        charts.append(c)
+    # Previously: one bar chart with FPS / build-time-ms / BLAS bytes on ONE
+    # y-axis -- unreadable (values spanned 6 orders of magnitude).  Now: one
+    # chart per metric.  Each chart contrasts the 3 build-flag values (NONE /
+    # FAST_BUILD / FAST_TRACE) for BOTH cluster mode (driven by --build-flags)
+    # and trad mode (same flag applied via DXR1 PREFER_FAST_BUILD / PREFER_FAST_TRACE).
+    flag_to_runs = {}  # flag -> {"clusters": run, "traditional": run}
+    # NOTE: drop build_flags from the base filter -- otherwise the filter pins
+    # to "fast-trace" (the default) and excludes the bf-none / bf-fast-build
+    # variants we're explicitly trying to chart.
+    bf_filter_c = {k: v for k, v in base_default.items() if k != "build_flags"}
+    bf_filter_c["vertex_format"] = "float"
+    bf_filter_c["geometry_mode"] = "clusters"
+    bf_filter_t = dict(bf_filter_c)
+    bf_filter_t["geometry_mode"] = "traditional"
+    flag_runs_cluster = match(bf_filter_c)
+    flag_runs_trad    = match(bf_filter_t)
+    for r in flag_runs_cluster:
+        flag_to_runs.setdefault(r.config.build_flags, {})["clusters"]    = r
+    for r in flag_runs_trad:
+        flag_to_runs.setdefault(r.config.build_flags, {})["traditional"] = r
+
+    # Stable category order matching the CLI tokens
+    flag_order = [bf for bf in ("none", "fast-build", "fast-trace") if bf in flag_to_runs]
+
+    if len(flag_order) >= 2:
+        # Helper: returns (xs, fmt-fn) for the per-mode bar series
+        def _flag_chart(title, desc, path, fmt_fn, y_label):
+            c = Chart(
+                title=title, category="Build flags",
+                description=desc, chart_type="bar",
+                x_label="Build flag", y_label=y_label,
+            )
+            for mode_key in ("clusters", "traditional"):
+                pts = []
+                for bf in flag_order:
+                    r = flag_to_runs.get(bf, {}).get(mode_key)
+                    if not r:
+                        continue
+                    v = _g(r.data, *path, default=None)
+                    if v is None:
+                        continue
+                    pts.append((bf, v, f"{mode_key} {bf}: {fmt_fn(v)}"))
+                if pts:
+                    c.series[mode_key] = pts
+            return c
+
+        charts.append(_flag_chart(
+            "Build flags: steady-state FPS",
+            "Higher is better.  FAST_TRACE typically wins for traversal perf; FAST_BUILD trades it for build time.",
+            ("frame_perf", "fps"),
+            lambda v: f"{v:.1f} fps", "FPS",
+        ))
+        charts.append(_flag_chart(
+            "Build flags: static-BLAS build time (ms)",
+            "Wall-clock ms to build the static-scene BLAS.  FAST_BUILD should be fastest, FAST_TRACE slowest.",
+            ("build_times_ms", "static_blas"),
+            lambda v: f"{v:.2f} ms", "Build time (ms)",
+        ))
+        charts.append(_flag_chart(
+            "Build flags: static-CLAS build time (ms, cluster mode only)",
+            "Cluster-mode only -- trad mode reports 0 here.  The build-flag knob propagates into the CLAS build via BUILD_BLAS_FROM_CLAS flags.",
+            ("build_times_ms", "static_clas"),
+            lambda v: f"{v:.2f} ms", "CLAS build (ms)",
+        ))
+        # Cluster mode: STATIC_CLAS bytes
+        charts.append(_flag_chart(
+            "Build flags: cluster CLAS bytes (cluster mode)",
+            "How the BVH build-flag preference affects CLAS storage (the LEAF arrays before BLAS_FROM_CLAS).  Often flat -- CLAS encoding is mostly independent of the BLAS flag.",
+            ("memory_bytes", "static_clas_actual"),
+            fmt_bytes, "CLAS bytes",
+        ))
+        # Cluster mode: STATIC_BLAS bytes (BLAS-from-CLAS output)
+        charts.append(_flag_chart(
+            "Build flags: cluster BLAS bytes (cluster mode)",
+            "Bytes of the cluster-path BLAS-from-CLAS output.  Flag-sensitive: FAST_TRACE typically larger (deeper BVH), FAST_BUILD smaller.",
+            ("memory_bytes", "static_blas_total"),
+            fmt_bytes, "BLAS bytes",
+        ))
+        # Trad mode: BLAS bytes
+        charts.append(_flag_chart(
+            "Build flags: traditional BLAS bytes (trad mode)",
+            "DXR1 monolithic BLAS storage as a function of build-flag preference.  Same FAST_BUILD-smaller / FAST_TRACE-larger pattern is typical.",
+            ("memory_bytes", "traditional_blas_actual"),
+            fmt_bytes, "BLAS bytes",
+        ))
 
     # =========================================================================
     # CATEGORY: Precision sweep (FLOAT32_3 truncate bits)
@@ -685,7 +764,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                          "(apples-to-apples).  'static clusters' = the 8 static scene "
                          "objects' CLAS (built once at init).  'templates' = the "
                          "animated sphere's cluster TEMPLATES (rest-pose topology, "
-                         "built once at setup).  'per-frame CLAS' = the per-frame "
+                         "built once at setup).  'template instances' = the per-frame "
                          "INSTANTIATE output for the animated sphere (rebuilt every "
                          "frame).  X axis = position-mantissa bits KEPT "
                          "(= 23 - --position-truncate N).  Higher = more precision.  "
@@ -705,7 +784,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
             pts_pf.append((bits_kept,     ypf, f"{fmt_bytes(ypf)}  (truncate={b}, kept={bits_kept})"))
         c.series["static clusters"] = sorted(pts_static)
         c.series["templates"]       = sorted(pts_tmpl)
-        c.series["per-frame CLAS"]  = sorted(pts_pf)
+        c.series["template instances"]  = sorted(pts_pf)
         charts.append(c)
 
         # --- INSTANTIATE time chart (animated-only metric) -----------------
@@ -766,7 +845,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
             description=("Three CLAS-storage pools at the default scene, all in bytes "
                          "(apples-to-apples).  'static clusters' = the 8 static scene "
                          "objects' CLAS.  'templates' = the animated sphere's cluster "
-                         "TEMPLATES (rest-pose topology).  'per-frame CLAS' = the per-frame "
+                         "TEMPLATES (rest-pose topology).  'template instances' = the per-frame "
                          "INSTANTIATE output for the animated sphere.  X axis = "
                          "--compressed-bits N (bits/component for the COMPRESSED1 "
                          "shared-exponent quantizer; valid 1..16).  Higher = more precision.  "
@@ -785,7 +864,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
             pts_pf.append((b,     ypf, f"{fmt_bytes(ypf)}  (cb={b})"))
         c.series["static clusters"] = sorted(pts_static)
         c.series["templates"]       = sorted(pts_tmpl)
-        c.series["per-frame CLAS"]  = sorted(pts_pf)
+        c.series["template instances"]  = sorted(pts_pf)
         charts.append(c)
 
         # --- INSTANTIATE time chart (animated-only) ---

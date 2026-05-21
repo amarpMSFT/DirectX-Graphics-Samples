@@ -4260,13 +4260,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(obj.worldPos.x, obj.worldPos.y, obj.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[i].Transform), m);
         instances[i].InstanceID  = obj.instanceID;
-        // ⚠ DIAGNOSTIC: mask=0 hides all base-scene + static-clone instances
-        // so only the central animated ball + N_animClone anim clones render.
-        // Pull commit + rebuild + run + press [N] for 100 extras: you should
-        // see the central animated ball + 20 small wave-deformed clones at
-        // spiral positions around it.  Nothing else.
-        // Revert to InstanceMask=0xFF when done.
-        instances[i].InstanceMask= 0x00;
+        instances[i].InstanceMask= 0xFF;
         // Hit-group contribution.  Three cases:
         //   * SINGLE-region opaque-only        -> kHitGroupContribOpaque
         //   * SINGLE-region glass OR ALL-glass -> kHitGroupContribGlass
@@ -4337,10 +4331,7 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                    * XMMatrixTranslation(a.worldPos.x, a.worldPos.y, a.worldPos.z);
         XMStoreFloat3x4(reinterpret_cast<XMFLOAT3X4*>(instances[N_static].Transform), m);
         instances[N_static].InstanceID  = a.instanceID;
-        // ⚠ DIAGNOSTIC: mask=0 hides the central animated source ball too,
-        // so the user sees ONLY the 20 anim clones at spiral positions.
-        // Revert to 0xFF when done.
-        instances[N_static].InstanceMask= 0x00;
+        instances[N_static].InstanceMask= 0xFF;
         // Animated object has no ClusterObject scene config yet; treat by
         // material only (currently refractive glass -> GlassHitGroup).
         const auto& aMat = m_materials[a.instanceID];
@@ -4399,16 +4390,6 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
                 (m_geometryMode == GeometryMode::Clusters && ac.blasGPUVA != 0)
                     ? ac.blasGPUVA
                     : animBlasGVA;
-            // ⚠ DIAGNOSTIC: log every anim clone's TLAS row
-            SampleLog::LogF(L"[tlas-anim-clone] row=%u pos=(%.2f,%.2f,%.2f) scale=%.2f "
-                            L"mask=0x%02X flags=0x%X contrib=%u accelStruct=0x%llX (ac.blasGPUVA=0x%llX animBlasGVA=0x%llX)\n",
-                            row, ac.worldPos.x, ac.worldPos.y, ac.worldPos.z, ac.worldScale,
-                            (unsigned)instances[row].InstanceMask,
-                            (unsigned)instances[row].Flags,
-                            instances[row].InstanceContributionToHitGroupIndex,
-                            (unsigned long long)instances[row].AccelerationStructure,
-                            (unsigned long long)ac.blasGPUVA,
-                            (unsigned long long)animBlasGVA);
             (isGlass ? nGlass : nOpaque)++;
         }
     }
@@ -4471,6 +4452,21 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
 void D3D12RaytracingClusteredGeometry::RebuildTlasPerFrame()
 {
     if (!m_tlasBuffer || !m_tlasScratchBuffer || !m_tlasInstanceDescs) return;
+    // ⚠ CRITICAL BUG (next to fix): N_total here OMITS m_animatedClones.size()
+    // so per-frame TLAS rebuild only includes the first (N_static + N_anim)
+    // instances -- the N_animClone anim-clone instance descs written into
+    // m_tlasInstanceDescs by BuildTlasClassic are NEVER ENROLLED in the
+    // per-frame TLAS, so anim clones don't render.
+    //
+    // The intuitive fix (add + m_animatedClones.size()) triggers TDR
+    // (DXGI_ERROR_DEVICE_HUNG) even when clones reference a known-good
+    // BLAS (source's or a static obj's).  Cause unknown -- requires
+    // further investigation:
+    //   - Initial BuildTlasClassic with full N_total works
+    //   - Per-frame TLAS rebuild with full N_total + ANY mask=0xFF anim
+    //     clone instance causes the GPU to hang during ray traversal
+    //   - Setting mask=0 (skip during traversal) avoids the TDR
+    //   - Bug reproduces with N=1 anim clone too -- not a scale issue
     const UINT N_total = (UINT)m_objects.size()
         + (m_animatedObjectEnabled ? 1u : 0u);
 

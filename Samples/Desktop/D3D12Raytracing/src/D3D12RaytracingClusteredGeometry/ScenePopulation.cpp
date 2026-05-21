@@ -407,22 +407,19 @@ void D3D12RaytracingClusteredGeometry::RegenerateWorkloadCloneInstances()
 
         if (cycleSlot == kAnimCycleSlot)
         {
-            // Animated clone: EXACTLY as if it were one of the static
-            // clones in the sequence -- same spiralPos formula (Vogel
-            // sunflower starting at innerR=4.5, area-equivalent spacing
-            // expanding outward via r=sqrt(innerR^2 + i*spacing^2)),
-            // same per-clone random rotation + scale, same height
-            // curve.  The ONLY difference vs a static clone at this
-            // position is that this slot is animated (shared CLAS so
-            // it wave-deforms in lock-step with the central source).
+            // Animated clone: lives in the SAME spiral as the static
+            // clones (every 5th slot in the cycle is the anim variant).
+            // Same spiralPos, same per-clone random rotation + scale.
             //
-            // Sentinel material override => inherit source's chrome+
-            // glass checker so each clone visually matches the central
-            // animated ball.
+            // ⚠ KNOWN ISSUE: anim clones DON'T currently render because
+            // RebuildTlasPerFrame's NumDescs OMITS m_animatedClones.size().
+            // Adding it triggers TDR for reasons under investigation.
+            // See D3D12RaytracingClusteredGeometry.cpp RebuildTlasPerFrame
+            // comment block for details.
             AnimatedCloneInstance ac;
             ac.worldPos             = spiralPos;
-            ac.worldRotEuler        = randRot;        // same as static would get
-            ac.worldScale           = randScale;      // same as static would get
+            ac.worldRotEuler        = randRot;
+            ac.worldScale           = randScale;
             ac.materialOverrideSlot = 0xFFFFFFFFu;
             m_animatedClones.push_back(ac);
             continue;

@@ -398,6 +398,19 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                 out.append(r)
         return out
 
+    # Look up the baseline-scene object count from any successful run -- the
+    # sample dumps it as scene.base_objects.  Used to label the scaling
+    # x-axis as 'Extra unique objects (vs N-object baseline)' so readers
+    # immediately see what 'N=1000 clones' means in terms of total objects.
+    base_objects = None
+    for r in ok:
+        bo = _g(r.data, "scene", "base_objects", default=None)
+        if bo:
+            base_objects = bo
+            break
+    extra_x_label = (f"Extra unique objects (vs {base_objects}-object baseline)"
+                     if base_objects else "Extra unique objects")
+
     charts: list[Chart] = []
 
     # =========================================================================
@@ -417,7 +430,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "(DXR2) path amortises geometry via cluster templates + "
                      "BLAS-from-CLAS; the traditional (DXR1) path stores a full "
                      "monolithic BLAS per unique object."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Total AS memory (bytes)",
+        chart_type="line", x_label=extra_x_label, y_label="Total AS memory (bytes)",
         x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
@@ -439,7 +452,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "BLAS + TLAS for cluster mode, BLAS + TLAS for traditional).  "
                      "Measured once at startup; per-frame anim work excluded.  "
                      "Lower is better."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Build time (ms)",
+        chart_type="line", x_label=extra_x_label, y_label="Build time (ms)",
         x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
@@ -460,7 +473,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         description=("Rolling-average FPS over the bench window.  Higher is "
                      "better.  Reflects total per-frame cost including ray "
                      "traversal, shading, AS rebuilds (anim BLAS), and present."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="FPS",
+        chart_type="line", x_label=extra_x_label, y_label="FPS",
         x_scale="category",
     )
     for mode in ("clusters", "traditional"):
@@ -481,7 +494,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         description=("GPU time spent rebuilding the TLAS each frame, smoothed "
                      "by the per-frame snap window.  Includes all clones since "
                      "TLAS NumDescs must cover every instance.  Lower is better."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="TLAS rebuild (µs)",
+        chart_type="line", x_label=extra_x_label, y_label="TLAS rebuild (µs)",
         x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
@@ -504,7 +517,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "rebuild for the animated objects.  Both modes use the "
                      "same field (pf_blas_us); the meaning depends on the path. "
                      "Lower is better."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Anim BLAS (µs)",
+        chart_type="line", x_label=extra_x_label, y_label="Anim BLAS (µs)",
         x_scale="category", y_is_log=True,
     )
     for mode in ("clusters", "traditional"):
@@ -541,7 +554,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "If clones use lower LOD than the base scene, you'd see "
                      "sublinear growth -- in this sample they don't, so the "
                      "curve scales near-linearly with clone count."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Clusters",
+        chart_type="line", x_label=extra_x_label, y_label="Clusters",
         x_scale="category", y_is_log=True,
     )
     pts = []
@@ -563,7 +576,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
                      "this curve's slope to the cluster-count curve above to see "
                      "if clones use higher or lower triangles-per-cluster than "
                      "the base scene."),
-        chart_type="line", x_label="Extra instances (clones)", y_label="Triangles",
+        chart_type="line", x_label=extra_x_label, y_label="Triangles",
         x_scale="category", y_is_log=True,
     )
     pts = []

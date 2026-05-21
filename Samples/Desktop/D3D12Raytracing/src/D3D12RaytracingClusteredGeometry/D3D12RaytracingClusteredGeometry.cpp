@@ -6445,6 +6445,11 @@ void D3D12RaytracingClusteredGeometry::WriteBenchmarkSnapshot()
     o << "  \"scene\": {\n";
     kvU("total_clusters",       m_overlayStats.totalClusterCount);
     kvU("total_triangles",      m_overlayStats.totalTriangleCount);
+    // Baseline-scene object count (set in BuildScene as m_sourceObjectCount).
+    // The benchmark x-axis 'extra instances' is measured AGAINST this baseline,
+    // so reports can label charts as 'Extra unique objects (vs N-object
+    // baseline)' without hardcoding N.
+    kvU("base_objects",         m_sourceObjectCount);
     // Animated mesh cluster + triangle counts (independent of the static scene
     // cluster count above).  Useful for bytes-per-cluster math when comparing
     // static vs animated CLAS sizes -- the animated sphere is meshed differently

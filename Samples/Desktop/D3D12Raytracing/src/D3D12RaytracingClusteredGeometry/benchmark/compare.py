@@ -137,6 +137,21 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
         all_slugs |= m.slugs
     common_slugs = set.intersection(*[m.slugs for m in machines]) if machines else set()
 
+    # Look up baseline-scene object count from any machine's default run
+    # (sample dumps it as scene.base_objects).  Used to label the scaling
+    # x-axis with the actual baseline rather than a hardcoded number.
+    base_objects = None
+    for m in machines:
+        for r in m.runs.values():
+            bo = _g(r.data, "scene", "base_objects", default=None)
+            if bo:
+                base_objects = bo
+                break
+        if base_objects:
+            break
+    extra_x_label = (f"Extra unique objects (vs {base_objects}-object baseline)"
+                     if base_objects else "Extra unique objects")
+
     defs: list[ChartDef] = []
 
     # --- Scaling: extra-instances on X -----------------------------------
@@ -157,7 +172,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
                          "machines at the same scene scale.  Differences here "
                          "are usually adapter-architecture / driver-allocator "
                          "specific (e.g. NVIDIA vs Intel vs WARP)."),
-            chart_type="line", x_label="Extra instances", y_label="Total AS (bytes)",
+            chart_type="line", x_label=extra_x_label, y_label="Total AS (bytes)",
             x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("memory_bytes", "total_as"),
             value_formatter=fmt_bytes,
@@ -168,7 +183,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             description=("Wall-clock ms to build the static AS pipeline.  "
                          "Where machines diverge most is in the parallel "
                          "compaction passes."),
-            chart_type="line", x_label="Extra instances", y_label="Build time (ms)",
+            chart_type="line", x_label=extra_x_label, y_label="Build time (ms)",
             x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("build_times_ms", "total"),
             value_formatter=lambda v: f"{v:.1f} ms",
@@ -179,7 +194,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             description=("Higher is better.  Reveals adapter-class differences "
                          "(consumer vs workstation vs WARP) more sharply than "
                          "memory does."),
-            chart_type="line", x_label="Extra instances", y_label="FPS",
+            chart_type="line", x_label=extra_x_label, y_label="FPS",
             x_scale="category", x_keys=xs,
             metric_path=("frame_perf", "fps"),
             value_formatter=lambda v: f"{v:.1f} fps",
@@ -188,7 +203,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             title=f"Per-frame TLAS rebuild µs vs scene size ({mode_label})",
             category="Scaling -- per-frame ops",
             description="Microseconds GPU spent rebuilding TLAS each frame.  Lower is better.",
-            chart_type="line", x_label="Extra instances", y_label="TLAS rebuild (µs)",
+            chart_type="line", x_label=extra_x_label, y_label="TLAS rebuild (µs)",
             x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("frame_perf", "pf_tlas_us"),
             value_formatter=fmt_us,
@@ -198,7 +213,7 @@ def build_chart_defs(machines: list[MachineReport]) -> list[ChartDef]:
             category="Scaling -- per-frame ops",
             description=("Cluster mode: BUILD_BLAS_FROM_CLAS.  Traditional: full "
                          "DXR1 BLAS rebuild.  Lower is better."),
-            chart_type="line", x_label="Extra instances", y_label="Anim BLAS (µs)",
+            chart_type="line", x_label=extra_x_label, y_label="Anim BLAS (µs)",
             x_scale="category", y_is_log=True, x_keys=xs,
             metric_path=("frame_perf", "pf_blas_us"),
             value_formatter=fmt_us,

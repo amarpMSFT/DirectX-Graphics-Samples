@@ -109,6 +109,23 @@ void D3D12RaytracingClusteredGeometry::ParseCommandLineArgs(_In_reads_(argc) WCH
             else if (_wcsicmp(argv[i+1], L"compact")  == 0) m_traditionalAllocMode = TraditionalAllocMode::Compact;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--trad-anim") == 0 && i + 1 < argc)
+        {
+            // [F] runtime toggle in traditional mode (per-frame animated BLAS).
+            //   rebuild - full BuildRaytracingAccelerationStructure each frame
+            //             (FAST_TRACE quality; fresh topology every frame --
+            //             apples-to-apples comparison with the cluster path's
+            //             INSTANTIATE + BUILD_BLAS_FROM_CLAS pipeline).
+            //   refit   - same Build call with PERFORM_UPDATE flag (reuses
+            //             topology; ~4-10x cheaper but quality drifts as
+            //             vertices wobble away from the cached topology).
+            //             No equivalent in the cluster path -- INSTANTIATE
+            //             always re-encodes leaves and BUILD_BLAS_FROM_CLAS
+            //             always re-tops the BLAS.
+            if      (_wcsicmp(argv[i+1], L"rebuild") == 0) m_traditionalAnimMode = TraditionalAnimMode::Rebuild;
+            else if (_wcsicmp(argv[i+1], L"refit")   == 0) m_traditionalAnimMode = TraditionalAnimMode::Refit;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--rebuild-mode") == 0 && i + 1 < argc)
         {
             // Per-frame static-AS rebuild mode = [R] runtime toggle, set from CLI

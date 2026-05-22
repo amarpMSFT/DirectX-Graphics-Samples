@@ -63,9 +63,10 @@ class RunConfig:
     vertex_format: str        = "float"           # --vertex-format
     clas_alloc: str           = "compact"         # --clas-alloc
     trad_alloc: str           = "compact"         # --trad-alloc
+    trad_anim_mode: str       = "rebuild"         # --trad-anim {rebuild|refit}
     static_rebuild: str       = "none"            # --rebuild-mode
     build_flags: str          = "fast-trace"      # --build-flags
-    extra_instances: int      = 0                 # --at <f>:extra-<n>  (we use CLI-equivalent below)
+    extra_instances: int      = 0                 # --extra-instances
     position_truncate_bits: int | None = None     # --position-truncate
     compressed_bits: int | None        = None     # --compressed-bits
     aa_samples: int | None             = None     # --aa-samples
@@ -76,6 +77,7 @@ class RunConfig:
             "--vertex-format", self.vertex_format,
             "--clas-alloc",    self.clas_alloc,
             "--trad-alloc",    self.trad_alloc,
+            "--trad-anim",     self.trad_anim_mode,
             "--rebuild-mode",  self.static_rebuild,
             "--build-flags",   self.build_flags,
             "--extra-instances", str(self.extra_instances),
@@ -102,6 +104,7 @@ class RunConfig:
                 "vertex_format": "vtx",
                 "clas_alloc":    "clas",
                 "trad_alloc":    "trad",
+                "trad_anim_mode": "anim",
                 "static_rebuild": "reb",
                 "build_flags":   "bf",
                 "extra_instances": "n",
@@ -151,14 +154,20 @@ def build_sweep_matrix(quick: bool, include_10k_trad: bool) -> list[RunConfig]:
 
     # --- 1. Scene scaling --------------------------------------------------
     # Cluster mode at 10K is fast (~5s init); trad mode at 10K is slow
-    # (~60-90s init) and dominates wall-clock.  Include cluster 10K by default;
-    # gate trad 10K on include_10k_trad.  --quick skips 10K entirely.
+    # (~10s init).  Include both by default; --quick skips 10K entirely.
     cluster_scales = [0, 100, 1000] + ([10000] if not quick else [])
     trad_scales    = [0, 100, 1000] + ([10000] if (include_10k_trad and not quick) else [])
     for n in cluster_scales:
         runs.append(RunConfig(geometry_mode="clusters",    extra_instances=n))
     for n in trad_scales:
+        # Default trad anim mode is 'rebuild' -- apples-to-apples with cluster
+        # (both produce fresh topology each frame).  Add a parallel 'refit'
+        # variant so the anim BLAS chart can show all three lines: cluster,
+        # trad rebuild, trad refit.  Refit is the topology-preserving
+        # PERFORM_UPDATE path (~4-10x cheaper but no equivalent in cluster).
         runs.append(RunConfig(geometry_mode="traditional", extra_instances=n))
+        runs.append(RunConfig(geometry_mode="traditional", extra_instances=n,
+                              trad_anim_mode="refit"))
 
     # --- 2. Orthogonal at default scene size (clusters, extra=0) ----------
     runs.append(RunConfig(vertex_format="compressed"))
@@ -418,6 +427,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     # =========================================================================
     scale_filter = dict(vertex_format="float", clas_alloc="compact",
                         build_flags="fast-trace", static_rebuild="none",
+                        trad_anim_mode="rebuild",
                         position_truncate_bits=None, compressed_bits=None,
                         aa_samples=None)
 
@@ -509,25 +519,49 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
         charts.append(c)
 
     # --- Per-frame animated BLAS-from-CLAS / animated trad BLAS rebuild ---
+    # THREE series for the fair-comparison story:
+    #   cluster              -- INSTANTIATE_CLUSTER_TEMPLATES + BUILD_BLAS_FROM_CLAS
+    #                           (the only animation pipeline cluster mode supports;
+    #                           templates always pre-built, BLAS always fresh-topology'd)
+    #   traditional (rebuild)-- DXR1 BuildRaytracingAccelerationStructure with
+    #                           PREFER_FAST_TRACE; fresh topology each frame.
+    #                           APPLES-TO-APPLES with cluster (both = fresh topology).
+    #   traditional (refit)  -- DXR1 build with PERFORM_UPDATE flag; reuses cached
+    #                           topology, ~4-10x cheaper, BUT quality drifts as
+    #                           the mesh deforms.  NO cluster equivalent (cluster
+    #                           always re-instantiates templates).  Included as
+    #                           'cheapest possible trad path' context, NOT
+    #                           apples-to-apples.
     c = Chart(
         title="Per-frame animated BLAS rebuild time vs scene size",
         category="Scaling",
-        description=("Cluster mode: BUILD_BLAS_FROM_CLAS time for the animated "
-                     "ball + clones.  Traditional mode: per-frame DXR1 BLAS "
-                     "rebuild for the animated objects.  Both modes use the "
-                     "same field (pf_blas_us); the meaning depends on the path. "
-                     "Lower is better."),
+        description=("GPU microseconds per frame spent rebuilding the animated "
+                     "objects' BLAS.  Three series for fair comparison:<br>"
+                     "&nbsp;<b>cluster</b> = BUILD_BLAS_FROM_CLAS over the "
+                     "INSTANTIATEd templates (the only animation path the cluster "
+                     "mode supports).<br>"
+                     "&nbsp;<b>traditional (rebuild)</b> = full DXR1 build with "
+                     "FAST_TRACE -- fresh topology each frame; APPLES-TO-APPLES "
+                     "with cluster.<br>"
+                     "&nbsp;<b>traditional (refit)</b> = DXR1 PERFORM_UPDATE; "
+                     "reuses cached topology, much cheaper but BVH quality drifts. "
+                     "No cluster equivalent -- shown for 'cheapest trad' context only."),
         chart_type="line", x_label=extra_x_label, y_label="Anim BLAS (µs)",
         x_scale="category", y_is_log=True,
     )
-    for mode in ("clusters", "traditional"):
+    for series_label, filt in [
+        ("cluster",               {**scale_filter, "geometry_mode": "clusters",    "trad_alloc": "compact", "trad_anim_mode": "rebuild"}),
+        ("traditional (rebuild)", {**scale_filter, "geometry_mode": "traditional", "trad_alloc": "compact", "trad_anim_mode": "rebuild"}),
+        ("traditional (refit)",   {**scale_filter, "geometry_mode": "traditional", "trad_alloc": "compact", "trad_anim_mode": "refit"}),
+    ]:
         pts = []
-        for r in match({**scale_filter, "geometry_mode": mode, "trad_alloc": "compact"}):
+        for r in match(filt):
             x = r.config.extra_instances
             y = _g(r.data, "frame_perf", "pf_blas_us", default=0)
             pts.append((x, y, fmt_us(y)))
         pts.sort()
-        c.series[mode] = pts
+        if pts:
+            c.series[series_label] = pts
     if any(c.series.values()):
         charts.append(c)
 
@@ -594,6 +628,7 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
     # =========================================================================
     base_default = dict(geometry_mode="clusters", clas_alloc="compact",
                         build_flags="fast-trace", static_rebuild="none",
+                        trad_anim_mode="rebuild",
                         extra_instances=0, position_truncate_bits=None,
                         compressed_bits=None, aa_samples=None, trad_alloc="compact")
 

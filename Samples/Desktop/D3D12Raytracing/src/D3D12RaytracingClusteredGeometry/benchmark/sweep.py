@@ -599,37 +599,64 @@ def build_charts(runs: list[RunResult]) -> list[Chart]:
 
     cm_runs = match({**base_default, "vertex_format": "float"})
     c1_runs = match({**base_default, "vertex_format": "compressed"})
-    if cm_runs and c1_runs:
+    if (cm_runs and c1_runs):
         cm = cm_runs[0]
         c1 = c1_runs[0]
-        # Split into THREE separate single-unit charts (was one chart with
-        # bytes + µs + FPS on the same y-axis -- unreadable, values spanned
-        # 5 orders of magnitude).
-        #
-        # Chart 1: bytes (multi-series OK, all same unit)
+        # Chart 1: AS storage bytes.  Show every component that SUMS to
+        # total_as -- previously the chart had CLAS / VB+IB / BLAS / Total
+        # but Total > sum because the chart was missing animated_pf_clas
+        # (template instances, 52% of total) + animated_blas + TLAS.
+        # Cluster VB+IB is INPUT data (vertex+index source the build reads
+        # from), NOT part of total_as -- pulled out into its own chart below.
         c = Chart(
-            title="Vertex format: storage bytes (default scene)",
+            title="Vertex format: AS storage components (default scene)",
             category="Vertex format",
-            description=("FLOAT32_3 vs COMPRESSED1 storage at the default scene.  "
-                         "All series in bytes (apples-to-apples).  CLAS = cluster "
-                         "leaf arrays (the BVH input).  Cluster VB+IB = source "
-                         "vertex + index buffer the cluster build reads from "
-                         "(analogous to traditional VB+IB).  BLAS = BLAS-from-CLAS "
-                         "output.  Total AS = sum of all AS-related buckets."),
+            description=("All five AS-storage buckets at the default scene.  "
+                         "The bars SUM to total acceleration-structure bytes "
+                         "(there's no hidden 'Total' bar -- read the bars).  "
+                         "Static CLAS is the BVH leaf arrays for the 8 static "
+                         "objects; static BLAS is the BLAS-from-CLAS output; "
+                         "template instances is the per-frame INSTANTIATEd "
+                         "animated-sphere CLAS; animated BLAS is its BLAS; "
+                         "TLAS is the top-level array."),
             chart_type="bar", x_label="Vertex format", y_label="Bytes",
         )
         for label, run in (("FLOAT32_3", cm), ("COMPRESSED1", c1)):
             pts = []
             for name, path in [
-                ("CLAS",                  "memory_bytes.static_clas_actual"),
-                ("Cluster VB+IB",         "memory_bytes.static_cluster_input"),
-                ("BLAS",                  "memory_bytes.static_blas_total"),
-                ("Total AS",              "memory_bytes.total_as"),
+                ("static CLAS",        "memory_bytes.static_clas_actual"),
+                ("static BLAS",        "memory_bytes.static_blas_total"),
+                ("template instances", "memory_bytes.animated_pf_clas_actual"),
+                ("animated BLAS",      "memory_bytes.animated_blas"),
+                ("TLAS",               "memory_bytes.tlas"),
             ]:
                 v = _g(run.data, *path.split("."), default=0)
                 pts.append((name, v, f"{label} {name}: {fmt_bytes(v)}"))
             c.series[label] = pts
         charts.append(c)
+
+        # Chart 1b: source vertex+index input bytes.  Not part of AS -- this
+        # is the source buffer the AS build reads vertex positions + indices
+        # from (analogous to traditional VB+IB but in cluster-major layout).
+        # COMPRESSED1 saves the most here -- the source already lives in the
+        # 16-bit/component quantized layout, so this chart shows the storage
+        # the input data needs at each format.
+        c = Chart(
+            title="Vertex format: source vertex+index buffer bytes (cluster path input)",
+            category="Vertex format",
+            description=("Source vertex+index buffer (m_clusterInputBuffer) the "
+                         "cluster CLAS build reads from.  This is INPUT data, NOT "
+                         "AS storage -- analogous to traditional VB+IB.  Plotted "
+                         "separately so the AS-components chart above sums cleanly "
+                         "to total_as.  COMPRESSED1 stores positions in the 16-bit "
+                         "quantized layout natively here, hence the dramatic save."),
+            chart_type="bar", x_label="Vertex format", y_label="Bytes",
+        )
+        for label, run in (("FLOAT32_3", cm), ("COMPRESSED1", c1)):
+            v = _g(run.data, "memory_bytes", "static_cluster_input", default=0)
+            c.series[label] = [("Cluster VB+IB", v, f"{label}: {fmt_bytes(v)}")]
+        charts.append(c)
+
         # Chart 2: per-frame INSTANTIATE time (µs).
         c = Chart(
             title="Vertex format: per-frame INSTANTIATE time (default scene)",

@@ -263,11 +263,29 @@ void D3D12RaytracingClusteredGeometry::CreateDeviceDependentResources()
     // RebuildStaticAccelerationStructures which the [N] key calls.  Do
     // the same one-shot here so headless / scripted runs honour the
     // CLI flag without needing a scheduled [N] press.
+    //
+    // The initial BuildAccelerationStructures captured GPU timestamps for
+    // m_clasBuildMs / m_blasBuildMs / m_tlasBuildMs / m_totalBuildMs --
+    // but that was the BASELINE 8-object build, not the with-clones build
+    // we're about to do.  Wall-clock time the rebuild and OVERWRITE
+    // m_totalBuildMs with the bigger number so the benchmark JSON reports
+    // a build time representative of what was actually built.  The
+    // per-pass breakdown (clas/blas/tlas) stays as the GPU-timestamp
+    // measurement of the initial build -- those would need timestamp
+    // queries in RebuildStaticAccelerationStructures to be accurate at
+    // scale, and the headline metric users care about is total time.
     if (m_extraInstancesMode != ExtraInstancesMode::None)
     {
         SampleLog::LogF(L">>> applying --extra-instances %ls (one-shot rebuild)\n",
                         ExtraInstancesModeName());
+        auto t0 = std::chrono::steady_clock::now();
         RebuildStaticAccelerationStructures(L"--extra-instances startup");
+        auto t1 = std::chrono::steady_clock::now();
+        const double rebuildMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        SampleLog::LogF(L"  rebuild wall-clock: %.1f ms (was %.1f ms for baseline; "
+                        L"using rebuild as build_times_ms.total)\n",
+                        rebuildMs, m_totalBuildMs);
+        m_totalBuildMs = rebuildMs;
     }
 }
 

@@ -476,6 +476,9 @@ def render_html(machines: list[MachineReport], defs: list[ChartDef]) -> str:
                     },
                     "y": {
                         "type": "logarithmic" if cdef.y_is_log else "linear",
+                        # beginAtZero on LINEAR -- non-zero baselines exaggerate
+                        # small cross-machine differences.  Log axes can't.
+                        "beginAtZero": True if not cdef.y_is_log else None,
                         "title": {"display": True, "text": cdef.y_label, "color": "#9da7b3"},
                         "ticks": {"color": "#9da7b3"},
                         "grid": {"color": "#22272e"},

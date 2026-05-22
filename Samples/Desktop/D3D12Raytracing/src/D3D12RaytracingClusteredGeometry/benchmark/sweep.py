@@ -1101,6 +1101,13 @@ def render_html(charts: list[Chart], runs: list[RunResult], adapter_info: dict,
                     },
                     "y": {
                         "type": "logarithmic" if c.y_is_log else "linear",
+                        # beginAtZero on LINEAR charts -- a non-zero baseline
+                        # exaggerates small differences (45.5 -> 47.0 fps would
+                        # look like a 100% gain) so always anchor at 0.  Log
+                        # charts can't start at 0 (log(0) = -inf) so they keep
+                        # the default auto-min behaviour; their visual cue is
+                        # already 'powers of 10', not 'distance from baseline'.
+                        "beginAtZero": True if not c.y_is_log else None,
                         "title": {"display": True, "text": c.y_label, "color": "#9da7b3"},
                         "ticks": {"color": "#9da7b3"},
                         "grid": {"color": "#22272e"},

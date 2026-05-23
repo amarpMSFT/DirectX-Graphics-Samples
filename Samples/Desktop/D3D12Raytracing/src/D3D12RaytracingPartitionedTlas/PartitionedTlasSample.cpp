@@ -111,6 +111,23 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
             m_partitionBudget = (uint32_t)std::max(1, n);
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--resize-at") == 0 && i + 1 < argc)
+        {
+            // --resize-at FRAME:NEW_BUDGET  (e.g. --resize-at 60:16 --resize-at 120:128)
+            UINT64 frame  = 0;
+            uint32_t newP = 0;
+            wchar_t* endptr = nullptr;
+            frame = wcstoull(argv[i+1], &endptr, 10);
+            if (endptr && *endptr == L':')
+            {
+                newP = (uint32_t)wcstoul(endptr + 1, nullptr, 10);
+            }
+            if (newP > 0)
+            {
+                m_scheduledResizes.push_back({ frame, newP });
+            }
+            i += 1;
+        }
     }
     SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s camera=%s grid=%ux%ux%u "
                     L"ballsPerSide=%u screenshotFrame=%d exitAfterFrames=%u "
@@ -626,6 +643,7 @@ void PartitionedTlasSample::OnRender()
 
 void PartitionedTlasSample::DoRender()
 {
+    ApplyResizeIfPending();      // phase 3c: hotkey/scheduled PTLAS resize
     RecomputeAsOrigin();        // updates m_asOrigin BEFORE UpdateSceneConstantBuffer reads it
     UpdateSceneConstantBuffer();
 
@@ -883,6 +901,109 @@ void PartitionedTlasSample::OnSizeChanged(UINT width, UINT height, bool minimize
     if (!m_deviceResources->WindowSizeChanged(width, height, minimized)) return;
     UpdateForSizeChange(width, height);
     CreateWindowSizeDependentResources();
+}
+
+// =============================================================================
+// Hotkeys + PTLAS resize (phase 3c)
+// =============================================================================
+//
+// [  /  ]  : cycle partition budget through a power-of-2 ladder.  Each
+//            change schedules a PTLAS tear-down + recreate at the start
+//            of the next frame -- the EXPENSIVE update path per spec.
+//            (A true SourceAS-based incremental resize is a later
+//            milestone; this version recreates from scratch so the spike
+//            is unmistakable.)
+// SPACE    : pause/resume the flock motion (TODO -- placeholder).
+//
+void PartitionedTlasSample::OnKeyDown(UINT8 key)
+{
+    static const uint32_t kBudgetLadder[] = { 8, 16, 32, 64, 128, 216 };
+    static const int kBudgetCount = (int)(sizeof(kBudgetLadder) / sizeof(kBudgetLadder[0]));
+    auto findCurrentIdx = [&]() -> int {
+        for (int i = 0; i < kBudgetCount; ++i)
+            if (kBudgetLadder[i] >= m_partitionBudget) return i;
+        return kBudgetCount - 1;
+    };
+    if (key == VK_OEM_4)   // [
+    {
+        int i = findCurrentIdx();
+        if (i > 0)
+        {
+            m_pendingBudget = kBudgetLadder[i - 1];
+            SampleLog::LogF(L"[hotkey] '[' -> queue PTLAS resize to %u partitions (was %u)\n",
+                            m_pendingBudget, m_partitionBudget);
+        }
+    }
+    else if (key == VK_OEM_6)   // ]
+    {
+        int i = findCurrentIdx();
+        if (m_partitionBudget < kBudgetLadder[i]) i--;  // bump up if not on a ladder rung
+        if (i + 1 < kBudgetCount)
+        {
+            m_pendingBudget = kBudgetLadder[i + 1];
+            SampleLog::LogF(L"[hotkey] ']' -> queue PTLAS resize to %u partitions (was %u)\n",
+                            m_pendingBudget, m_partitionBudget);
+        }
+    }
+}
+
+void PartitionedTlasSample::ApplyResizeIfPending()
+{
+    // (1) Check scheduled resizes (--resize-at).
+    for (size_t i = 0; i < m_scheduledResizes.size(); )
+    {
+        if (m_scheduledResizes[i].frame == m_framesRendered)
+        {
+            m_pendingBudget = m_scheduledResizes[i].newBudget;
+            SampleLog::LogF(L"[scheduled resize at frame %llu] -> %u partitions "
+                            L"(was %u)\n",
+                            (unsigned long long)m_framesRendered, m_pendingBudget,
+                            m_partitionBudget);
+            m_scheduledResizes.erase(m_scheduledResizes.begin() + i);
+        }
+        else
+        {
+            ++i;
+        }
+    }
+    if (m_pendingBudget == 0 || m_pendingBudget == m_partitionBudget)
+    {
+        m_pendingBudget = 0;
+        return;
+    }
+
+    // (2) Tear-down + recreate.  The OLD PtlasSystem owns the OLD PTLAS
+    // resource; releasing it via reset() reclaims its memory once the GPU
+    // is done.  Wait for GPU to drain in-flight frames first so the
+    // resources can be safely freed.
+    m_deviceResources->WaitForGpu();
+    SampleLog::LogF(L"[ptlas-resize] applying: budget %u -> %u  "
+                    L"(tear-down + recreate; spec's expensive path)\n",
+                    m_partitionBudget, m_pendingBudget);
+    m_partitionBudget = m_pendingBudget;
+    m_pendingBudget   = 0;
+
+    // Recreate RollingPartitions with new budget; this resets ownership
+    // so the next Update sees all balls as "changed" and the next Build
+    // does a full WRITE_INSTANCE pass.
+    m_rollingParts.Initialize(m_partitionBudget, /*forwardBias*/ 0.30f,
+                              m_scene, m_ballWorldPos);
+
+    // Recreate the TLAS system (PTLAS or Traditional -- both are valid).
+    ITlasSystem::InitDesc tlasInit = {};
+    tlasInit.maxInstances                  = m_scene.TotalBalls();
+    tlasInit.maxPartitions                 = m_partitionBudget;
+    tlasInit.maxInstancesPerPartition      = std::max(1u, 2 * m_scene.BallsPerPartition());
+    tlasInit.maxInstancesInGlobalPartition = 0;
+    m_tlas.reset();
+    if (m_tlasMode == TlasMode::Partitioned)
+        m_tlas = std::make_unique<PtlasSystem>();
+    else
+        m_tlas = std::make_unique<TraditionalTlasSystem>();
+    m_tlas->Initialize(m_dxrDevice.Get(), m_deviceResources.get(), tlasInit);
+    m_ptlasInitialWriteDone = false;
+    m_cumBallChanges = 0;
+    m_cumBallChangesLastLog = 0;
 }
 
 void PartitionedTlasSample::OnDestroy()

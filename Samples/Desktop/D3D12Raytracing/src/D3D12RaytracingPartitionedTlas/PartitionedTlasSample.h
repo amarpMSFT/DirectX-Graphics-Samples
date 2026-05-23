@@ -47,6 +47,7 @@ public:
     virtual void OnRender() override;
     virtual void OnSizeChanged(UINT width, UINT height, bool minimized) override;
     virtual void OnDestroy() override;
+    virtual void OnKeyDown(UINT8 key) override;
     virtual IDXGISwapChain* GetSwapchain() override { return m_deviceResources->GetSwapChain(); }
     virtual void ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc) override;
 
@@ -101,10 +102,17 @@ private:
 
     // ---- Rolling-partition manager (phase 3b+).  Budget is set via
     // --partitions; defaults to a smaller value than the cell count so
-    // recycling is visible.  Phase 3c will turn the budget into a runtime
-    // knob that triggers PTLAS resize. ----
+    // recycling is visible.  Phase 3c turns the budget into a runtime
+    // knob (hotkeys [ / ]) that triggers a full PTLAS tear-down + rebuild
+    // -- the more expensive of the two PTLAS update paths per spec. ----
     RollingPartitions m_rollingParts;
     uint32_t          m_partitionBudget = 64;
+    uint32_t          m_pendingBudget   = 0;   // 0 = no pending resize
+    // Phase 3c headless: --resize-at FRAME:N triggers a resize to N at
+    // frame FRAME.  Multiple --resize-at flags queue multiple resizes.
+    struct ScheduledResize { UINT64 frame; uint32_t newBudget; };
+    std::vector<ScheduledResize> m_scheduledResizes;
+    void ApplyResizeIfPending();
 
     // ---- RT pipeline + shader table + bindings ----
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;

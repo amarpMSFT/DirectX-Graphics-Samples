@@ -17,6 +17,7 @@
 #include "BallAssets.h"
 #include "SceneLayout.h"
 #include "FlockMotion.h"
+#include "RollingPartitions.h"
 
 #include <string>
 #include <memory>
@@ -59,6 +60,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12CommandListRaytracing2> m_dxr2CommandList;
     bool   m_clustersAndPtlasSupported = false;
     UINT64 m_framesRendered            = 0;
+    UINT64 m_cumBallChanges            = 0;   // accumulates since startup
+    UINT64 m_cumBallChangesLastLog     = 0;   // value at previous log frame
     StepTimer m_timer;
     std::chrono::steady_clock::time_point m_startTime;
 
@@ -81,7 +84,7 @@ private:
     // of balls; balls are equally spaced across the whole lattice). ----
     SceneLayout m_scene;
     std::vector<SceneInstance>      m_sceneInstances;          // world-space (built once)
-    std::vector<DirectX::XMFLOAT3>  m_partitionHomes;          // world-space per partition
+    std::vector<DirectX::XMFLOAT3>  m_ballWorldPos;            // ball positions only (fed to RollingPartitions)
     bool                            m_ptlasInitialWriteDone = false;
     DirectX::XMFLOAT3               m_asOrigin = { 0, 0, 0 };  // current frame's AS-space origin
     void BuildSceneInstances();
@@ -95,6 +98,13 @@ private:
     enum class CameraMode { Orbit, FlockFollow };
     CameraMode  m_cameraMode = CameraMode::FlockFollow;
     FlockMotion m_flock;
+
+    // ---- Rolling-partition manager (phase 3b+).  Budget is set via
+    // --partitions; defaults to a smaller value than the cell count so
+    // recycling is visible.  Phase 3c will turn the budget into a runtime
+    // knob that triggers PTLAS resize. ----
+    RollingPartitions m_rollingParts;
+    uint32_t          m_partitionBudget = 64;
 
     // ---- RT pipeline + shader table + bindings ----
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;

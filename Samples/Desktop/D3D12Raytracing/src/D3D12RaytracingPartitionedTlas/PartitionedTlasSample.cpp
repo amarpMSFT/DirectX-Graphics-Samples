@@ -105,6 +105,12 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
                      _wcsicmp(argv[i+1], L"flock")        == 0) m_cameraMode = CameraMode::FlockFollow;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--partitions") == 0 && i + 1 < argc)
+        {
+            int n = _wtoi(argv[i + 1]);
+            m_partitionBudget = (uint32_t)std::max(1, n);
+            i += 1;
+        }
     }
     SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s camera=%s grid=%ux%ux%u "
                     L"ballsPerSide=%u screenshotFrame=%d exitAfterFrames=%u "
@@ -249,17 +255,27 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // is the linear index of the partition cell containing the ball.
     BuildSceneInstances();
     SampleLog::LogF(L"[scene] grid=%ux%ux%u  ballsPerSide=%u  total balls=%u "
-                    L"partitions=%u  perPartMax=%u\n",
+                    L"cells=%u  partitionBudget=%u\n",
                     m_scene.gridX, m_scene.gridY, m_scene.gridZ,
                     m_scene.ballsPerSide, m_scene.TotalBalls(),
-                    m_scene.Partitions(), m_scene.BallsPerPartition());
+                    m_scene.Partitions(), m_partitionBudget);
 
-    // Pick the active TLAS system, sized for the scene.
+    // Set up the rolling-partition manager.  Cell count = grid cell count;
+    // partition budget = PTLAS PartitionCount.  Budget < cells means active
+    // recycling each frame; budget >= cells means every cell always has a
+    // partition (effectively phase 2c behaviour).
+    m_rollingParts.Initialize(m_partitionBudget, /*forwardBias*/ 0.30f,
+                              m_scene, m_ballWorldPos);
+
+    // Pick the active TLAS system, sized for the partition budget.
     ITlasSystem::InitDesc tlasInit = {};
     tlasInit.maxInstances                  = m_scene.TotalBalls();
-    tlasInit.maxPartitions                 = m_scene.Partitions();
-    tlasInit.maxInstancesPerPartition      = m_scene.BallsPerPartition();
-    tlasInit.maxInstancesInGlobalPartition = 0;     // reserved for the flock in phase 3
+    tlasInit.maxPartitions                 = m_partitionBudget;
+    // Worst case: a single partition gets MAX possible balls.  With cells
+    // assigned 1:1, the max is one cell's worth (ballsPerSide^3).  Bump
+    // the cap slightly so per-partition imbalance has headroom.
+    tlasInit.maxInstancesPerPartition      = std::max(1u, 2 * m_scene.BallsPerPartition());
+    tlasInit.maxInstancesInGlobalPartition = 0;     // reserved for the flock in phase 4
     if (m_tlasMode == TlasMode::Partitioned)
         m_tlas = std::make_unique<PtlasSystem>();
     else
@@ -458,40 +474,29 @@ void PartitionedTlasSample::CreateShaderTable()
 }
 
 // =============================================================================
-// Scene instances (milestone 2c: world-space + partition-home table)
+// Scene instances (milestone 3b: precompute world transforms + ball positions;
+// per-frame partition assignment lives in RollingPartitions)
 // =============================================================================
 void PartitionedTlasSample::BuildSceneInstances()
 {
     using namespace DirectX;
     m_sceneInstances.clear();
     m_sceneInstances.reserve(m_scene.TotalBalls());
-    m_partitionHomes.clear();
-    m_partitionHomes.reserve(m_scene.Partitions());
-
-    // Partition home table (world-space center of each partition cell).
-    for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
-    for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
-    for (uint32_t pi = 0; pi < m_scene.gridX; ++pi)
-    {
-        m_partitionHomes.push_back(m_scene.PartitionHomeWorld(pi, pj, pk));
-    }
+    m_ballWorldPos.clear();
+    m_ballWorldPos.reserve(m_scene.TotalBalls());
 
     const D3D12_GPU_VIRTUAL_ADDRESS blas = m_ball.BlasGpuVa();
     for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
     for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
     for (uint32_t pi = 0; pi < m_scene.gridX; ++pi)
     {
-        const uint32_t partIdx = m_scene.PartitionIndex(pi, pj, pk);
         for (uint32_t bk = 0; bk < m_scene.ballsPerSide; ++bk)
         for (uint32_t bj = 0; bj < m_scene.ballsPerSide; ++bj)
         for (uint32_t bi = 0; bi < m_scene.ballsPerSide; ++bi)
         {
             DirectX::XMFLOAT3 pos = m_scene.BallWorldPos(pi, pj, pk, bi, bj, bk);
-            // World-space Scale * Translate, then transposed for DXR's
-            // column-vector 3x4 instance-transform convention.  Per-frame
-            // adjustments (subtracting as_origin for Traditional, subtracting
-            // partition_home for Partitioned-local) happen in DoRender by
-            // tweaking m[0..2][3] before the TLAS-system call.
+            m_ballWorldPos.push_back(pos);
+
             XMMATRIX m = XMMatrixScaling(m_scene.ballScale, m_scene.ballScale, m_scene.ballScale)
                        * XMMatrixTranslation(pos.x, pos.y, pos.z);
             SceneInstance inst = {};
@@ -499,7 +504,7 @@ void PartitionedTlasSample::BuildSceneInstances()
             inst.blasGva        = blas;
             inst.instanceID     = m_scene.BallIndex(pi, pj, pk, bi, bj, bk);
             inst.instanceMask   = 0xFF;
-            inst.partitionIndex = partIdx;
+            inst.partitionIndex = 0;   // set per-frame by RollingPartitions
             m_sceneInstances.push_back(inst);
         }
     }
@@ -630,20 +635,23 @@ void PartitionedTlasSample::DoRender()
 
     // ---- (P)TLAS build for this frame ----
     //
-    // Both modes must produce hits in the same AS-space coord frame so the
-    // shader output is bit-for-bit identical:
-    //   * Partitioned (PTLAS):
-    //       - WRITE_INSTANCE once at init with PARTITION-LOCAL transforms
-    //         (instance translation = ball_world - partition_home).
-    //       - TRANSLATE_PARTITION every frame: translation[p] = home[p] - as_origin.
-    //       - Per-frame work: ~partitionCount partition translations.  The
-    //         partition-local instance writes never repeat.
-    //   * Traditional (DXR1 TLAS):
-    //       - No partition concept, so we have to bake (world - as_origin)
-    //         into every instance transform and re-write all of them each
-    //         frame.  This is exactly the cost PTLAS sidesteps -- 5832
-    //         instance writes vs 216 partition translations in this scene.
+    // Phase 3b switched from "fixed grid of partitions" to ROLLING WINDOW:
+    //   * m_rollingParts picks the P cells closest to the flock as the
+    //     active set; partition slot indices recycle as cells enter/leave.
+    //   * Each ball reports its current owner partition (or kNoPartition if
+    //     its cell isn't in the active set this frame).
+    //   * Per-frame: WRITE_INSTANCE for balls whose owner changed
+    //     (transfer or transition between active/disabled), and
+    //     TRANSLATE_PARTITION for ALL active partitions (their world-space
+    //     centroids are fixed but the AS-space offset = home - as_origin
+    //     changes every frame as the camera moves).
+    //   * Traditional baseline: just rebuilds the flat instance list with
+    //     translation = world - as_origin every frame, disabling balls
+    //     whose owner is kNoPartition (AccelerationStructure = 0).
     using namespace DirectX;
+
+    m_rollingParts.Update(m_flock.position, m_flock.forward);
+    m_cumBallChanges += (UINT64)m_rollingParts.ChangedBalls().size();
 
     m_tlas->BeginFrame();
     // Timestamp BEFORE TLAS build.
@@ -653,45 +661,101 @@ void PartitionedTlasSample::DoRender()
 
     if (m_tlasMode == TlasMode::Partitioned)
     {
+        // (a) WRITE_INSTANCE for changed ball owners.  On the very first
+        //     frame ALL balls "change" (from uninitialised) -- the first
+        //     pass writes the full set; subsequent frames write only the
+        //     subset that crossed an active/inactive boundary or moved
+        //     between partition slots.
+        std::vector<SceneInstance> writes;
+        const auto& changed = m_ptlasInitialWriteDone
+                              ? m_rollingParts.ChangedBalls()
+                              : std::vector<uint32_t>();   // sentinel; we iterate ALL below
+        const uint32_t fullCount = m_rollingParts.BallCount();
+        const uint32_t writeIterCount = m_ptlasInitialWriteDone ? (uint32_t)changed.size() : fullCount;
+        writes.reserve(writeIterCount);
+
+        for (uint32_t i = 0; i < writeIterCount; ++i)
+        {
+            const uint32_t b = m_ptlasInitialWriteDone ? changed[i] : i;
+            const uint32_t owner = m_rollingParts.Owner(b);
+            SceneInstance inst = m_sceneInstances[b];
+            inst.instanceID = b;
+            if (owner == RollingPartitions::kNoPartition)
+            {
+                // Disabled: make the instance DEGENERATE (transform with
+                // first-3-elements-of-each-row zero) so per spec it is
+                // EXCLUDED ENTIRELY from the PTLAS -- doesn't count toward
+                // any partition's instance cap, doesn't get traced.  Just
+                // setting AccelerationStructure=0 is "disabled but still in
+                // partition" which can exceed MaxInstancePerPartitionCount
+                // and TDRs the driver if many instances pile into the same
+                // fallback slot.
+                inst.blasGva        = 0;
+                inst.partitionIndex = 0;
+                memset(&inst.transform, 0, sizeof(inst.transform));
+            }
+            else
+            {
+                // Active: partition-local transform = ball_world - home.
+                const auto& home = m_rollingParts.PartitionHome(owner);
+                inst.partitionIndex = owner;
+                inst.transform.m[0][3] -= home.x;
+                inst.transform.m[1][3] -= home.y;
+                inst.transform.m[2][3] -= home.z;
+            }
+            writes.push_back(inst);
+        }
+        if (!writes.empty())
+        {
+            m_tlas->WriteInstances(writes.data(), (UINT)writes.size());
+        }
         if (!m_ptlasInitialWriteDone)
         {
-            // One-shot: write all instances with partition-local transforms.
-            std::vector<SceneInstance> local(m_sceneInstances.size());
-            for (size_t i = 0; i < m_sceneInstances.size(); ++i)
-            {
-                local[i] = m_sceneInstances[i];
-                const XMFLOAT3& home = m_partitionHomes[local[i].partitionIndex];
-                // SceneInstance.transform is transposed (DXR 3x4 layout):
-                // translation lives at m[0][3], m[1][3], m[2][3].
-                local[i].transform.m[0][3] -= home.x;
-                local[i].transform.m[1][3] -= home.y;
-                local[i].transform.m[2][3] -= home.z;
-            }
-            m_tlas->WriteInstances(local.data(), (UINT)local.size());
             m_ptlasInitialWriteDone = true;
-            SampleLog::LogF(L"[ptlas] initial WRITE_INSTANCE pass: %u instances (partition-local transforms)\n",
-                            (unsigned)local.size());
+            SampleLog::LogF(L"[ptlas] initial WRITE_INSTANCE pass: %u instances "
+                            L"(partition budget = %u)\n",
+                            (unsigned)writes.size(), m_partitionBudget);
         }
 
-        // Per-frame: TRANSLATE_PARTITION for every partition.
-        std::vector<ITlasSystem::PartitionTranslate> pts(m_partitionHomes.size());
-        for (size_t p = 0; p < m_partitionHomes.size(); ++p)
+        // (b) TRANSLATE_PARTITION for every active partition every frame.
+        //     home - as_origin keeps AS-space coords near zero where the
+        //     rays start.
+        std::vector<ITlasSystem::PartitionTranslate> pts;
+        pts.reserve(m_partitionBudget);
+        for (uint32_t p = 0; p < m_rollingParts.PartitionCount(); ++p)
         {
-            pts[p].partitionIndex = (UINT)p;
-            pts[p].translation[0] = m_partitionHomes[p].x - m_asOrigin.x;
-            pts[p].translation[1] = m_partitionHomes[p].y - m_asOrigin.y;
-            pts[p].translation[2] = m_partitionHomes[p].z - m_asOrigin.z;
+            if (!m_rollingParts.PartitionActive(p)) continue;
+            const auto& home = m_rollingParts.PartitionHome(p);
+            ITlasSystem::PartitionTranslate t = {};
+            t.partitionIndex = p;
+            t.translation[0] = home.x - m_asOrigin.x;
+            t.translation[1] = home.y - m_asOrigin.y;
+            t.translation[2] = home.z - m_asOrigin.z;
+            pts.push_back(t);
         }
-        m_tlas->TranslatePartitions(pts.data(), (UINT)pts.size());
+        if (!pts.empty())
+        {
+            m_tlas->TranslatePartitions(pts.data(), (UINT)pts.size());
+        }
     }
     else
     {
         // Traditional: rebuild instance descs with translation baked
-        // (world - as_origin) so we trace in the same AS-space frame.
+        // (world - as_origin), DISABLING balls outside the active set
+        // (AS = 0).  No partition concept, so the rolling-window cost
+        // shows up as a full-instance-list rewrite every frame.
         std::vector<SceneInstance> adj(m_sceneInstances.size());
         for (size_t i = 0; i < m_sceneInstances.size(); ++i)
         {
             adj[i] = m_sceneInstances[i];
+            const uint32_t owner = m_rollingParts.Owner((uint32_t)i);
+            if (owner == RollingPartitions::kNoPartition)
+            {
+                // Disable: AccelerationStructure = 0 in the
+                // D3D12_RAYTRACING_INSTANCE_DESC; TraditionalTlasSystem
+                // writes 0 through to the desc and the ray misses.
+                adj[i].blasGva = 0;
+            }
             adj[i].transform.m[0][3] -= m_asOrigin.x;
             adj[i].transform.m[1][3] -= m_asOrigin.y;
             adj[i].transform.m[2][3] -= m_asOrigin.z;
@@ -736,16 +800,21 @@ void PartitionedTlasSample::DoRender()
     if (m_logStatsEvery > 0 && (m_framesRendered % m_logStatsEvery) == 0)
     {
         auto fs = m_tlas->GetLastFrameStats();
-        SampleLog::LogF(L"[frame %llu] tlas=%s instances=%u part_translates=%u "
-                        L"result=%llu scratch=%llu  build_ms=%.3f (raw %.3f)  "
-                        L"as_origin=(%.2f, %.2f, %.2f)\n",
+        const uint64_t deltaWrites = m_cumBallChanges - m_cumBallChangesLastLog;
+        m_cumBallChangesLastLog = m_cumBallChanges;
+        SampleLog::LogF(L"[frame %llu] tlas=%s budget=%u "
+                        L"writes_since_last_log=%llu cum_writes=%llu part_trans=%u "
+                        L"build_ms=%.3f (raw %.3f)  flock=(%.2f, %.2f, %.2f)  "
+                        L"fwd=(%.2f, %.2f, %.2f)\n",
                         (unsigned long long)m_framesRendered,
                         m_tlas->ModeName(),
-                        fs.instancesSubmitted, fs.partitionsTouched,
-                        (unsigned long long)fs.resultBytes,
-                        (unsigned long long)fs.scratchBytes,
+                        m_partitionBudget,
+                        (unsigned long long)deltaWrites,
+                        (unsigned long long)m_cumBallChanges,
+                        fs.partitionsTouched,
                         m_tlasBuildMsEma, m_tlasBuildMsLast,
-                        m_asOrigin.x, m_asOrigin.y, m_asOrigin.z);
+                        m_flock.position.x, m_flock.position.y, m_flock.position.z,
+                        m_flock.forward.x, m_flock.forward.y, m_flock.forward.z);
     }
 
     // ---- Bind RT pipeline + descriptors ----

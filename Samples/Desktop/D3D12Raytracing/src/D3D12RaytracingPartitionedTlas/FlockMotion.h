@@ -26,11 +26,13 @@ struct FlockMotion
 {
     // Path shape.  pathRadius scales the orbit envelope; freq* control how
     // each axis sweeps.  Pick irrational ratios so the curve doesn't
-    // visibly repeat.
+    // visibly repeat.  Defaults are tuned so cell crossings (and PTLAS
+    // partition recycling) are visible within a few seconds while still
+    // feeling like a gradually-arcing flight.
     float pathRadius   = 5.5f;       // wraps within the ball lattice
-    float freqX        = 0.085f;     // rad/s
-    float freqY        = 0.043f;
-    float freqZ        = 0.061f;
+    float freqX        = 0.20f;      // rad/s
+    float freqY        = 0.10f;
+    float freqZ        = 0.14f;
     float phaseY       = 1.3f;
     float phaseZ       = 0.4f;
     float vertScale    = 0.55f;      // y motion is gentler than xz

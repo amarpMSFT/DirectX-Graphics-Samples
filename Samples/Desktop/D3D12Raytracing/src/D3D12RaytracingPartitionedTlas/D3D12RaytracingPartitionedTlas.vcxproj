@@ -131,6 +131,7 @@
     <ClInclude Include="BallAssets.h" />
     <ClInclude Include="SceneLayout.h" />
     <ClInclude Include="FlockMotion.h" />
+    <ClInclude Include="RollingPartitions.h" />
     <ClInclude Include="ITlasSystem.h" />
     <ClInclude Include="TraditionalTlasSystem.h" />
     <ClInclude Include="PtlasSystem.h" />

@@ -128,7 +128,6 @@
     <ClInclude Include="PartitionedTlasSample.h" />
     <ClInclude Include="ProceduralGeometry.h" />
     <ClInclude Include="GpuBuffer.h" />
-    <ClInclude Include="BallAssets.h" />
     <ClInclude Include="MeshAssets.h" />
     <ClInclude Include="SceneLayout.h" />
     <ClInclude Include="FlockMotion.h" />

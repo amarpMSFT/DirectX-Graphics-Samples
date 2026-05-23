@@ -38,7 +38,11 @@ if log.exists():
 
 # Run.  --screenshot N path renders N frames, captures, then exits when
 # --exit-after-frames also says so (we pass both so the exit is deterministic).
-r = subprocess.run([exe, "--screenshot", "5", shot, "--exit-after-frames", "8"],
+# Pass --tlas-mode via env override of argv tail.
+import os
+mode = os.environ.get("TLAS_MODE", "partitioned")
+r = subprocess.run([exe, "--screenshot", "5", shot, "--exit-after-frames", "8",
+                    "--tlas-mode", mode],
                    capture_output=True, text=True, timeout=30,
                    cwd=str(pathlib.Path(exe).parent))
 print(f"\nRUN rc={r.returncode}")

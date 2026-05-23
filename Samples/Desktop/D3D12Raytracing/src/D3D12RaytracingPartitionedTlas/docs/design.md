@@ -248,3 +248,110 @@ don't see each other's slot internals.
   scene is moving.
 - Materials/shading: start with normal-derived color so visual debugging works
   without much shading code. PBR/reflections later if useful.
+
+## TLAS comparison toggle (Vanilla vs Partitioned)
+
+Per user request: support a runtime/CLI toggle that switches the entire
+scene's top-level acceleration structure from PTLAS to a **traditional DXR1
+TLAS** built each frame via `BuildRaytracingAccelerationStructure()`. The
+scene, BLAS set, materials, and shaders all stay the same — only the
+top-level structure swaps.
+
+- `--tlas-mode partitioned|traditional` CLI flag (initial value).
+- `[M]` runtime hotkey to cycle modes; triggers a clean tear-down + rebuild
+  of the active top-level structure (the OTHER mode's resources are released
+  to keep memory honest in comparison).
+- The shader's `g_tlas : register(t0)` slot binding is unchanged across
+  modes; the SRV just points at whichever top-level structure is active.
+- A `TlasSystem` interface wraps both:
+  ```cpp
+  class ITlasSystem {
+  public:
+      virtual void Initialize(...)             = 0;
+      virtual void BeginFrame(...)             = 0;
+      virtual void UpdateInstances(...)        = 0;  // per-frame instance changes
+      virtual void Build(cmdList)              = 0;
+      virtual D3D12_GPU_VIRTUAL_ADDRESS Gva()  const = 0;
+      virtual const wchar_t* ModeName()        const = 0;  // for overlay
+  };
+  ```
+  `PtlasSystem` and `TraditionalTlasSystem` both implement this. The sample
+  holds a `std::unique_ptr<ITlasSystem>` that swaps on mode-toggle.
+
+Why this matters: it lets the same demo answer the "why PTLAS?" question
+visually — the user can see build-time and instance-update behavior side-by-
+side. Also acts as a sanity check on my BLAS setup (the per-frame
+traditional TLAS rebuild stresses the BLAS GVAs the same way PTLAS will, so
+if one path works the other should too).
+
+## Instrumentation
+
+Borrowing the clustered-geometry sample's design wholesale, because the
+patterns are already field-proven for these workloads.
+
+GPU timestamps (via `ID3D12QueryHeap`/`D3D12_QUERY_TYPE_TIMESTAMP`),
+captured around named "passes":
+
+- `clas_build`           (when cluster path active)
+- `cluster_template_inst` (per-frame animated balls + flock)
+- `blas_from_clas`       (per-frame for animated)
+- `tlas_build`           (traditional path)
+- `ptlas_build`          (partitioned path)
+- `ptlas_write_args_cs`  (per-frame WRITE_INSTANCE arg-fill CS)
+- `ptlas_update_args_cs` (per-frame UPDATE_INSTANCE arg-fill CS)
+- `ptlas_translate_args_cs` (per-frame TRANSLATE_PARTITION arg-fill CS)
+- `dispatch_rays`
+
+EMA-smoothed `m_pf*Ms` doubles for the overlay; raw last-frame values for
+`--log-raw-every`. CPU wall-clock side-by-side via `std::chrono::steady_clock`
+for the frame-time / FPS overlay line.
+
+CPU-side counts logged per frame (or per mode-change):
+- partition counts: total, balls displaced this frame, balls transferred this
+  frame across partition boundaries, flock instance count
+- LOD distribution: count per LOD level
+- AS-mode active (`partitioned` / `traditional`)
+- PTLAS sizing: `InstanceCount`, `PartitionCount`, `MaxInstancePerPartitionCount`,
+  `MaxInstanceInGlobalPartitionCount`, result size, scratch size
+- BLAS pool occupancy: bytes used vs allocated
+
+CLI / scheduled-action surface (mirrors clustered sample):
+- `--log-pf-every N`           dump EMA per-frame stats every N frames
+- `--log-raw-every N`          dump raw last-frame timings every N frames
+- `--bench-seconds N`          run for N seconds, then write `--bench-out` and exit
+- `--bench-out PATH.json`      JSON dump (one record per measurement)
+- `--at FRAME:ACTION`          scheduled-action queue (one fires once at FRAME)
+  - `tlas-partitioned`, `tlas-traditional` — switch AS mode
+  - `lod-static`, `lod-camera`               — freeze LOD vs camera-distance
+  - `flock-pause`, `flock-resume`            — freeze the flock motion
+  - `log`                                    — emit a snapshot line
+  - `exit`                                   — clean quit
+- `--exit-after-frames N`      already wired in milestone 1
+
+On-screen overlay (when DirectXTK12 is added back in, milestone 4+):
+- FPS / ms-per-frame
+- AS mode + scene size knobs
+- Per-pass timings table
+- Partition activity meter (transfers/frame, displaced/frame)
+- Memory totals
+- Active hotkey hints
+
+Keyboard hotkeys (interactive runs):
+- `[P]` pause animation
+- `[M]` cycle TLAS mode (partitioned / traditional)
+- `[C]` free-cam vs flock-follow camera
+- `[L]` LOD viz overlay
+- `[B]` partition-color viz overlay
+- `[T]` cycle TRANSLATE_PARTITION demo: off / per-frame-track-camera /
+        snap-on-grid-step
+- `,` / `.` adjust scene density (balls per region)
+- `[` / `]` adjust partition grid dimensions
+
+Phase wisely: not all of this in milestone 2a. The instrumentation belt
+fleshes out as features land. What ships per milestone:
+- 2a: SampleLog wiring of every state change + a per-frame timing
+  scaffold; bench/sweep CLI flags reserved (no-op if unsupported).
+- 2b: GPU timestamp pipeline for the few passes that exist
+  (`tlas_build`/`ptlas_build`, `dispatch_rays`). TLAS toggle wired.
+- 3+: per-pass timings as each pass lands; scheduled actions; bench mode;
+  overlay.

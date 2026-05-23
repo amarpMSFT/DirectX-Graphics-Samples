@@ -13,28 +13,27 @@
 
 #include "DXSample.h"
 #include "StepTimer.h"
+#include "ITlasSystem.h"
+#include "BallAssets.h"
 
 #include <string>
+#include <memory>
 
-// PartitionedTlasSample (Milestone 1 SKELETON)
+// PartitionedTlasSample
 // ---------------------------------------------------------------------------
-// At this stage the sample only:
-//   * Initialises a D3D12 device + swap chain (via DeviceResources)
-//   * Queries DXR2 / Clusters+PTLAS support (logs result, does NOT fail if
-//     unsupported -- so we can verify build/run on machines without DXR2)
-//   * Clears the back buffer to a unique teal so screenshots are
-//     unambiguously THIS sample
-//   * Honours --screenshot N path and --exit-after-frames N for unattended
-//     headless verification (mirrors the clustered-geometry sample's CLI)
+// Milestone 2a (this commit): one ball, one TLAS instance, two TLAS modes
+// (`traditional` baseline / `partitioned`) toggleable at startup via
+// `--tlas-mode`.  Both produce identical pixels so the toggle is a
+// before/after sanity check on the PtlasSystem implementation.
 //
-// Future milestones layer in PtlasSystem / ClusterSystem / SceneState /
-// GpuMemory and the actual PTLAS work. See docs/design.md for the plan.
+// Milestones 2b+ scale up to a grid of partitions and the moving flock; see
+// docs/design.md.
 class PartitionedTlasSample : public DXSample
 {
 public:
     PartitionedTlasSample(UINT width, UINT height, std::wstring name);
 
-    // IDeviceNotify (from DXSample base)
+    // IDeviceNotify
     virtual void OnDeviceLost() override;
     virtual void OnDeviceRestored() override;
 
@@ -50,27 +49,65 @@ public:
 private:
     static const UINT FrameCount = 3;
 
-    // Device + DXR2 surfaces (DXR2 is queried but its features are not yet
-    // exercised; the dxr2 pointers stay null until later milestones).
+    // ---- DXR1 + DXR2 device / cmdlist surfaces ----
     Microsoft::WRL::ComPtr<ID3D12Device5>                m_dxrDevice;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4>   m_dxrCommandList;
     Microsoft::WRL::ComPtr<ID3D12DeviceRaytracing2>      m_dxr2Device;
     Microsoft::WRL::ComPtr<ID3D12CommandListRaytracing2> m_dxr2CommandList;
     bool   m_clustersAndPtlasSupported = false;
     UINT64 m_framesRendered            = 0;
-
     StepTimer m_timer;
+    std::chrono::steady_clock::time_point m_startTime;
 
-    // ---- Headless / screenshot CLI state -------------------------------
-    int          m_screenshotFrame    = -1;   // --screenshot N path
+    // ---- CLI / headless state ----
+    int          m_screenshotFrame    = -1;
     std::wstring m_screenshotPath;
     bool         m_screenshotTaken    = false;
-    UINT         m_exitAfterFrames    = 0;    // --exit-after-frames N (0 = never)
+    UINT         m_exitAfterFrames    = 0;
 
-    // ---- Helpers (defined in .cpp) ------------------------------------
+    // ---- TLAS mode (selectable; instrumentation hook) ----
+    enum class TlasMode { Partitioned, Traditional };
+    TlasMode m_tlasMode = TlasMode::Partitioned;
+    std::unique_ptr<ITlasSystem> m_tlas;
+
+    // ---- Static assets ----
+    BallAssets m_ball;
+
+    // ---- RT pipeline + shader table + bindings ----
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;
+    Microsoft::WRL::ComPtr<ID3D12StateObject>   m_rtStateObject;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_shaderTable;
+    UINT64                                      m_rayGenRecordSize       = 0;
+    UINT64                                      m_missRecordStartOffset  = 0;
+    UINT64                                      m_missRecordSize         = 0;
+    UINT64                                      m_hitRecordStartOffset   = 0;
+    UINT64                                      m_hitRecordSize          = 0;
+
+    // ---- Per-frame scene constants (3-deep upload-heap ring) ----
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_sceneCb;
+    UINT8*                                      m_sceneCbCpu     = nullptr;
+    UINT64                                      m_sceneCbStride  = 0;
+
+    // ---- Output UAV + descriptor heap ----
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_output;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_descHeap;     // CBV_SRV_UAV, shader-visible
+    UINT                                          m_descSize    = 0;
+    UINT                                          m_uavHeapIdx  = 0;  // index of output UAV in m_descHeap
+
+    // ---- Helpers (defined in .cpp) ----
     void CreateDeviceDependentResources();
     void ReleaseDeviceDependentResources();
+    void CreateWindowSizeDependentResources();
+    void CreateRaytracingPipeline();
+    void CreateShaderTable();
+    void CreateOutputUav();
+    void CreateDescriptorHeap();
+    void CreateSceneConstantBuffer();
+
+    void UpdateSceneConstantBuffer();
+    void DoRender();
+
     void CaptureBackBufferToFile(const std::wstring& path);
-    HRESULT SaveBGRAToPng(const std::wstring& path, UINT width, UINT height,
+    HRESULT SaveRGBAToPng(const std::wstring& path, UINT width, UINT height,
                           const uint8_t* data, UINT rowPitchBytes);
 };

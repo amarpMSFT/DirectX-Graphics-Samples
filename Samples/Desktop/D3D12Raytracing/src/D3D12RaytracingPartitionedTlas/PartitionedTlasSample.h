@@ -79,7 +79,8 @@ private:
     std::unique_ptr<ITlasSystem> m_tlas;
 
     // ---- Static assets ----
-    MeshAssets m_ball;
+    MeshAssets m_ball;       // hi-LOD icosphere (subdiv=2, 320 tris)
+    MeshAssets m_ballLow;    // lo-LOD icosphere (subdiv=0, 20 tris) -- phase 5 LOD swap
     MeshAssets m_donut;
     // The donut flock-members live in the PTLAS GLOBAL PARTITION (phase 4).
     // Their transforms are FLOCK-LOCAL (small offsets from flock center)
@@ -99,10 +100,16 @@ private:
     SceneLayout m_scene;
     std::vector<SceneInstance>      m_sceneInstances;          // world-space (built once)
     std::vector<DirectX::XMFLOAT3>  m_ballWorldPos;            // ball positions only (fed to RollingPartitions)
+    std::vector<uint8_t>            m_ballLod;                 // per-ball current LOD (0=hi, 1=lo); reset on init/resize
     bool                            m_ptlasInitialWriteDone = false;
     DirectX::XMFLOAT3               m_asOrigin = { 0, 0, 0 };  // current frame's AS-space origin
     void BuildSceneInstances();
     void RecomputeAsOrigin();
+
+    // LOD threshold: balls within this AS-space distance from camera get
+    // hi-LOD; beyond -> lo-LOD.  Tuned so the swap is visible during the
+    // flock's transit through the lattice.
+    static constexpr float kLodNearDist = 3.5f;
 
     // ---- Camera / flock-follow rig.  --camera-mode orbit|flock-follow
     // selects between the static orbit camera (phase 2c) and the

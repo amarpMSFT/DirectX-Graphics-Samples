@@ -103,6 +103,13 @@ public:
         // transforms it hands to WriteInstances above.
     }
 
+    void UpdateInstances(const InstanceUpdate* /*args*/, UINT /*count*/) override
+    {
+        // No-op: the traditional path rewrites the full instance list
+        // every frame, so any LOD/BLAS swap is already reflected in the
+        // SceneInstance.blasGva values the sample feeds into WriteInstances.
+    }
+
     void Build(ID3D12GraphicsCommandList4* cl,
                ID3D12CommandListRaytracing2* /*cl2*/) override
     {

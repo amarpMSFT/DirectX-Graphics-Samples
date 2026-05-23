@@ -202,6 +202,37 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
 }
 
 // ---------------------------------------------------------------------------
+// UpdateInstances -- stage an UPDATE_INSTANCE op.  Only changes the BLAS
+// pointer + (optionally) the hit-group index of existing instances.  Spec
+// requires the instance to have either ENABLE_EXPLICIT_AABB or a non-zero
+// AS pointer on its last WRITE_INSTANCE.  Cheap if ENABLE_EXPLICIT_AABB
+// was used (no partition refit); otherwise causes the partition's internal
+// AS to refit to the new BLAS bounds.
+//
+// Typical use: per-frame LOD swap.  Per-frame cluster-template
+// re-instantiation for animated geometry uses the same op.
+//
+// Spec: D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS
+// ---------------------------------------------------------------------------
+void PtlasSystem::UpdateInstances(const InstanceUpdate* args, UINT count)
+{
+    if (count == 0) return;
+    std::vector<D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS> a(count);
+    for (UINT i = 0; i < count; ++i)
+    {
+        a[i].InstanceIndex                       = args[i].instanceIndex;
+        a[i].InstanceContributionToHitGroupIndex = 0;
+        a[i].AccelerationStructure               = args[i].newBlas;
+    }
+    constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS);
+    D3D12_GPU_VIRTUAL_ADDRESS gva =
+        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/8);
+    AppendPendingOp(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_UPDATE_INSTANCE,
+                    gva, count, kStride);
+    m_lastUpdateCount += count;
+}
+
+// ---------------------------------------------------------------------------
 // TranslatePartitions -- stage a TRANSLATE_PARTITION op for `count` partitions.
 // Each arg is { partitionIndex, translation[3] }.  partitionIndex can be
 // any value in [0..PartitionCount) for regular partitions or

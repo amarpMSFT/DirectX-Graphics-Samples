@@ -94,6 +94,19 @@ public:
     // identified via D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION).
     virtual void TranslatePartitions(const PartitionTranslate* args, UINT count) = 0;
 
+    // GPU-side arg structure for a single UPDATE_INSTANCE operation.
+    // Updates an instance's BLAS pointer without rewriting its transform
+    // or partition assignment.  Spec: cheap (no internal AS rebuild) IFF
+    // the original WRITE_INSTANCE used ENABLE_EXPLICIT_AABB; otherwise the
+    // partition refits to the new BLAS's bounds.  Use case: per-frame LOD
+    // swap, cluster-template re-instantiation for animated geometry.
+    struct InstanceUpdate
+    {
+        UINT  instanceIndex;
+        D3D12_GPU_VIRTUAL_ADDRESS newBlas;
+    };
+    virtual void UpdateInstances(const InstanceUpdate* args, UINT count) = 0;
+
     // Build/finalize the top-level structure.  Records GPU work into `cl`.
     virtual void Build(ID3D12GraphicsCommandList4* cl,
                        ID3D12CommandListRaytracing2* cl2) = 0;

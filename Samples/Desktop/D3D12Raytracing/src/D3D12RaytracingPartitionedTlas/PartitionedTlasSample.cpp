@@ -266,10 +266,12 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // Build mesh assets (icosphere ball + torus donut, each with its DXR1
     // BLAS).  Both record into the open cmd list; the caller (us, below)
     // closes / executes / waits at the end of init.
-    m_ball.Initialize (m_dxrDevice.Get(), m_dxrCommandList.Get(),
-                       ProceduralGeometry::MakeIcosphere(2), L"BallMesh");
-    m_donut.Initialize(m_dxrDevice.Get(), m_dxrCommandList.Get(),
-                       ProceduralGeometry::MakeTorus(0.55f, 0.18f, 28, 14), L"DonutMesh");
+    m_ball.Initialize    (m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                          ProceduralGeometry::MakeIcosphere(2), L"BallMeshHi");
+    m_ballLow.Initialize (m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                          ProceduralGeometry::MakeIcosphere(0), L"BallMeshLo");
+    m_donut.Initialize   (m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                          ProceduralGeometry::MakeTorus(0.55f, 0.18f, 28, 14), L"DonutMesh");
 
     // Donut flock-member roster.  Members orbit the flock center in a
     // small ring (3D positions baked here; later milestones can animate
@@ -745,6 +747,13 @@ void PartitionedTlasSample::DoRender()
                 inst.transform.m[0][3] -= home.x;
                 inst.transform.m[1][3] -= home.y;
                 inst.transform.m[2][3] -= home.z;
+                // LOD-aware BLAS swap: hi-LOD if close to camera, lo otherwise.
+                const auto& wp = m_ballWorldPos[b];
+                const float dx = wp.x - m_asOrigin.x;
+                const float dy = wp.y - m_asOrigin.y;
+                const float dz = wp.z - m_asOrigin.z;
+                const bool nearCam = (dx*dx + dy*dy + dz*dz) < kLodNearDist * kLodNearDist;
+                inst.blasGva = nearCam ? m_ball.BlasGpuVa() : m_ballLow.BlasGpuVa();
             }
             writes.push_back(inst);
         }
@@ -776,10 +785,69 @@ void PartitionedTlasSample::DoRender()
         if (!m_ptlasInitialWriteDone)
         {
             m_ptlasInitialWriteDone = true;
+            // Per-ball LOD state begins at "hi" (matches the initial write
+            // which uses m_ball.BlasGpuVa()).
+            m_ballLod.assign(m_rollingParts.BallCount(), 0);
             SampleLog::LogF(L"[ptlas] initial WRITE_INSTANCE pass: %u instances "
                             L"(%u donuts in global partition; partition budget = %u)\n",
                             (unsigned)writes.size(), (unsigned)m_donutMembers.size(),
                             m_partitionBudget);
+        }
+
+        // (a3) UPDATE_INSTANCE for balls whose LOD just changed (and whose
+        //      partition didn't change in (a)).  LOD = distance from
+        //      camera; balls within kLodNearDist get hi-LOD, others lo-LOD.
+        //      Spec: UPDATE_INSTANCE just swaps the BLAS pointer -- the
+        //      instance's partition / transform / mask / flags are
+        //      unchanged.  Without ENABLE_EXPLICIT_AABB the partition
+        //      refits internally (more expensive); with it the swap is
+        //      cheap.  Phase 5 will add ENABLE_EXPLICIT_AABB at initial
+        //      WRITE_INSTANCE to take the cheap path.
+        std::vector<ITlasSystem::InstanceUpdate> updates;
+        if (m_ballLod.size() == m_rollingParts.BallCount())
+        {
+            // Mark balls written this frame (to skip them in the LOD pass).
+            std::vector<bool> writtenThisFrame(m_rollingParts.BallCount(), false);
+            for (uint32_t b : m_rollingParts.ChangedBalls())
+                writtenThisFrame[b] = true;
+
+            for (uint32_t b = 0; b < m_rollingParts.BallCount(); ++b)
+            {
+                if (writtenThisFrame[b]) continue;
+                if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) continue;
+                const auto& pos = m_ballWorldPos[b];
+                float dx = pos.x - m_asOrigin.x;
+                float dy = pos.y - m_asOrigin.y;
+                float dz = pos.z - m_asOrigin.z;
+                float d2 = dx*dx + dy*dy + dz*dz;
+                const uint8_t newLod = (d2 < kLodNearDist * kLodNearDist) ? 0u : 1u;
+                if (newLod != m_ballLod[b])
+                {
+                    ITlasSystem::InstanceUpdate u = {};
+                    u.instanceIndex = kDonutCount + b;
+                    u.newBlas = (newLod == 0) ? m_ball.BlasGpuVa() : m_ballLow.BlasGpuVa();
+                    updates.push_back(u);
+                    m_ballLod[b] = newLod;
+                }
+            }
+            if (!updates.empty())
+            {
+                m_tlas->UpdateInstances(updates.data(), (UINT)updates.size());
+            }
+        }
+        // For balls written this frame, also seed m_ballLod from current
+        // distance so UPDATE_INSTANCE doesn't fire for them next frame
+        // when nothing actually changed.
+        for (uint32_t b : m_rollingParts.ChangedBalls())
+        {
+            if (b >= m_ballLod.size()) continue;
+            if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) { m_ballLod[b] = 0; continue; }
+            const auto& pos = m_ballWorldPos[b];
+            float dx = pos.x - m_asOrigin.x;
+            float dy = pos.y - m_asOrigin.y;
+            float dz = pos.z - m_asOrigin.z;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            m_ballLod[b] = (d2 < kLodNearDist * kLodNearDist) ? 0u : 1u;
         }
 
         // (b) TRANSLATE_PARTITION for every active partition every frame
@@ -892,7 +960,7 @@ void PartitionedTlasSample::DoRender()
         const uint64_t deltaWrites = m_cumBallChanges - m_cumBallChangesLastLog;
         m_cumBallChangesLastLog = m_cumBallChanges;
         SampleLog::LogF(L"[frame %llu] tlas=%s budget=%u "
-                        L"writes_since_last_log=%llu cum_writes=%llu part_trans=%u "
+                        L"writes_delta=%llu cum_writes=%llu  updates_total=%u  part_trans=%u "
                         L"build_ms=%.3f (raw %.3f)  flock=(%.2f, %.2f, %.2f)  "
                         L"fwd=(%.2f, %.2f, %.2f)\n",
                         (unsigned long long)m_framesRendered,
@@ -900,6 +968,7 @@ void PartitionedTlasSample::DoRender()
                         m_partitionBudget,
                         (unsigned long long)deltaWrites,
                         (unsigned long long)m_cumBallChanges,
+                        fs.instancesSubmitted,
                         fs.partitionsTouched,
                         m_tlasBuildMsEma, m_tlasBuildMsLast,
                         m_flock.position.x, m_flock.position.y, m_flock.position.z,

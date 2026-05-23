@@ -188,7 +188,7 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
         a.InstanceContributionToHitGroupIndex = 0;
         a.InstanceFlags                       = D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_NONE;
         a.AccelerationStructure               = s.blasGva;
-        a.InstanceIndex                       = i;
+        a.InstanceIndex                       = s.instanceIndex;
         a.PartitionIndex                      = s.partitionIndex;
         a.ExplicitAABB                        = {};   // not used (flag not set)
     }

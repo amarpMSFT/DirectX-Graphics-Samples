@@ -37,6 +37,10 @@ struct SceneInstance
 {
     DirectX::XMFLOAT4X4 transform;     // row-major, last row is (0,0,0,1)
     D3D12_GPU_VIRTUAL_ADDRESS blasGva; // 256-byte aligned BLAS
+    UINT instanceIndex;                // PTLAS slot to write into.  Distinct from
+                                       // instanceID -- this is the address-in-PTLAS,
+                                       // not the user-visible value.  Traditional
+                                       // TLAS ignores this and uses array position.
     UINT instanceID;                   // accessible via InstanceID() in HLSL
     UINT instanceMask;                 // 0xFF by default
     UINT partitionIndex;               // 0xFFFFFFFF = global (PTLAS); ignored by traditional

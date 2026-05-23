@@ -30,6 +30,7 @@
 #include "TraditionalTlasSystem.h"
 #include "PtlasSystem.h"
 #include "GpuBuffer.h"
+#include "ProceduralGeometry.h"
 #include "RaytracingHlslCompat.h"
 
 #include "CompiledShaders/Raytracing.hlsl.h"  // produced by FxCompile -> g_pRaytracing
@@ -262,10 +263,31 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
         m_tlasMode = TlasMode::Traditional;
     }
 
-    // Build ball assets (mesh + DXR1 BLAS).  This records into the
-    // already-open cmd list; the caller (us, below) closes / executes /
-    // waits at the end of init.
-    m_ball.Initialize(m_dxrDevice.Get(), m_dxrCommandList.Get(), /*subdiv*/ 2);
+    // Build mesh assets (icosphere ball + torus donut, each with its DXR1
+    // BLAS).  Both record into the open cmd list; the caller (us, below)
+    // closes / executes / waits at the end of init.
+    m_ball.Initialize (m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                       ProceduralGeometry::MakeIcosphere(2), L"BallMesh");
+    m_donut.Initialize(m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                       ProceduralGeometry::MakeTorus(0.55f, 0.18f, 28, 14), L"DonutMesh");
+
+    // Donut flock-member roster.  Members orbit the flock center in a
+    // small ring (3D positions baked here; later milestones can animate
+    // these offsets to make the flock "shimmer").  Phase 4 keeps it
+    // static.
+    m_donutMembers.clear();
+    m_donutMembers.reserve(kDonutCount);
+    for (uint32_t i = 0; i < kDonutCount; ++i)
+    {
+        const float t = (float)i / (float)kDonutCount;
+        const float ring = 0.85f;
+        DirectX::XMFLOAT3 off = {
+            ring * cosf(t * DirectX::XM_2PI),
+            0.05f * sinf(t * DirectX::XM_2PI * 3.0f),    // small vertical wobble
+            ring * sinf(t * DirectX::XM_2PI),
+        };
+        m_donutMembers.push_back({ off, 0.40f });
+    }
 
     // Compute the static scene instance list.  Milestone 2b: every ball is
     // a static instance referencing the single shared BLAS; partition index
@@ -284,15 +306,13 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     m_rollingParts.Initialize(m_partitionBudget, /*forwardBias*/ 0.30f,
                               m_scene, m_ballWorldPos);
 
-    // Pick the active TLAS system, sized for the partition budget.
+    // Pick the active TLAS system, sized for the partition budget +
+    // global-partition flock.
     ITlasSystem::InitDesc tlasInit = {};
-    tlasInit.maxInstances                  = m_scene.TotalBalls();
+    tlasInit.maxInstances                  = m_scene.TotalBalls() + kDonutCount;
     tlasInit.maxPartitions                 = m_partitionBudget;
-    // Worst case: a single partition gets MAX possible balls.  With cells
-    // assigned 1:1, the max is one cell's worth (ballsPerSide^3).  Bump
-    // the cap slightly so per-partition imbalance has headroom.
     tlasInit.maxInstancesPerPartition      = std::max(1u, 2 * m_scene.BallsPerPartition());
-    tlasInit.maxInstancesInGlobalPartition = 0;     // reserved for the flock in phase 4
+    tlasInit.maxInstancesInGlobalPartition = kDonutCount;     // donut flock
     if (m_tlasMode == TlasMode::Partitioned)
         m_tlas = std::make_unique<PtlasSystem>();
     else
@@ -503,6 +523,9 @@ void PartitionedTlasSample::BuildSceneInstances()
     m_ballWorldPos.reserve(m_scene.TotalBalls());
 
     const D3D12_GPU_VIRTUAL_ADDRESS blas = m_ball.BlasGpuVa();
+    // PTLAS InstanceIndex layout: donuts occupy [0..kDonutCount), balls
+    // start at kDonutCount.  Recorded in inst.instanceIndex so PtlasSystem
+    // writes to the correct slot even when we only WRITE_INSTANCE a subset.
     for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
     for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
     for (uint32_t pi = 0; pi < m_scene.gridX; ++pi)
@@ -519,7 +542,9 @@ void PartitionedTlasSample::BuildSceneInstances()
             SceneInstance inst = {};
             XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(m));
             inst.blasGva        = blas;
-            inst.instanceID     = m_scene.BallIndex(pi, pj, pk, bi, bj, bk);
+            const uint32_t ballIdx = m_scene.BallIndex(pi, pj, pk, bi, bj, bk);
+            inst.instanceIndex  = kDonutCount + ballIdx;
+            inst.instanceID     = ballIdx;
             inst.instanceMask   = 0xFF;
             inst.partitionIndex = 0;   // set per-frame by RollingPartitions
             m_sceneInstances.push_back(inst);
@@ -690,14 +715,14 @@ void PartitionedTlasSample::DoRender()
                               : std::vector<uint32_t>();   // sentinel; we iterate ALL below
         const uint32_t fullCount = m_rollingParts.BallCount();
         const uint32_t writeIterCount = m_ptlasInitialWriteDone ? (uint32_t)changed.size() : fullCount;
-        writes.reserve(writeIterCount);
+        writes.reserve(writeIterCount + (m_ptlasInitialWriteDone ? 0 : (uint32_t)m_donutMembers.size()));
 
         for (uint32_t i = 0; i < writeIterCount; ++i)
         {
             const uint32_t b = m_ptlasInitialWriteDone ? changed[i] : i;
             const uint32_t owner = m_rollingParts.Owner(b);
             SceneInstance inst = m_sceneInstances[b];
-            inst.instanceID = b;
+            // inst.instanceIndex already = kDonutCount + b from BuildSceneInstances.
             if (owner == RollingPartitions::kNoPartition)
             {
                 // Disabled: make the instance DEGENERATE (transform with
@@ -723,6 +748,27 @@ void PartitionedTlasSample::DoRender()
             }
             writes.push_back(inst);
         }
+        // (a2) Donut flock in the GLOBAL PARTITION.  Static partition-local
+        //      transforms (= flock-local offset + scale).  Written ONCE; the
+        //      global partition's translation, updated each frame below,
+        //      places them at flock_pos - as_origin in AS-space.
+        if (!m_ptlasInitialWriteDone)
+        {
+            for (uint32_t d = 0; d < (uint32_t)m_donutMembers.size(); ++d)
+            {
+                const auto& m = m_donutMembers[d];
+                XMMATRIX t = XMMatrixScaling(m.scale, m.scale, m.scale)
+                           * XMMatrixTranslation(m.localOffset.x, m.localOffset.y, m.localOffset.z);
+                SceneInstance inst = {};
+                XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(t));
+                inst.blasGva        = m_donut.BlasGpuVa();
+                inst.instanceIndex  = kFlockInstBase + d;
+                inst.instanceID     = 0x10000u | d;
+                inst.instanceMask   = 0xFF;
+                inst.partitionIndex = (UINT)D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION;
+                writes.push_back(inst);
+            }
+        }
         if (!writes.empty())
         {
             m_tlas->WriteInstances(writes.data(), (UINT)writes.size());
@@ -731,15 +777,15 @@ void PartitionedTlasSample::DoRender()
         {
             m_ptlasInitialWriteDone = true;
             SampleLog::LogF(L"[ptlas] initial WRITE_INSTANCE pass: %u instances "
-                            L"(partition budget = %u)\n",
-                            (unsigned)writes.size(), m_partitionBudget);
+                            L"(%u donuts in global partition; partition budget = %u)\n",
+                            (unsigned)writes.size(), (unsigned)m_donutMembers.size(),
+                            m_partitionBudget);
         }
 
-        // (b) TRANSLATE_PARTITION for every active partition every frame.
-        //     home - as_origin keeps AS-space coords near zero where the
-        //     rays start.
+        // (b) TRANSLATE_PARTITION for every active partition every frame
+        //     (home - as_origin) + ONE for the global partition (flock_pos - as_origin).
         std::vector<ITlasSystem::PartitionTranslate> pts;
-        pts.reserve(m_partitionBudget);
+        pts.reserve(m_partitionBudget + 1);
         for (uint32_t p = 0; p < m_rollingParts.PartitionCount(); ++p)
         {
             if (!m_rollingParts.PartitionActive(p)) continue;
@@ -751,6 +797,15 @@ void PartitionedTlasSample::DoRender()
             t.translation[2] = home.z - m_asOrigin.z;
             pts.push_back(t);
         }
+        {
+            // Global partition tracks the flock center.
+            ITlasSystem::PartitionTranslate t = {};
+            t.partitionIndex = (UINT)D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION;
+            t.translation[0] = m_flock.position.x - m_asOrigin.x;
+            t.translation[1] = m_flock.position.y - m_asOrigin.y;
+            t.translation[2] = m_flock.position.z - m_asOrigin.z;
+            pts.push_back(t);
+        }
         if (!pts.empty())
         {
             m_tlas->TranslatePartitions(pts.data(), (UINT)pts.size());
@@ -760,23 +815,39 @@ void PartitionedTlasSample::DoRender()
     {
         // Traditional: rebuild instance descs with translation baked
         // (world - as_origin), DISABLING balls outside the active set
-        // (AS = 0).  No partition concept, so the rolling-window cost
-        // shows up as a full-instance-list rewrite every frame.
-        std::vector<SceneInstance> adj(m_sceneInstances.size());
+        // (AS = 0).  Donuts appended at the end; their world translation
+        // = flock_pos + local_offset - as_origin.
+        std::vector<SceneInstance> adj;
+        adj.reserve(m_sceneInstances.size() + m_donutMembers.size());
         for (size_t i = 0; i < m_sceneInstances.size(); ++i)
         {
-            adj[i] = m_sceneInstances[i];
+            SceneInstance s = m_sceneInstances[i];
             const uint32_t owner = m_rollingParts.Owner((uint32_t)i);
             if (owner == RollingPartitions::kNoPartition)
             {
-                // Disable: AccelerationStructure = 0 in the
-                // D3D12_RAYTRACING_INSTANCE_DESC; TraditionalTlasSystem
-                // writes 0 through to the desc and the ray misses.
-                adj[i].blasGva = 0;
+                s.blasGva = 0;
             }
-            adj[i].transform.m[0][3] -= m_asOrigin.x;
-            adj[i].transform.m[1][3] -= m_asOrigin.y;
-            adj[i].transform.m[2][3] -= m_asOrigin.z;
+            s.transform.m[0][3] -= m_asOrigin.x;
+            s.transform.m[1][3] -= m_asOrigin.y;
+            s.transform.m[2][3] -= m_asOrigin.z;
+            adj.push_back(s);
+        }
+        for (uint32_t d = 0; d < (uint32_t)m_donutMembers.size(); ++d)
+        {
+            const auto& m = m_donutMembers[d];
+            XMMATRIX t = XMMatrixScaling(m.scale, m.scale, m.scale)
+                       * XMMatrixTranslation(
+                            m_flock.position.x + m.localOffset.x - m_asOrigin.x,
+                            m_flock.position.y + m.localOffset.y - m_asOrigin.y,
+                            m_flock.position.z + m.localOffset.z - m_asOrigin.z);
+            SceneInstance inst = {};
+            XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(t));
+            inst.blasGva        = m_donut.BlasGpuVa();
+            inst.instanceID     = 0x10000u | d;
+            inst.instanceMask   = 0xFF;
+            inst.partitionIndex = 0;
+            inst.instanceIndex  = (UINT)(m_sceneInstances.size() + d);
+            adj.push_back(inst);
         }
         m_tlas->WriteInstances(adj.data(), (UINT)adj.size());
     }
@@ -991,10 +1062,10 @@ void PartitionedTlasSample::ApplyResizeIfPending()
 
     // Recreate the TLAS system (PTLAS or Traditional -- both are valid).
     ITlasSystem::InitDesc tlasInit = {};
-    tlasInit.maxInstances                  = m_scene.TotalBalls();
+    tlasInit.maxInstances                  = m_scene.TotalBalls() + kDonutCount;
     tlasInit.maxPartitions                 = m_partitionBudget;
     tlasInit.maxInstancesPerPartition      = std::max(1u, 2 * m_scene.BallsPerPartition());
-    tlasInit.maxInstancesInGlobalPartition = 0;
+    tlasInit.maxInstancesInGlobalPartition = kDonutCount;
     m_tlas.reset();
     if (m_tlasMode == TlasMode::Partitioned)
         m_tlas = std::make_unique<PtlasSystem>();

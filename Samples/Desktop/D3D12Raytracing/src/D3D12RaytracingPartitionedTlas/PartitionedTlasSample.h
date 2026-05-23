@@ -14,7 +14,7 @@
 #include "DXSample.h"
 #include "StepTimer.h"
 #include "ITlasSystem.h"
-#include "BallAssets.h"
+#include "MeshAssets.h"
 #include "SceneLayout.h"
 #include "FlockMotion.h"
 #include "RollingPartitions.h"
@@ -79,7 +79,20 @@ private:
     std::unique_ptr<ITlasSystem> m_tlas;
 
     // ---- Static assets ----
-    BallAssets m_ball;
+    MeshAssets m_ball;
+    MeshAssets m_donut;
+    // The donut flock-members live in the PTLAS GLOBAL PARTITION (phase 4).
+    // Their transforms are FLOCK-LOCAL (small offsets from flock center)
+    // and the global partition's translation is updated each frame to
+    // place the flock cluster at flock_pos - as_origin in AS-space.
+    struct FlockMember {
+        DirectX::XMFLOAT3 localOffset;   // relative to flock position
+        float             scale;
+    };
+    std::vector<FlockMember> m_donutMembers;
+    static constexpr UINT kDonutCount     = 9;
+    static constexpr UINT kFlockInstBase  = 0; // donut instance indices: [kFlockInstBase .. kFlockInstBase+kDonutCount)
+    // Ball instances live ABOVE donuts in the PTLAS InstanceIndex range.
 
     // ---- Scene layout (grid of partitions; each partition holds a sub-grid
     // of balls; balls are equally spaced across the whole lattice). ----

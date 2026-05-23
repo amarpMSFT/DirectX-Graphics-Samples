@@ -16,6 +16,7 @@
 #include "ITlasSystem.h"
 #include "BallAssets.h"
 #include "SceneLayout.h"
+#include "FlockMotion.h"
 
 #include <string>
 #include <memory>
@@ -85,6 +86,15 @@ private:
     DirectX::XMFLOAT3               m_asOrigin = { 0, 0, 0 };  // current frame's AS-space origin
     void BuildSceneInstances();
     void RecomputeAsOrigin();
+
+    // ---- Camera / flock-follow rig.  --camera-mode orbit|flock-follow
+    // selects between the static orbit camera (phase 2c) and the
+    // camera-trails-flock rig (phase 3+).  In both cases m_asOrigin
+    // tracks the camera so partition translations and the AS-space camera
+    // CB stay consistent. ----
+    enum class CameraMode { Orbit, FlockFollow };
+    CameraMode  m_cameraMode = CameraMode::FlockFollow;
+    FlockMotion m_flock;
 
     // ---- RT pipeline + shader table + bindings ----
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;

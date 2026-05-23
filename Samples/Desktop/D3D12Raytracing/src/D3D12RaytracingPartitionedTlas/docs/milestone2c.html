@@ -1,0 +1,78 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+body { background:#0d1117; color:#e6edf3; font-family:system-ui; padding:20px; max-width:1400px; margin:0 auto; }
+h1 { color:#58a6ff; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:16px 0; }
+.card { background:#161b22; padding:12px; border-radius:6px; border:1px solid #30363d; }
+.card h3 { margin:0 0 8px 0; color:#3fb950; font-family:monospace; }
+.card img { width:100%; border-radius:4px; display:block; }
+.stats { font-family:monospace; font-size:13px; line-height:1.6; }
+.stats .k { color:#8b949e; }
+.stats .v { color:#e6edf3; }
+.win { color:#3fb950; font-weight:bold; }
+.lose { color:#d29922; }
+table { width:100%; border-collapse:collapse; margin:8px 0; font-family:monospace; }
+td { padding:6px 12px; border-bottom:1px solid #30363d; }
+td:first-child { color:#8b949e; }
+hr { border:0; border-top:1px solid #30363d; margin:20px 0; }
+.note { color:#8b949e; font-size:13px; }
+</style></head><body>
+<h1>D3D12 Raytracing — Partitioned TLAS sample (milestone 2c)</h1>
+<p>5832 balls in a 6×6×6 lattice of 216 partitions.
+Same scene, same shader, same BLAS; only the top-level structure differs.</p>
+
+<div class="grid">
+  <div class="card">
+    <h3>partitioned (PTLAS, DXR2)</h3>
+    <img src="screenshots/m2c_partitioned.png">
+    <div class="stats">
+      <span class="k">result size:</span> <span class="v">2,099,840 B</span><br>
+      <span class="k">scratch size:</span> <span class="v">1,591,680 B</span><br>
+      <span class="k">per-frame ops:</span> <span class="v">216 TRANSLATE_PARTITION</span><br>
+      <span class="k">build_ms (EMA):</span> <span class="v win">~0.123 ms</span>
+    </div>
+  </div>
+  <div class="card">
+    <h3>traditional (TLAS, DXR1)</h3>
+    <img src="screenshots/m2c_traditional.png">
+    <div class="stats">
+      <span class="k">result size:</span> <span class="v">1,760,128 B</span><br>
+      <span class="k">scratch size:</span> <span class="v">640,512 B</span><br>
+      <span class="k">per-frame ops:</span> <span class="v">5832 instance writes + full TLAS rebuild</span><br>
+      <span class="k">build_ms (EMA):</span> <span class="v lose">~0.155 ms</span>
+    </div>
+  </div>
+</div>
+
+<h2>What this milestone shows</h2>
+<table>
+<tr><td>Scene</td><td>6×6×6 grid of partitions, 3×3×3 balls per partition (216 partitions, 5832 instances)</td></tr>
+<tr><td>BLAS</td><td>shared single icosphere BLAS (DXR1 — cluster BLAS via CLAS lands in 2b/3)</td></tr>
+<tr><td>PTLAS ops exercised</td><td>WRITE_INSTANCE (once), TRANSLATE_PARTITION (every frame, all 216 partitions)</td></tr>
+<tr><td>AS-origin tracking</td><td>per-frame as_origin = camera position; PTLAS instances stored partition-local;
+  traditional bakes (world − as_origin) into every instance every frame</td></tr>
+<tr><td>Identical output</td><td>both modes produce pixel-identical renders</td></tr>
+<tr><td>Adapter</td><td>NVIDIA GeForce RTX 4090 (preview driver, DXR2/PTLAS=YES)</td></tr>
+</table>
+
+<h2>Repo state</h2>
+<table>
+<tr><td>branch</td><td>user/amarp/ptlas-sample (local; not pushed)</td></tr>
+<tr><td>commits</td><td>6 (design doc → skeleton → 2a single ball → 2b grid → 2c translation → instrumentation)</td></tr>
+<tr><td>files added</td><td>~17 (Main, Sample, PtlasSystem, TraditionalTlasSystem, ITlasSystem, BallAssets, SceneLayout, ProceduralGeometry, GpuBuffer, Raytracing.hlsl, RaytracingHlslCompat, _buildrun.py, _run_interactive.py, design.md, readme.md, ...)</td></tr>
+</table>
+
+<h2>What's next (not in this run)</h2>
+<ul>
+<li>Cluster BLAS (CLAS + BUILD_BLAS_FROM_CLAS) for the static balls</li>
+<li>Flock of donuts in the GLOBAL PARTITION (exercises both partition types in one PTLAS)</li>
+<li>UPDATE_INSTANCE for LOD swaps (the 3rd PTLAS op type; only WRITE + TRANSLATE exercised so far)</li>
+<li>Displacement field + partition transfers (balls reassigned to a different partition each frame as the flock pushes them around)</li>
+<li>Cluster template animation for displaced balls (pulsation)</li>
+<li>On-screen overlay (DirectXTK12)</li>
+<li>WARP smoke-test</li>
+</ul>
+
+<p class="note">Source: <code>d:\samples2\Samples\Desktop\D3D12Raytracing\src\D3D12RaytracingPartitionedTlas</code>.
+Read <code>docs/design.md</code> for the architectural roadmap; the centerpiece is <code>PtlasSystem.cpp</code> (~210 lines).</p>
+</body></html>

@@ -98,10 +98,19 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
             m_logStatsEvery = (UINT)std::max(0, n);
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--camera-mode") == 0 && i + 1 < argc)
+        {
+            if      (_wcsicmp(argv[i+1], L"orbit")        == 0) m_cameraMode = CameraMode::Orbit;
+            else if (_wcsicmp(argv[i+1], L"flock-follow") == 0 ||
+                     _wcsicmp(argv[i+1], L"flock")        == 0) m_cameraMode = CameraMode::FlockFollow;
+            i += 1;
+        }
     }
-    SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s grid=%ux%ux%u ballsPerSide=%u "
-                    L"screenshotFrame=%d exitAfterFrames=%u logStatsEvery=%u)\n",
+    SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s camera=%s grid=%ux%ux%u "
+                    L"ballsPerSide=%u screenshotFrame=%d exitAfterFrames=%u "
+                    L"logStatsEvery=%u)\n",
                     m_tlasMode == TlasMode::Partitioned ? L"partitioned" : L"traditional",
+                    m_cameraMode == CameraMode::FlockFollow ? L"flock" : L"orbit",
                     m_scene.gridX, m_scene.gridY, m_scene.gridZ, m_scene.ballsPerSide,
                     m_screenshotFrame, m_exitAfterFrames, m_logStatsEvery);
 }
@@ -496,23 +505,34 @@ void PartitionedTlasSample::BuildSceneInstances()
     }
 }
 
-// Camera-anchored AS-origin: track the camera position every frame.  Phase
-// 2c's primary use of partition translation is to demonstrate the operation
-// firing across every partition each frame; the precision-tracking value
-// (best floats near where rays start) is a nice side-effect.
+// Camera-anchored AS-origin: track the camera every frame so the PTLAS
+// sees coords near zero where the rays start.  In flock-follow mode the
+// camera trails the flock through the lattice, so as_origin scans across
+// the volume of balls -- which in turn means TRANSLATE_PARTITION runs every
+// frame on every partition (the partitions effectively move past the
+// camera as it flies forward).
 void PartitionedTlasSample::RecomputeAsOrigin()
 {
     using namespace DirectX;
     const double tsec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m_startTime).count();
-    auto sceneSize = m_scene.SceneSize();
-    const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
-    const float r     = diag * 1.2f;
-    const float h     = diag * 0.35f;
-    const float angle = (float)(tsec * 0.20);
-    // Same camera pose used by UpdateSceneConstantBuffer; centralise the
-    // formula here later (milestone 3 will add SceneState ownership).
-    m_asOrigin = { r * sinf(angle), h, r * cosf(angle) };
+
+    if (m_cameraMode == CameraMode::FlockFollow)
+    {
+        m_flock.Update(tsec);
+        auto cam = m_flock.CameraPos();
+        m_asOrigin = cam;
+    }
+    else
+    {
+        // Orbit (phase 2c default).
+        auto sceneSize = m_scene.SceneSize();
+        const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
+        const float r     = diag * 1.2f;
+        const float h     = diag * 0.35f;
+        const float angle = (float)(tsec * 0.20);
+        m_asOrigin = { r * sinf(angle), h, r * cosf(angle) };
+    }
 }
 
 void PartitionedTlasSample::UpdateSceneConstantBuffer()
@@ -522,20 +542,31 @@ void PartitionedTlasSample::UpdateSceneConstantBuffer()
     const double tsec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m_startTime).count();
 
-    // Orbit camera framing the whole grid.  Look at scene center (origin
-    // because BuildSceneInstances centers the lattice).  AS-space origin
-    // is whatever RecomputeAsOrigin() last set m_asOrigin to (= camera in
-    // milestone 2c).  Camera ray origin and look-target are expressed in
-    // AS-space so projectionToWorld unprojects to AS-space points.
-    auto sceneSize = m_scene.SceneSize();
-    const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
-    const float r     = diag * 1.2f;       // pull back proportional to scene
-    const float h     = diag * 0.35f;
-    const float angle = (float)(tsec * 0.20);
-
-    XMVECTOR eyeWorld    = XMVectorSet(r * sinf(angle), h, r * cosf(angle), 1);
-    XMVECTOR targetWorld = XMVectorSet(0, 0, 0, 1);
-    XMVECTOR up          = XMVectorSet(0, 1, 0, 0);
+    // Orbit OR flock-follow camera depending on m_cameraMode.  In both cases
+    // m_asOrigin (set by RecomputeAsOrigin just before this call) tracks
+    // the camera world position; we build the view in AS-space so
+    // projectionToWorld unprojects to AS-space points and TraceRay sees
+    // the camera-anchored coord frame the PTLAS is laid out in.
+    XMVECTOR eyeWorld, targetWorld;
+    if (m_cameraMode == CameraMode::FlockFollow)
+    {
+        auto cam = m_flock.CameraPos();
+        auto tgt = m_flock.CameraTarget();
+        eyeWorld    = XMVectorSet(cam.x, cam.y, cam.z, 1);
+        targetWorld = XMVectorSet(tgt.x, tgt.y, tgt.z, 1);
+    }
+    else
+    {
+        // Orbit framing the whole grid.
+        auto sceneSize = m_scene.SceneSize();
+        const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
+        const float r     = diag * 1.2f;
+        const float h     = diag * 0.35f;
+        const float angle = (float)(tsec * 0.20);
+        eyeWorld    = XMVectorSet(r * sinf(angle), h, r * cosf(angle), 1);
+        targetWorld = XMVectorSet(0, 0, 0, 1);
+    }
+    XMVECTOR up = XMVectorSet(0, 1, 0, 0);
 
     XMVECTOR asOriginVec = XMVectorSet(m_asOrigin.x, m_asOrigin.y, m_asOrigin.z, 0);
     XMVECTOR eyeAs       = XMVectorSubtract(eyeWorld,    asOriginVec);

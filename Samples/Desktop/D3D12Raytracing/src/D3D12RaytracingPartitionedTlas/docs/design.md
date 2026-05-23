@@ -220,15 +220,70 @@ don't see each other's slot internals.
 - Hotkeys: `[P]` pause, `[C]` toggle free-cam, `[B]` toggle debug partition viz,
   `[L]` toggle LOD viz, `[T]` cycle translate-partition demo mode, …
 
-## Phasing (re-affirming)
+## Phasing (re-affirming + extending)
 
-1. **Skeleton**: builds, queries DXR2 caps, clears teal, exits via --screenshot.
-2. **Static scene**: balls in grid + initial PTLAS WRITE_INSTANCE pass. Trace.
-3. **GPU LOD**: distance-based LOD with PTLAS UPDATE_INSTANCE.
-4. **Flock + global partition**.
-5. **Displacement field + ball partition transfers + animated cluster templates**.
-6. **TRANSLATE_PARTITION exercise**.
-7. **Polish + debug viz**.
+1. **Skeleton**: builds, queries DXR2 caps, clears teal, exits via --screenshot. ✅
+2. **Static scene**:
+   - 2a one ball + one PTLAS, A/B vs traditional TLAS. ✅
+   - 2b 5832 balls in 216 partitions, A/B identical. ✅
+   - 2c camera-anchored TRANSLATE_PARTITION every frame. ✅
+3. **Flock + camera-follows-flock + ROLLING PARTITION WINDOW** (new direction
+   per user; supersedes the old "fixed 3D grid of partitions" model below):
+   - 3a Flock center on an arcing path; camera trails close behind.
+   - 3b Rolling partition window: partition count is a fixed *budget*, but
+        each partition's spatial coverage migrates forward as the flock
+        flies.  Balls that pass into a recycled partition's region get
+        `WRITE_INSTANCE`'d into the new partition.  Balls that stay in
+        place but their hosting partition gets recycled also get re-written
+        into the new owner partition.  Partitions far behind the flock
+        (no balls covered) get re-positioned to host balls ahead.
+   - 3c **PTLAS resize** triggered by a UI/CLI control varying total
+        partition budget.  Smaller budgets force more aggressive recycling;
+        larger budgets cover more of the visible range without re-writes.
+        Implements the spec's "expensive update with capacity change" path
+        (`D3D12_RTAS_PARTITIONED_TLAS_INPUTS_DESC.PartitionCount` differs
+        between successive PTLAS builds).
+4. **GPU LOD via UPDATE_INSTANCE.**
+5. **Donut sub-flock in the GLOBAL PARTITION + displacement field on balls.**
+6. **Cluster BLAS via CLAS + BUILD_BLAS_FROM_CLAS + cluster-template anim.**
+7. **Polish, debug viz, WARP smoke-test.**
+
+## Rolling-window partition model (phase 3+)
+
+Replaces the fixed `gridX*gridY*gridZ` partition lattice from phase 2.
+
+Concept:
+- Partition count is a budget `P` (e.g. 64, 128, 256, 1024) set via UI.  Each
+  partition has a moving spatial coverage AABB; partitions effectively form
+  a "string of beads" oriented roughly along the flock's velocity vector.
+- Balls live at FIXED world positions (this never changes; balls don't
+  follow the flock).  As the flock moves, the rolling partition window
+  scans across the lattice of balls.
+- Each frame:
+  1. Recompute the partition window position (centered ahead of flock,
+     extended for some distance both forward and laterally).
+  2. For each ball, determine which partition it falls in this frame.
+     If different from last frame's owner partition, queue a `WRITE_INSTANCE`
+     to move it.
+  3. Partitions whose AABB no longer contains any balls get RECYCLED:
+     pick the next "frontier" position ahead of the flock, repurpose the
+     partition there.  Balls that fall in the new AABB get `WRITE_INSTANCE`'d
+     into it.
+  4. All partition translations updated as before (TRANSLATE_PARTITION).
+- When the user changes `P`, the PTLAS gets resized:
+  - New build with `D3D12_RTAS_PARTITIONED_TLAS_INPUTS_DESC.PartitionCount`
+    set to the new `P`.
+  - All instances must be re-written (their partition_index needs to be
+    valid under the new sizing).
+  - This is the expensive path the spec warns about ("expect that the cost
+    of doing such a PTLAS build will be far higher than merely doing
+    modifications within existing bounds") and we'll log it so the user
+    sees the spike.
+
+UI controls (phase 3c+):
+- `[` / `]` decrement / increment partition budget power-of-2 (or fixed list).
+- `--partition-budget N` CLI for headless sweeps.
+- Hotkey to cycle partition budget; per-budget run captures a timing sample.
 
 ## WARP / hardware notes
 

@@ -74,10 +74,36 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
             else if (_wcsicmp(argv[i+1], L"traditional") == 0) m_tlasMode = TlasMode::Traditional;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--grid") == 0 && i + 1 < argc)
+        {
+            // --grid WxHxD  e.g. --grid 8x8x8
+            uint32_t gx = 0, gy = 0, gz = 0;
+            if (swscanf_s(argv[i+1], L"%ux%ux%u", &gx, &gy, &gz) == 3)
+            {
+                m_scene.gridX = std::max(1u, gx);
+                m_scene.gridY = std::max(1u, gy);
+                m_scene.gridZ = std::max(1u, gz);
+            }
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--balls-per-side") == 0 && i + 1 < argc)
+        {
+            int n = _wtoi(argv[i + 1]);
+            m_scene.ballsPerSide = (uint32_t)std::max(1, n);
+            i += 1;
+        }
+        else if (_wcsicmp(argv[i], L"--log-stats-every") == 0 && i + 1 < argc)
+        {
+            int n = _wtoi(argv[i + 1]);
+            m_logStatsEvery = (UINT)std::max(0, n);
+            i += 1;
+        }
     }
-    SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s screenshotFrame=%d exitAfterFrames=%u)\n",
+    SampleLog::LogF(L"OnInit: CLI parsed (tlasMode=%s grid=%ux%ux%u ballsPerSide=%u "
+                    L"screenshotFrame=%d exitAfterFrames=%u logStatsEvery=%u)\n",
                     m_tlasMode == TlasMode::Partitioned ? L"partitioned" : L"traditional",
-                    m_screenshotFrame, m_exitAfterFrames);
+                    m_scene.gridX, m_scene.gridY, m_scene.gridZ, m_scene.ballsPerSide,
+                    m_screenshotFrame, m_exitAfterFrames, m_logStatsEvery);
 }
 
 // =============================================================================
@@ -237,6 +263,28 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     CreateRaytracingPipeline();
     CreateShaderTable();
     CreateSceneConstantBuffer();
+
+    // ---- GPU timestamp query heap + readback ring ----
+    {
+        D3D12_QUERY_HEAP_DESC qhd = {};
+        qhd.Type     = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count    = kTimestampsPerFrame * kTimestampSlots;
+        ThrowIfFailed(device->CreateQueryHeap(&qhd, IID_PPV_ARGS(&m_timestampHeap)));
+        m_timestampHeap->SetName(L"PT/TimestampHeap");
+
+        auto rbHeap  = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        auto bufDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(UINT64) * qhd.Count);
+        ThrowIfFailed(device->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE,
+            &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&m_timestampReadback)));
+        m_timestampReadback->SetName(L"PT/TimestampReadback");
+
+        ThrowIfFailed(cmdQueue->GetTimestampFrequency(&m_timestampFreqHz));
+        SampleLog::LogF(L"[stats] timestamp frequency = %llu ticks/s "
+                        L"(%.3f ns/tick)\n",
+                        (unsigned long long)m_timestampFreqHz,
+                        1e9 / (double)m_timestampFreqHz);
+    }
 
     // CreateOutputUav is called from CreateWindowSizeDependentResources
     // because the output texture is sized to the back buffer.
@@ -567,6 +615,11 @@ void PartitionedTlasSample::DoRender()
     using namespace DirectX;
 
     m_tlas->BeginFrame();
+    // Timestamp BEFORE TLAS build.
+    const UINT tsSlot     = m_timestampSlotIdx;
+    const UINT tsSlotBase = tsSlot * kTimestampsPerFrame;
+    cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 0);
+
     if (m_tlasMode == TlasMode::Partitioned)
     {
         if (!m_ptlasInitialWriteDone)
@@ -616,20 +669,51 @@ void PartitionedTlasSample::DoRender()
     }
     m_tlas->Build(cl, cl2);
 
+    // Timestamp AFTER TLAS build, resolve this slot's pair to readback.
+    cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 1);
+    cl->ResolveQueryData(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        tsSlotBase, kTimestampsPerFrame,
+        m_timestampReadback.Get(), tsSlotBase * sizeof(UINT64));
+
+    // Read N-2 slots back (GPU has finished there).  First few frames have
+    // no valid history yet so guard against the underflow.
+    if (m_framesRendered >= (kTimestampSlots - 1))
+    {
+        const UINT readSlot = (tsSlot + 1) % kTimestampSlots;  // oldest slot still in heap
+        const UINT64* ts = nullptr;
+        D3D12_RANGE readRange = { readSlot * kTimestampsPerFrame * sizeof(UINT64),
+                                  (readSlot + 1) * kTimestampsPerFrame * sizeof(UINT64) };
+        ThrowIfFailed(m_timestampReadback->Map(0, &readRange, (void**)&ts));
+        const UINT64 t0 = ts[readSlot * kTimestampsPerFrame + 0];
+        const UINT64 t1 = ts[readSlot * kTimestampsPerFrame + 1];
+        m_timestampReadback->Unmap(0, nullptr);
+        if (t1 > t0)
+        {
+            m_tlasBuildMsLast = double(t1 - t0) * 1000.0 / double(m_timestampFreqHz);
+            constexpr double kEmaA = 1.0 / 16.0;
+            m_tlasBuildMsEma = (m_tlasBuildMsEma == 0.0)
+                ? m_tlasBuildMsLast
+                : (m_tlasBuildMsEma * (1.0 - kEmaA) + m_tlasBuildMsLast * kEmaA);
+        }
+    }
+    m_timestampSlotIdx = (m_timestampSlotIdx + 1) % kTimestampSlots;
+
     // Per-frame stats (cheap; once per frame).  GPU timestamps land in a
     // later milestone -- for now we log instance/partition counts and
     // result/scratch budgets straight off the active TLAS system so the
     // headless log shows the workload size.
-    if ((m_framesRendered % 60) == 0)
+    if (m_logStatsEvery > 0 && (m_framesRendered % m_logStatsEvery) == 0)
     {
         auto fs = m_tlas->GetLastFrameStats();
         SampleLog::LogF(L"[frame %llu] tlas=%s instances=%u part_translates=%u "
-                        L"result=%llu scratch=%llu  as_origin=(%.2f, %.2f, %.2f)\n",
+                        L"result=%llu scratch=%llu  build_ms=%.3f (raw %.3f)  "
+                        L"as_origin=(%.2f, %.2f, %.2f)\n",
                         (unsigned long long)m_framesRendered,
                         m_tlas->ModeName(),
                         fs.instancesSubmitted, fs.partitionsTouched,
                         (unsigned long long)fs.resultBytes,
                         (unsigned long long)fs.scratchBytes,
+                        m_tlasBuildMsEma, m_tlasBuildMsLast,
                         m_asOrigin.x, m_asOrigin.y, m_asOrigin.z);
     }
 

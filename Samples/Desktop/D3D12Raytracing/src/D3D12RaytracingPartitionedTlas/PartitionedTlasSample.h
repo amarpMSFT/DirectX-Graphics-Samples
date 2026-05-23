@@ -66,6 +66,7 @@ private:
     std::wstring m_screenshotPath;
     bool         m_screenshotTaken    = false;
     UINT         m_exitAfterFrames    = 0;
+    UINT         m_logStatsEvery      = 60;
 
     // ---- TLAS mode (selectable; instrumentation hook) ----
     enum class TlasMode { Partitioned, Traditional };
@@ -106,7 +107,19 @@ private:
     UINT                                          m_descSize    = 0;
     UINT                                          m_uavHeapIdx  = 0;  // index of output UAV in m_descHeap
 
-    // ---- Helpers (defined in .cpp) ----
+    // ---- GPU timestamps (per-frame, ring-buffered) ----
+    // 2 timestamps per slot, 1 slot per frame in flight + headroom.  CPU
+    // reads from slot ~(FrameCount + 1) behind the writer so the GPU has
+    // definitely completed the writes.  Resolved into the readback buffer
+    // by ResolveQueryData() at end of cmd list each frame.
+    static const UINT kTimestampsPerFrame = 2;          // [tlas_build_begin, tlas_build_end]
+    static const UINT kTimestampSlots     = FrameCount + 2;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> m_timestampHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  m_timestampReadback;
+    UINT64                                  m_timestampFreqHz   = 0;
+    double                                  m_tlasBuildMsEma    = 0.0;
+    double                                  m_tlasBuildMsLast   = 0.0;
+    UINT                                    m_timestampSlotIdx  = 0;   // current write slot
     void CreateDeviceDependentResources();
     void ReleaseDeviceDependentResources();
     void CreateWindowSizeDependentResources();

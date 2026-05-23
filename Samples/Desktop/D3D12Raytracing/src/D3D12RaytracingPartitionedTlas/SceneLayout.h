@@ -71,6 +71,35 @@ struct SceneLayout
                  -0.5f * s.z + 0.5f * ballSpacing };
     }
 
+    // World-space center of the partition cell (centroid of its balls'
+    // positions).  Used as the "partition home" for the camera-anchored
+    // partition-translation scheme: each frame we set partition translation
+    // = PartitionHome - as_origin, so the PTLAS sees positions near zero.
+    DirectX::XMFLOAT3 PartitionHomeWorld(uint32_t pi, uint32_t pj, uint32_t pk) const
+    {
+        // Centroid of the NxNxN ball positions in this partition.  Since
+        // balls are at (partI*N + 0..N-1) * spacing + shift, the centroid
+        // along each axis is partI*N + (N-1)/2 * spacing + shift, which
+        // simplifies to BallWorldPos(pi,pj,pk, (N-1)/2,(N-1)/2,(N-1)/2)
+        // for the closest integer mid-ball (good enough; for even N we
+        // shift by an extra 0.5 cell, also fine).
+        auto shift = SceneCenterToOriginShift();
+        const float halfN = 0.5f * (float)(ballsPerSide - 1);
+        return {
+            shift.x + ballSpacing * (pi * ballsPerSide + halfN),
+            shift.y + ballSpacing * (pj * ballsPerSide + halfN),
+            shift.z + ballSpacing * (pk * ballsPerSide + halfN),
+        };
+    }
+
+    DirectX::XMFLOAT3 PartitionHomeWorld(uint32_t linearIdx) const
+    {
+        uint32_t pk = linearIdx / (gridX * gridY);
+        uint32_t pj = (linearIdx / gridX) % gridY;
+        uint32_t pi =  linearIdx % gridX;
+        return PartitionHomeWorld(pi, pj, pk);
+    }
+
     // ---- Helpers ----
 
     uint32_t PartitionIndex(uint32_t pi, uint32_t pj, uint32_t pk) const

@@ -36,6 +36,7 @@ public:
                     const InitDesc& desc) override;
     void BeginFrame() override;
     void WriteInstances(const SceneInstance* instances, UINT count) override;
+    void TranslatePartitions(const PartitionTranslate* args, UINT count) override;
     void Build(ID3D12GraphicsCommandList4* cl,
                ID3D12CommandListRaytracing2* cl2) override;
     D3D12_GPU_VIRTUAL_ADDRESS Gva() const override { return m_ptlas->GetGPUVirtualAddress(); }

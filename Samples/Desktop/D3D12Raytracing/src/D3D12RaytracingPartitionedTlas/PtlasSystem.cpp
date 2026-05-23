@@ -66,13 +66,17 @@ void PtlasSystem::Initialize(ID3D12Device5* device, DX::DeviceResources* /*dr*/,
     //     These values are the upper bounds: actual per-frame ops can
     //     reference any subset of [0..InstanceCount) and [0..PartitionCount).
     m_inputs                                    = {};
-    m_inputs.Flags                              = D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_TRACE;
+    m_inputs.Flags                              = D3D12_RTAS_PARTITIONED_TLAS_FLAG_FAST_TRACE
+                                                | D3D12_RTAS_PARTITIONED_TLAS_FLAG_ENABLE_PARTITION_TRANSLATION;
     m_inputs.InstanceCount                      = desc.maxInstances;
     m_inputs.PartitionCount                     = desc.maxPartitions;
     m_inputs.MaxInstancePerPartitionCount       = desc.maxInstancesPerPartition;
     m_inputs.MaxInstanceInGlobalPartitionCount  = desc.maxInstancesInGlobalPartition;
-    // NOTE: ENABLE_PARTITION_TRANSLATION will go in here in milestone 2c
-    // when we start using camera-anchored partition translations.
+    // ENABLE_PARTITION_TRANSLATION enabled unconditionally: this sample's
+    // milestone 2c uses per-frame TRANSLATE_PARTITION ops to re-center
+    // every partition on the camera each frame.  Per spec the flag adds a
+    // small memory cost (stores the un-translated instance transforms) but
+    // unlocks the cheap-many-partitions update path.
 
     // (2) Ask the driver for result + scratch byte budgets.
     D3D12_RTAS_OPERATION_INPUTS opInputs   = {};
@@ -198,6 +202,47 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
 }
 
 // ---------------------------------------------------------------------------
+// TranslatePartitions -- stage a TRANSLATE_PARTITION op for `count` partitions.
+// Each arg is { partitionIndex, translation[3] }.  partitionIndex can be
+// any value in [0..PartitionCount) for regular partitions or
+// D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION (0xFFFFFFFF)
+// for the global partition.  Translation values REPLACE (not accumulate) the
+// previous translation for that partition.
+//
+// Use case in this sample: every frame, compute
+//   translation[p] = partition_home_world - as_origin_world
+// and submit one TRANSLATE_PARTITION op for every partition.  Combined with
+// PARTITION-LOCAL instance transforms (translation_world(b) - home_world(p)),
+// the PTLAS sees acceleration-structure-space coords centered on the camera
+// every frame -- best float precision exactly where rays start.
+//
+// Spec: D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS
+// ---------------------------------------------------------------------------
+void PtlasSystem::TranslatePartitions(const PartitionTranslate* args, UINT count)
+{
+    if (count == 0) return;
+
+    // Translate args are 16 bytes each (UINT + 3 floats, naturally
+    // 4-byte-aligned).  Build them contiguously in a local vector then
+    // copy in one shot into the frame arena.
+    std::vector<D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS> a(count);
+    for (UINT i = 0; i < count; ++i)
+    {
+        a[i].PartitionIndex          = args[i].partitionIndex;
+        a[i].PartitionTranslation[0] = args[i].translation[0];
+        a[i].PartitionTranslation[1] = args[i].translation[1];
+        a[i].PartitionTranslation[2] = args[i].translation[2];
+    }
+
+    constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS);
+    D3D12_GPU_VIRTUAL_ADDRESS gva =
+        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/4);
+    AppendPendingOp(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_TRANSLATE_PARTITION,
+                    gva, count, kStride);
+    m_lastTranslateCount += count;
+}
+
+// ---------------------------------------------------------------------------
 // Build -- assemble the per-frame op header array + invoke
 // ExecuteIndirectRTASOperations with a PARTITIONED_TLAS desc.  This is the
 // entire PTLAS-build call.
@@ -282,6 +327,6 @@ ITlasSystem::FrameStats PtlasSystem::GetLastFrameStats() const
     s.resultBytes        = m_resultBytes;
     s.scratchBytes       = m_scratchBytes;
     s.instancesSubmitted = m_lastWriteCount + m_lastUpdateCount;
-    s.partitionsTouched  = 0; // (computed in a later milestone)
+    s.partitionsTouched  = m_lastTranslateCount;
     return s;
 }

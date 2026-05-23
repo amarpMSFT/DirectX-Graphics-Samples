@@ -78,8 +78,12 @@ private:
     // ---- Scene layout (grid of partitions; each partition holds a sub-grid
     // of balls; balls are equally spaced across the whole lattice). ----
     SceneLayout m_scene;
-    std::vector<SceneInstance> m_sceneInstances;   // built once at init for milestone 2b
+    std::vector<SceneInstance>      m_sceneInstances;          // world-space (built once)
+    std::vector<DirectX::XMFLOAT3>  m_partitionHomes;          // world-space per partition
+    bool                            m_ptlasInitialWriteDone = false;
+    DirectX::XMFLOAT3               m_asOrigin = { 0, 0, 0 };  // current frame's AS-space origin
     void BuildSceneInstances();
+    void RecomputeAsOrigin();
 
     // ---- RT pipeline + shader table + bindings ----
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;

@@ -72,6 +72,24 @@ public:
     //     remembers which partitions are touched.
     virtual void WriteInstances(const SceneInstance* instances, UINT count) = 0;
 
+    // GPU-side arg structure for a single TRANSLATE_PARTITION operation.
+    // Mirrors D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS
+    // but we redefine it CPU-side so callers don't have to include the full
+    // PTLAS header just to fill these.  (Traditional impls also accept the
+    // struct -- they just ignore the data.)
+    struct PartitionTranslate
+    {
+        UINT  partitionIndex;
+        FLOAT translation[3];
+    };
+
+    // Optional per-frame call.  PTLAS impl emits a TRANSLATE_PARTITION op
+    // with `args[0..count)` baked into the current frame's arg buffer; the
+    // Traditional impl is a no-op (no partition concept).  Counts can be
+    // up to InitDesc::maxPartitions + 1 (the +1 covers the global partition;
+    // identified via D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION).
+    virtual void TranslatePartitions(const PartitionTranslate* args, UINT count) = 0;
+
     // Build/finalize the top-level structure.  Records GPU work into `cl`.
     virtual void Build(ID3D12GraphicsCommandList4* cl,
                        ID3D12CommandListRaytracing2* cl2) = 0;

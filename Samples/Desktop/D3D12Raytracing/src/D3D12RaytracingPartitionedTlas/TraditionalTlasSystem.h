@@ -81,8 +81,9 @@ public:
                          L"TraditionalTlasSystem: too many instances this frame");
             const SceneInstance& s = instances[i];
             D3D12_RAYTRACING_INSTANCE_DESC d = {};
-            // Row-major 3x4 from our 4x4.  We treat the input as already
-            // row-major; copy the first three rows directly.
+            // Row-major 3x4 from our 4x4 (SceneInstance.transform is
+            // already transposed for the DXR 3x4 convention; see
+            // PartitionedTlasSample::BuildSceneInstances).
             for (int r = 0; r < 3; ++r)
                 for (int c = 0; c < 4; ++c)
                     d.Transform[r][c] = s.transform.m[r][c];
@@ -93,6 +94,13 @@ public:
             d.AccelerationStructure               = s.blasGva;
             m_instUploadCpu[m_frameInstCount++] = d;
         }
+    }
+
+    void TranslatePartitions(const PartitionTranslate* /*args*/, UINT /*count*/) override
+    {
+        // No-op: traditional TLAS has no partition translation concept.
+        // The sample bakes any per-frame world-shift into the per-instance
+        // transforms it hands to WriteInstances above.
     }
 
     void Build(ID3D12GraphicsCommandList4* cl,

@@ -401,13 +401,24 @@ void PartitionedTlasSample::CreateShaderTable()
 }
 
 // =============================================================================
-// Scene instances (milestone 2b: static, built once)
+// Scene instances (milestone 2c: world-space + partition-home table)
 // =============================================================================
 void PartitionedTlasSample::BuildSceneInstances()
 {
     using namespace DirectX;
     m_sceneInstances.clear();
     m_sceneInstances.reserve(m_scene.TotalBalls());
+    m_partitionHomes.clear();
+    m_partitionHomes.reserve(m_scene.Partitions());
+
+    // Partition home table (world-space center of each partition cell).
+    for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
+    for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
+    for (uint32_t pi = 0; pi < m_scene.gridX; ++pi)
+    {
+        m_partitionHomes.push_back(m_scene.PartitionHomeWorld(pi, pj, pk));
+    }
+
     const D3D12_GPU_VIRTUAL_ADDRESS blas = m_ball.BlasGpuVa();
     for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
     for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
@@ -419,13 +430,11 @@ void PartitionedTlasSample::BuildSceneInstances()
         for (uint32_t bi = 0; bi < m_scene.ballsPerSide; ++bi)
         {
             DirectX::XMFLOAT3 pos = m_scene.BallWorldPos(pi, pj, pk, bi, bj, bk);
-            // Build object-to-world as Scale * Translation in DirectXMath's
-            // row-vector convention.  THEN transpose: DXR's 3x4 instance
-            // transform expects translation in the LAST COLUMN of each row
-            // (column-vector convention), whereas DirectXMath puts it in
-            // the last ROW.  Storing the transpose means downstream copies
-            // (TraditionalTlasSystem and PtlasSystem) can just take rows
-            // 0..2 verbatim.
+            // World-space Scale * Translate, then transposed for DXR's
+            // column-vector 3x4 instance-transform convention.  Per-frame
+            // adjustments (subtracting as_origin for Traditional, subtracting
+            // partition_home for Partitioned-local) happen in DoRender by
+            // tweaking m[0..2][3] before the TLAS-system call.
             XMMATRIX m = XMMatrixScaling(m_scene.ballScale, m_scene.ballScale, m_scene.ballScale)
                        * XMMatrixTranslation(pos.x, pos.y, pos.z);
             SceneInstance inst = {};
@@ -439,6 +448,25 @@ void PartitionedTlasSample::BuildSceneInstances()
     }
 }
 
+// Camera-anchored AS-origin: track the camera position every frame.  Phase
+// 2c's primary use of partition translation is to demonstrate the operation
+// firing across every partition each frame; the precision-tracking value
+// (best floats near where rays start) is a nice side-effect.
+void PartitionedTlasSample::RecomputeAsOrigin()
+{
+    using namespace DirectX;
+    const double tsec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - m_startTime).count();
+    auto sceneSize = m_scene.SceneSize();
+    const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
+    const float r     = diag * 1.2f;
+    const float h     = diag * 0.35f;
+    const float angle = (float)(tsec * 0.20);
+    // Same camera pose used by UpdateSceneConstantBuffer; centralise the
+    // formula here later (milestone 3 will add SceneState ownership).
+    m_asOrigin = { r * sinf(angle), h, r * cosf(angle) };
+}
+
 void PartitionedTlasSample::UpdateSceneConstantBuffer()
 {
     using namespace DirectX;
@@ -447,33 +475,38 @@ void PartitionedTlasSample::UpdateSceneConstantBuffer()
         std::chrono::steady_clock::now() - m_startTime).count();
 
     // Orbit camera framing the whole grid.  Look at scene center (origin
-    // because BuildSceneInstances centers the lattice).
+    // because BuildSceneInstances centers the lattice).  AS-space origin
+    // is whatever RecomputeAsOrigin() last set m_asOrigin to (= camera in
+    // milestone 2c).  Camera ray origin and look-target are expressed in
+    // AS-space so projectionToWorld unprojects to AS-space points.
     auto sceneSize = m_scene.SceneSize();
     const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
     const float r     = diag * 1.2f;       // pull back proportional to scene
     const float h     = diag * 0.35f;
     const float angle = (float)(tsec * 0.20);
 
-    XMVECTOR eye    = XMVectorSet(r * sinf(angle), h, r * cosf(angle), 1);
-    XMVECTOR target = XMVectorSet(0, 0, 0, 1);
-    XMVECTOR up     = XMVectorSet(0, 1, 0, 0);
-    XMMATRIX view = XMMatrixLookAtRH(eye, target, up);
-    const float aspect = (float)m_width / (float)m_height;
-    XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, aspect, 0.1f, 1000.0f);
+    XMVECTOR eyeWorld    = XMVectorSet(r * sinf(angle), h, r * cosf(angle), 1);
+    XMVECTOR targetWorld = XMVectorSet(0, 0, 0, 1);
+    XMVECTOR up          = XMVectorSet(0, 1, 0, 0);
 
-    // projectionToWorld is (view * proj)^-1.  We're row-vector-times-matrix
-    // (HLSL convention), so the combined transform is view * proj.
-    XMMATRIX viewProj = view * proj;
-    XMMATRIX projToWorld = XMMatrixInverse(nullptr, viewProj);
+    XMVECTOR asOriginVec = XMVectorSet(m_asOrigin.x, m_asOrigin.y, m_asOrigin.z, 0);
+    XMVECTOR eyeAs       = XMVectorSubtract(eyeWorld,    asOriginVec);
+    XMVECTOR targetAs    = XMVectorSubtract(targetWorld, asOriginVec);
+
+    XMMATRIX viewAs   = XMMatrixLookAtRH(eyeAs, targetAs, up);
+    const float aspect = (float)m_width / (float)m_height;
+    XMMATRIX proj     = XMMatrixPerspectiveFovRH(XM_PIDIV4, aspect, 0.1f, 1000.0f);
+    XMMATRIX viewProj = viewAs * proj;
+    XMMATRIX projToAs = XMMatrixInverse(nullptr, viewProj);
 
     SceneConstantBuffer cb = {};
     // HLSL constant-buffer matrices default to COLUMN-major.  We're a
-    // row-major shop (DirectXMath + row-vector HLSL `mul(vec, mat)`), so
-    // transpose at upload time and let HLSL's column-major reinterpretation
-    // hand us back the row-major matrix the shader wants.
-    XMStoreFloat4x4(&cb.projectionToWorld, XMMatrixTranspose(projToWorld));
-    XMStoreFloat4(&cb.cameraOriginAs, eye);
-    cb.asOriginWorld   = { 0, 0, 0, 0 };
+    // row-major shop, so transpose at upload time and let HLSL's
+    // column-major reinterpretation hand us back the row-major matrix the
+    // shader wants.
+    XMStoreFloat4x4(&cb.projectionToWorld, XMMatrixTranspose(projToAs));
+    XMStoreFloat4(&cb.cameraOriginAs, eyeAs);
+    cb.asOriginWorld   = { m_asOrigin.x, m_asOrigin.y, m_asOrigin.z, 0 };
     cb.lightDirAndPad  = { 0.5f, 0.8f, 0.3f, 0 };
     cb.missColorAndTime = { 0.02f, 0.04f, 0.06f, (float)tsec };
 
@@ -509,6 +542,7 @@ void PartitionedTlasSample::OnRender()
 
 void PartitionedTlasSample::DoRender()
 {
+    RecomputeAsOrigin();        // updates m_asOrigin BEFORE UpdateSceneConstantBuffer reads it
     UpdateSceneConstantBuffer();
 
     m_deviceResources->Prepare();   // cmd list reset; back buffer -> RENDER_TARGET
@@ -516,8 +550,70 @@ void PartitionedTlasSample::DoRender()
     auto cl2 = m_dxr2CommandList.Get();
 
     // ---- (P)TLAS build for this frame ----
+    //
+    // Both modes must produce hits in the same AS-space coord frame so the
+    // shader output is bit-for-bit identical:
+    //   * Partitioned (PTLAS):
+    //       - WRITE_INSTANCE once at init with PARTITION-LOCAL transforms
+    //         (instance translation = ball_world - partition_home).
+    //       - TRANSLATE_PARTITION every frame: translation[p] = home[p] - as_origin.
+    //       - Per-frame work: ~partitionCount partition translations.  The
+    //         partition-local instance writes never repeat.
+    //   * Traditional (DXR1 TLAS):
+    //       - No partition concept, so we have to bake (world - as_origin)
+    //         into every instance transform and re-write all of them each
+    //         frame.  This is exactly the cost PTLAS sidesteps -- 5832
+    //         instance writes vs 216 partition translations in this scene.
+    using namespace DirectX;
+
     m_tlas->BeginFrame();
-    m_tlas->WriteInstances(m_sceneInstances.data(), (UINT)m_sceneInstances.size());
+    if (m_tlasMode == TlasMode::Partitioned)
+    {
+        if (!m_ptlasInitialWriteDone)
+        {
+            // One-shot: write all instances with partition-local transforms.
+            std::vector<SceneInstance> local(m_sceneInstances.size());
+            for (size_t i = 0; i < m_sceneInstances.size(); ++i)
+            {
+                local[i] = m_sceneInstances[i];
+                const XMFLOAT3& home = m_partitionHomes[local[i].partitionIndex];
+                // SceneInstance.transform is transposed (DXR 3x4 layout):
+                // translation lives at m[0][3], m[1][3], m[2][3].
+                local[i].transform.m[0][3] -= home.x;
+                local[i].transform.m[1][3] -= home.y;
+                local[i].transform.m[2][3] -= home.z;
+            }
+            m_tlas->WriteInstances(local.data(), (UINT)local.size());
+            m_ptlasInitialWriteDone = true;
+            SampleLog::LogF(L"[ptlas] initial WRITE_INSTANCE pass: %u instances (partition-local transforms)\n",
+                            (unsigned)local.size());
+        }
+
+        // Per-frame: TRANSLATE_PARTITION for every partition.
+        std::vector<ITlasSystem::PartitionTranslate> pts(m_partitionHomes.size());
+        for (size_t p = 0; p < m_partitionHomes.size(); ++p)
+        {
+            pts[p].partitionIndex = (UINT)p;
+            pts[p].translation[0] = m_partitionHomes[p].x - m_asOrigin.x;
+            pts[p].translation[1] = m_partitionHomes[p].y - m_asOrigin.y;
+            pts[p].translation[2] = m_partitionHomes[p].z - m_asOrigin.z;
+        }
+        m_tlas->TranslatePartitions(pts.data(), (UINT)pts.size());
+    }
+    else
+    {
+        // Traditional: rebuild instance descs with translation baked
+        // (world - as_origin) so we trace in the same AS-space frame.
+        std::vector<SceneInstance> adj(m_sceneInstances.size());
+        for (size_t i = 0; i < m_sceneInstances.size(); ++i)
+        {
+            adj[i] = m_sceneInstances[i];
+            adj[i].transform.m[0][3] -= m_asOrigin.x;
+            adj[i].transform.m[1][3] -= m_asOrigin.y;
+            adj[i].transform.m[2][3] -= m_asOrigin.z;
+        }
+        m_tlas->WriteInstances(adj.data(), (UINT)adj.size());
+    }
     m_tlas->Build(cl, cl2);
 
     // Per-frame stats (cheap; once per frame).  GPU timestamps land in a
@@ -527,13 +623,14 @@ void PartitionedTlasSample::DoRender()
     if ((m_framesRendered % 60) == 0)
     {
         auto fs = m_tlas->GetLastFrameStats();
-        SampleLog::LogF(L"[frame %llu] tlas=%s instances=%u parts=%u "
-                        L"result=%llu scratch=%llu\n",
+        SampleLog::LogF(L"[frame %llu] tlas=%s instances=%u part_translates=%u "
+                        L"result=%llu scratch=%llu  as_origin=(%.2f, %.2f, %.2f)\n",
                         (unsigned long long)m_framesRendered,
                         m_tlas->ModeName(),
                         fs.instancesSubmitted, fs.partitionsTouched,
                         (unsigned long long)fs.resultBytes,
-                        (unsigned long long)fs.scratchBytes);
+                        (unsigned long long)fs.scratchBytes,
+                        m_asOrigin.x, m_asOrigin.y, m_asOrigin.z);
     }
 
     // ---- Bind RT pipeline + descriptors ----

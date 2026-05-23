@@ -40,6 +40,49 @@ ExecuteIndirectRTASOperations.
   a region boundary get **WRITE_INSTANCE**'d into the new partition.
 - **Camera follows flock** automatically; a debug free-cam toggle later.
 
+## Camera-anchored coordinate system (drives TRANSLATE_PARTITION usage)
+
+The sample uses partition translation as the **primary** mechanism for keeping
+acceleration-structure-side world coordinates near origin while the camera flies
+through the grid. This both motivates `ENABLE_PARTITION_TRANSLATION` honestly
+(matches the spec's stated use case in `Partition translation`) and naturally
+exercises `TRANSLATE_PARTITION` on every partition every frame.
+
+Convention:
+
+- Every partition has a constant **`home_world_pos`** (grid cell center for
+  spatial partitions; flock center for the global partition).
+- Each instance's stored `Transform` is **partition-local** — i.e. ball offset
+  from its partition's `home_world_pos`. These local coordinates stay within a
+  single cell's extents, so the floats used at WRITE_INSTANCE time are small.
+- Per frame we pick an **`as_origin`** = (optionally quantized) camera position.
+- Per frame we set `partition_translation = home_world_pos − as_origin` for
+  every partition, via a single TRANSLATE_PARTITION op containing
+  `partition_count + 1` arg entries (one per spatial partition + the global one).
+  Args are produced by a tiny CS reading `home_world_pos` and `as_origin`.
+- Ray generation shader subtracts `as_origin` from the camera ray origin so
+  traversal happens in AS-origin-centered coordinates. World positions seen by
+  the closest-hit are `as_origin + hit_pos_in_as`.
+
+Consequences this design wants the reader to see:
+
+- TRANSLATE_PARTITION is exercised across the **entire** partition set every
+  frame — the demo doesn't have to invent a contrived single-partition wobble.
+- WRITE_INSTANCE transforms are always small. When a ball transfers across a
+  partition boundary, its new stored transform = (old_world_pos − new_partition_home),
+  computed in the partition-transfer CS without ever needing large world coords.
+- Displacement field acts in world space conceptually but the stored result is
+  always converted to the local frame of whichever partition the ball ends up in.
+- The global partition gets the same treatment — its translation tracks the flock
+  center relative to `as_origin`, keeping flock-instance transforms small even as
+  the flock crosses the world.
+
+Quantization knob (later refinement, not initial milestone): snap `as_origin` to
+a grid (e.g. partition step) so TRANSLATE_PARTITION only fires when the camera
+crosses a snap boundary. Demo first uses per-frame updates because the
+demonstration value of seeing the op fire every frame outweighs the
+micro-efficiency of throttling.
+
 ## Subsystems & factoring
 
 ```

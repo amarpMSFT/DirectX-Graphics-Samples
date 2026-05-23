@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  D3D12RaytracingPartitionedTlas sample.
+
+  This project intentionally diverges from the sibling raytracing samples in
+  that it does NOT use the Microsoft.Direct3D.D3D12 / Microsoft.Direct3D.DXC
+  NuGet packages. Both runtime + compiler components are sourced from a local
+  experimental D3D12 build via ExperimentalD3D12.props (see that file for what
+  it expects).
+
+  Skeleton (milestone 1) intentionally has NO HLSL custom-build steps and NO
+  DirectXTK12 dependency.  HLSL custom builds get added back when the
+  raytracing pipeline lands; DirectXTK12 gets added back when on-screen
+  overlay UI is wired in (also re-include the SpriteBatch/SpriteFont headers
+  in stdafx.h at that point).
+
+  Once a real Agility SDK NuGet package shipping DXR2 is available, switch
+  this project back to the standard NuGet pattern (see e.g.
+  D3D12RaytracingOpacityMicromaps.vcxproj in the d:\samples authored tree).
+-->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3BD4E81C-08EF-4AAA-B09C-6742E61897CD}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>D3D12Raytracing</RootNamespace>
+    <ProjectName>D3D12RaytracingPartitionedTlas</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- Pull in the experimental D3D12 runtime + DXC compiler hookup. -->
+  <Import Project="ExperimentalD3D12.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</LinkIncremental>
+    <LinkIncremental Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkIncremental>
+    <OutDir>bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">WIN32;_DEBUG;_WINDOWS;SAMPLE_LOG_DEFAULT_NAME=L"D3D12RaytracingPartitionedTlas.log";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">WIN32;NDEBUG;_WINDOWS;SAMPLE_LOG_DEFAULT_NAME=L"D3D12RaytracingPartitionedTlas.log";%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- ..\  -> picks up d3dx12.h from the parent src/ dir (shared with the
+           other raytracing samples in this tree).
+           $(IntDir) -> picks up CompiledShaders\*.hlsl.h once HLSL custom-build
+           steps are added back in later milestones. -->
+      <AdditionalIncludeDirectories>..\;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <Optimization Condition="'$(Configuration)'=='Debug'">Disabled</Optimization>
+      <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+      <FunctionLevelLinking Condition="'$(Configuration)'=='Release'">true</FunctionLevelLinking>
+      <IntrinsicFunctions Condition="'$(Configuration)'=='Release'">true</IntrinsicFunctions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
+      <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <!-- Delay-load d3d12 so we can run on machines without it for graceful
+           error reporting (matches sibling samples). -->
+      <DelayLoadDLLs>d3d12.dll</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="Main.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="DeviceResources.cpp" />
+    <ClCompile Include="Win32Application.cpp" />
+    <ClCompile Include="DXSample.cpp" />
+    <ClCompile Include="PartitionedTlasSample.cpp" />
+    <ClCompile Include="stdafx.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="DeviceResources.h" />
+    <ClInclude Include="DirectXRaytracingHelper.h" />
+    <ClInclude Include="DXSample.h" />
+    <ClInclude Include="DXSampleHelper.h" />
+    <ClInclude Include="HlslCompat.h" />
+    <ClInclude Include="SampleLog.h" />
+    <ClInclude Include="StepTimer.h" />
+    <ClInclude Include="Win32Application.h" />
+    <ClInclude Include="PartitionedTlasSample.h" />
+    <ClInclude Include="stdafx.h" />
+  </ItemGroup>
+
+  <!-- Loose files visible in IDE. -->
+  <ItemGroup>
+    <None Include="ExperimentalD3D12.props" />
+    <None Include="docs\design.md" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

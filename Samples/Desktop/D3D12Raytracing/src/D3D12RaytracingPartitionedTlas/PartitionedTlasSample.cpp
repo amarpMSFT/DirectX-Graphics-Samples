@@ -209,12 +209,22 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // waits at the end of init.
     m_ball.Initialize(m_dxrDevice.Get(), m_dxrCommandList.Get(), /*subdiv*/ 2);
 
-    // Pick the active TLAS system.
+    // Compute the static scene instance list.  Milestone 2b: every ball is
+    // a static instance referencing the single shared BLAS; partition index
+    // is the linear index of the partition cell containing the ball.
+    BuildSceneInstances();
+    SampleLog::LogF(L"[scene] grid=%ux%ux%u  ballsPerSide=%u  total balls=%u "
+                    L"partitions=%u  perPartMax=%u\n",
+                    m_scene.gridX, m_scene.gridY, m_scene.gridZ,
+                    m_scene.ballsPerSide, m_scene.TotalBalls(),
+                    m_scene.Partitions(), m_scene.BallsPerPartition());
+
+    // Pick the active TLAS system, sized for the scene.
     ITlasSystem::InitDesc tlasInit = {};
-    tlasInit.maxInstances                  = 1;     // milestone 2a: one ball
-    tlasInit.maxPartitions                 = 1;
-    tlasInit.maxInstancesPerPartition      = 1;
-    tlasInit.maxInstancesInGlobalPartition = 1;
+    tlasInit.maxInstances                  = m_scene.TotalBalls();
+    tlasInit.maxPartitions                 = m_scene.Partitions();
+    tlasInit.maxInstancesPerPartition      = m_scene.BallsPerPartition();
+    tlasInit.maxInstancesInGlobalPartition = 0;     // reserved for the flock in phase 3
     if (m_tlasMode == TlasMode::Partitioned)
         m_tlas = std::make_unique<PtlasSystem>();
     else
@@ -391,8 +401,43 @@ void PartitionedTlasSample::CreateShaderTable()
 }
 
 // =============================================================================
-// Per-frame
+// Scene instances (milestone 2b: static, built once)
 // =============================================================================
+void PartitionedTlasSample::BuildSceneInstances()
+{
+    using namespace DirectX;
+    m_sceneInstances.clear();
+    m_sceneInstances.reserve(m_scene.TotalBalls());
+    const D3D12_GPU_VIRTUAL_ADDRESS blas = m_ball.BlasGpuVa();
+    for (uint32_t pk = 0; pk < m_scene.gridZ; ++pk)
+    for (uint32_t pj = 0; pj < m_scene.gridY; ++pj)
+    for (uint32_t pi = 0; pi < m_scene.gridX; ++pi)
+    {
+        const uint32_t partIdx = m_scene.PartitionIndex(pi, pj, pk);
+        for (uint32_t bk = 0; bk < m_scene.ballsPerSide; ++bk)
+        for (uint32_t bj = 0; bj < m_scene.ballsPerSide; ++bj)
+        for (uint32_t bi = 0; bi < m_scene.ballsPerSide; ++bi)
+        {
+            DirectX::XMFLOAT3 pos = m_scene.BallWorldPos(pi, pj, pk, bi, bj, bk);
+            // Build object-to-world as Scale * Translation in DirectXMath's
+            // row-vector convention.  THEN transpose: DXR's 3x4 instance
+            // transform expects translation in the LAST COLUMN of each row
+            // (column-vector convention), whereas DirectXMath puts it in
+            // the last ROW.  Storing the transpose means downstream copies
+            // (TraditionalTlasSystem and PtlasSystem) can just take rows
+            // 0..2 verbatim.
+            XMMATRIX m = XMMatrixScaling(m_scene.ballScale, m_scene.ballScale, m_scene.ballScale)
+                       * XMMatrixTranslation(pos.x, pos.y, pos.z);
+            SceneInstance inst = {};
+            XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(m));
+            inst.blasGva        = blas;
+            inst.instanceID     = m_scene.BallIndex(pi, pj, pk, bi, bj, bk);
+            inst.instanceMask   = 0xFF;
+            inst.partitionIndex = partIdx;
+            m_sceneInstances.push_back(inst);
+        }
+    }
+}
 
 void PartitionedTlasSample::UpdateSceneConstantBuffer()
 {
@@ -401,16 +446,20 @@ void PartitionedTlasSample::UpdateSceneConstantBuffer()
     const double tsec = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - m_startTime).count();
 
-    // Orbit camera around origin at radius 4, height 1.5.  In milestone 2a
-    // the ball sits at the origin so we look at (0,0,0).
-    const float angle  = (float)(tsec * 0.35);
-    const float r      = 4.0f;
-    XMVECTOR eye    = XMVectorSet(r * sinf(angle), 1.5f, r * cosf(angle), 1);
+    // Orbit camera framing the whole grid.  Look at scene center (origin
+    // because BuildSceneInstances centers the lattice).
+    auto sceneSize = m_scene.SceneSize();
+    const float diag = sqrtf(sceneSize.x*sceneSize.x + sceneSize.y*sceneSize.y + sceneSize.z*sceneSize.z);
+    const float r     = diag * 1.2f;       // pull back proportional to scene
+    const float h     = diag * 0.35f;
+    const float angle = (float)(tsec * 0.20);
+
+    XMVECTOR eye    = XMVectorSet(r * sinf(angle), h, r * cosf(angle), 1);
     XMVECTOR target = XMVectorSet(0, 0, 0, 1);
     XMVECTOR up     = XMVectorSet(0, 1, 0, 0);
     XMMATRIX view = XMMatrixLookAtRH(eye, target, up);
     const float aspect = (float)m_width / (float)m_height;
-    XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, aspect, 0.1f, 200.0f);
+    XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, aspect, 0.1f, 1000.0f);
 
     // projectionToWorld is (view * proj)^-1.  We're row-vector-times-matrix
     // (HLSL convention), so the combined transform is view * proj.
@@ -468,21 +517,24 @@ void PartitionedTlasSample::DoRender()
 
     // ---- (P)TLAS build for this frame ----
     m_tlas->BeginFrame();
-    {
-        SceneInstance inst = {};
-        // Identity transform: ball at origin.
-        XMMATRIX id = XMMatrixIdentity();
-        XMStoreFloat4x4(&inst.transform, id);
-        inst.blasGva        = m_ball.BlasGpuVa();
-        inst.instanceID     = 0;
-        inst.instanceMask   = 0xFF;
-        // Milestone 2a uses partition 0 (a regular spatial partition).
-        // Phase 2b grows to a partition grid; the flock will live in the
-        // global partition (partitionIndex = 0xFFFFFFFF) in phase 3.
-        inst.partitionIndex = 0;
-        m_tlas->WriteInstances(&inst, 1);
-    }
+    m_tlas->WriteInstances(m_sceneInstances.data(), (UINT)m_sceneInstances.size());
     m_tlas->Build(cl, cl2);
+
+    // Per-frame stats (cheap; once per frame).  GPU timestamps land in a
+    // later milestone -- for now we log instance/partition counts and
+    // result/scratch budgets straight off the active TLAS system so the
+    // headless log shows the workload size.
+    if ((m_framesRendered % 60) == 0)
+    {
+        auto fs = m_tlas->GetLastFrameStats();
+        SampleLog::LogF(L"[frame %llu] tlas=%s instances=%u parts=%u "
+                        L"result=%llu scratch=%llu\n",
+                        (unsigned long long)m_framesRendered,
+                        m_tlas->ModeName(),
+                        fs.instancesSubmitted, fs.partitionsTouched,
+                        (unsigned long long)fs.resultBytes,
+                        (unsigned long long)fs.scratchBytes);
+    }
 
     // ---- Bind RT pipeline + descriptors ----
     ID3D12DescriptorHeap* heaps[] = { m_descHeap.Get() };

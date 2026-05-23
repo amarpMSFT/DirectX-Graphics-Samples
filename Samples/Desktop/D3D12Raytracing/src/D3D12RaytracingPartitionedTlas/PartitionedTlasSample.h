@@ -15,9 +15,11 @@
 #include "StepTimer.h"
 #include "ITlasSystem.h"
 #include "BallAssets.h"
+#include "SceneLayout.h"
 
 #include <string>
 #include <memory>
+#include <vector>
 
 // PartitionedTlasSample
 // ---------------------------------------------------------------------------
@@ -72,6 +74,12 @@ private:
 
     // ---- Static assets ----
     BallAssets m_ball;
+
+    // ---- Scene layout (grid of partitions; each partition holds a sub-grid
+    // of balls; balls are equally spaced across the whole lattice). ----
+    SceneLayout m_scene;
+    std::vector<SceneInstance> m_sceneInstances;   // built once at init for milestone 2b
+    void BuildSceneInstances();
 
     // ---- RT pipeline + shader table + bindings ----
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;

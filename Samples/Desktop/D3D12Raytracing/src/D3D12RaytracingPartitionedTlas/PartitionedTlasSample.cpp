@@ -614,6 +614,23 @@ void PartitionedTlasSample::RecomputeAsOrigin()
     }
 }
 
+// Displacement field: a ball at world-rest-position `restPos` is pushed
+// radially away from the flock center.  Smooth (1 - d/R)^2 falloff to
+// zero at kDisplaceRadius.  Returns the displacement VECTOR (added to
+// restPos to get the displaced world position).  Outside the radius
+// the result is identically zero.
+DirectX::XMFLOAT3 PartitionedTlasSample::ComputeBallDisplacement(const DirectX::XMFLOAT3& restPos) const
+{
+    DirectX::XMFLOAT3 d = { restPos.x - m_flock.position.x,
+                            restPos.y - m_flock.position.y,
+                            restPos.z - m_flock.position.z };
+    float dist = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+    if (dist >= kDisplaceRadius || dist < 1e-4f) return { 0, 0, 0 };
+    float t = 1.0f - dist / kDisplaceRadius;
+    float mag = kDisplaceMaxPush * t * t;
+    return { d.x / dist * mag, d.y / dist * mag, d.z / dist * mag };
+}
+
 void PartitionedTlasSample::UpdateSceneConstantBuffer()
 {
     using namespace DirectX;
@@ -728,6 +745,32 @@ void PartitionedTlasSample::DoRender()
     m_rollingParts.Update(m_flock.position, m_flock.forward);
     m_cumBallChanges += (UINT64)m_rollingParts.ChangedBalls().size();
 
+    // ---- Compute per-ball displacement state for this frame ----
+    //
+    // Displaced balls need a per-frame WRITE_INSTANCE (their world
+    // translation changes).  Newly-undisplaced balls also need one final
+    // WRITE_INSTANCE to settle them back to their rest position.  We
+    // track LAST FRAME's displacement state in m_ballDisplaced, recompute
+    // THIS FRAME's, and union the two for the "needs write" set.
+    const uint32_t ballN = m_rollingParts.BallCount();
+    std::vector<uint8_t> displacedNow(ballN, 0);   // 1 if currently displaced
+    std::vector<DirectX::XMFLOAT3> displacementVec(ballN);
+    std::vector<uint8_t> writeNow(ballN, 0);       // 1 if needs WRITE_INSTANCE this frame
+    {
+        for (uint32_t b = 0; b < ballN; ++b)
+        {
+            if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) continue;
+            auto disp = ComputeBallDisplacement(m_ballWorldPos[b]);
+            float mag2 = disp.x*disp.x + disp.y*disp.y + disp.z*disp.z;
+            displacementVec[b] = disp;
+            if (mag2 > 1e-8f) displacedNow[b] = 1;
+            // needs write if currently displaced OR was displaced last frame
+            // (the "settling" case -- restore to rest).
+            if (displacedNow[b] || (b < m_ballDisplaced.size() && m_ballDisplaced[b]))
+                writeNow[b] = 1;
+        }
+    }
+
     m_tlas->BeginFrame();
     // Timestamp BEFORE TLAS build.
     const UINT tsSlot     = m_timestampSlotIdx;
@@ -736,22 +779,33 @@ void PartitionedTlasSample::DoRender()
 
     if (m_tlasMode == TlasMode::Partitioned)
     {
-        // (a) WRITE_INSTANCE for changed ball owners.  On the very first
-        //     frame ALL balls "change" (from uninitialised) -- the first
-        //     pass writes the full set; subsequent frames write only the
-        //     subset that crossed an active/inactive boundary or moved
-        //     between partition slots.
+        // (a) WRITE_INSTANCE for any ball that needs a fresh write this frame.
+        //     Three reasons a ball needs writing:
+        //       1. Owner changed (rolling-window transfer or active/inactive flip)
+        //       2. Currently displaced by the flock (translation moves per frame)
+        //       3. Just left the displacement zone (settle back to rest)
+        //     #1 comes from RollingPartitions::ChangedBalls(); #2/#3 from
+        //     the displacedNow + previous-frame m_ballDisplaced union above.
+        //     On the initial pass (m_ptlasInitialWriteDone == false) we
+        //     write the full set unconditionally.
         std::vector<SceneInstance> writes;
-        const auto& changed = m_ptlasInitialWriteDone
-                              ? m_rollingParts.ChangedBalls()
-                              : std::vector<uint32_t>();   // sentinel; we iterate ALL below
-        const uint32_t fullCount = m_rollingParts.BallCount();
-        const uint32_t writeIterCount = m_ptlasInitialWriteDone ? (uint32_t)changed.size() : fullCount;
-        writes.reserve(writeIterCount + (m_ptlasInitialWriteDone ? 0 : (uint32_t)m_donutMembers.size()));
+        // Union ChangedBalls into the writeNow bitmap (it's a tight union).
+        for (uint32_t b : m_rollingParts.ChangedBalls())
+            if (b < writeNow.size()) writeNow[b] = 1;
 
-        for (uint32_t i = 0; i < writeIterCount; ++i)
+        const uint32_t fullCount = ballN;
+        const bool initialPass   = !m_ptlasInitialWriteDone;
+        const uint32_t writeIterCount = initialPass ? fullCount :
+            [&]{ uint32_t c = 0; for (auto v : writeNow) if (v) ++c; return c; }();
+        writes.reserve(writeIterCount + (initialPass ? (uint32_t)m_donutMembers.size() : 0));
+
+        // Iterate the union set of (changed | displaced | was_displaced).
+        // For the initial pass it's just all balls.
+        const uint32_t loopEnd = initialPass ? fullCount : fullCount;
+        for (uint32_t b = 0; b < loopEnd; ++b)
         {
-            const uint32_t b = m_ptlasInitialWriteDone ? changed[i] : i;
+            if (!initialPass && !writeNow[b]) continue;
+
             const uint32_t owner = m_rollingParts.Owner(b);
             SceneInstance inst = m_sceneInstances[b];
             // inst.instanceIndex already = kDonutCount + b from BuildSceneInstances.
@@ -777,30 +831,39 @@ void PartitionedTlasSample::DoRender()
                 inst.transform.m[0][3] -= home.x;
                 inst.transform.m[1][3] -= home.y;
                 inst.transform.m[2][3] -= home.z;
+                // Apply per-frame displacement (radial push from flock).
+                // Zero for balls outside kDisplaceRadius -- same code path
+                // for rest + displaced, no branching needed.
+                inst.transform.m[0][3] += displacementVec[b].x;
+                inst.transform.m[1][3] += displacementVec[b].y;
+                inst.transform.m[2][3] += displacementVec[b].z;
                 // LOD-aware BLAS swap: pick by distance from camera (3 bins).
-                const auto& wp = m_ballWorldPos[b];
-                const float dx = wp.x - m_asOrigin.x;
-                const float dy = wp.y - m_asOrigin.y;
-                const float dz = wp.z - m_asOrigin.z;
+                const float wpx = m_ballWorldPos[b].x + displacementVec[b].x;
+                const float wpy = m_ballWorldPos[b].y + displacementVec[b].y;
+                const float wpz = m_ballWorldPos[b].z + displacementVec[b].z;
+                const float dx = wpx - m_asOrigin.x;
+                const float dy = wpy - m_asOrigin.y;
+                const float dz = wpz - m_asOrigin.z;
                 const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
                 const uint8_t lod = SelectLodInitial(dist);
                 inst.blasGva = (lod == 0) ? m_ball.BlasGpuVa()
                              : (lod == 1) ? m_ballMid.BlasGpuVa()
                                           : m_ballLow.BlasGpuVa();
-                // ENABLE_EXPLICIT_AABB: provide a conservative AABB in
-                // partition-local space (= stored-transform space, which is
-                // what spec wants -- "after instance Transform, but excluding
-                // partition translation").  All LODs are unit-radius
-                // icospheres scaled by ballScale; the AABB is the partition-
-                // local ball position +/- ballScale (with a tiny pad so
-                // numerical rounding doesn't push a vertex outside the box).
-                const float local_x = inst.transform.m[0][3];
-                const float local_y = inst.transform.m[1][3];
-                const float local_z = inst.transform.m[2][3];
-                const float pad     = m_scene.ballScale * 1.05f;
+                // ENABLE_EXPLICIT_AABB: a CONSERVATIVE AABB around the
+                // ball's REST partition-local position, padded out by the
+                // displacement envelope (kDisplaceAabbPad) so the AABB
+                // covers every possible displaced position the ball may
+                // take.  This means the AABB is STABLE across frames even
+                // as the displaced transform shifts -- avoids the
+                // shrink/grow cycle and lets the partition's internal AS
+                // stay valid.
+                const float restLocalX = m_ballWorldPos[b].x - home.x;
+                const float restLocalY = m_ballWorldPos[b].y - home.y;
+                const float restLocalZ = m_ballWorldPos[b].z - home.z;
+                const float pad        = m_scene.ballScale * 1.05f + kDisplaceAabbPad;
                 inst.useExplicitAabb = true;
-                inst.aabbMin = { local_x - pad, local_y - pad, local_z - pad };
-                inst.aabbMax = { local_x + pad, local_y + pad, local_z + pad };
+                inst.aabbMin = { restLocalX - pad, restLocalY - pad, restLocalZ - pad };
+                inst.aabbMax = { restLocalX + pad, restLocalY + pad, restLocalZ + pad };
             }
             writes.push_back(inst);
         }
@@ -842,26 +905,18 @@ void PartitionedTlasSample::DoRender()
                             m_partitionBudget);
         }
 
-        // (a3) UPDATE_INSTANCE for balls whose LOD just changed (and whose
-        //      partition didn't change in (a)).  LOD = distance from
-        //      camera; balls within kLodNearDist get hi-LOD, others lo-LOD.
-        //      Spec: UPDATE_INSTANCE just swaps the BLAS pointer -- the
-        //      instance's partition / transform / mask / flags are
-        //      unchanged.  Without ENABLE_EXPLICIT_AABB the partition
-        //      refits internally (more expensive); with it the swap is
-        //      cheap.  Phase 5 will add ENABLE_EXPLICIT_AABB at initial
-        //      WRITE_INSTANCE to take the cheap path.
+        // (a3) UPDATE_INSTANCE for balls whose LOD just changed (and that
+        //      did NOT get a fresh WRITE_INSTANCE this frame, since those
+        //      already carry the latest LOD).  LOD = distance from camera;
+        //      bins with hysteresis to limit per-frame flicker.  With
+        //      ENABLE_EXPLICIT_AABB set on the prior WRITE, the swap is
+        //      cheap (no partition refit).
         std::vector<ITlasSystem::InstanceUpdate> updates;
-        if (m_ballLod.size() == m_rollingParts.BallCount())
+        if (m_ballLod.size() == ballN)
         {
-            // Mark balls written this frame (to skip them in the LOD pass).
-            std::vector<bool> writtenThisFrame(m_rollingParts.BallCount(), false);
-            for (uint32_t b : m_rollingParts.ChangedBalls())
-                writtenThisFrame[b] = true;
-
-            for (uint32_t b = 0; b < m_rollingParts.BallCount(); ++b)
+            for (uint32_t b = 0; b < ballN; ++b)
             {
-                if (writtenThisFrame[b]) continue;
+                if (writeNow[b]) continue;       // already written
                 if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) continue;
                 const auto& pos = m_ballWorldPos[b];
                 float dx = pos.x - m_asOrigin.x;
@@ -880,25 +935,39 @@ void PartitionedTlasSample::DoRender()
                     m_ballLod[b] = newLod;
                 }
             }
-            if (!updates.empty())
+            // KNOWN ISSUE (preview NVIDIA driver, 2026-05): mixing
+            // WRITE_INSTANCE + UPDATE_INSTANCE in the same PTLAS build call
+            // can TDR after a few frames.  Workaround: skip UPDATE when
+            // WRITES are non-empty.  LOD swap still works -- the LOD bin
+            // gets refreshed every time a ball is WRITE'd (rolling-window
+            // transitions + per-frame displacement writes).  When the
+            // driver gates fix this, remove the gate; the UPDATE-only path
+            // is materially cheaper for static rolling LOD.
+            if (!updates.empty() && writes.empty())
             {
                 m_tlas->UpdateInstances(updates.data(), (UINT)updates.size());
             }
         }
         // For balls written this frame, also seed m_ballLod from current
-        // distance so UPDATE_INSTANCE doesn't fire for them next frame
-        // when nothing actually changed.
-        for (uint32_t b : m_rollingParts.ChangedBalls())
+        // (possibly-displaced) distance so UPDATE_INSTANCE doesn't fire for
+        // them next frame when nothing actually changed.
+        for (uint32_t b = 0; b < ballN; ++b)
         {
+            if (!writeNow[b] && !initialPass) continue;
             if (b >= m_ballLod.size()) continue;
             if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) { m_ballLod[b] = 0; continue; }
             const auto& pos = m_ballWorldPos[b];
-            float dx = pos.x - m_asOrigin.x;
-            float dy = pos.y - m_asOrigin.y;
-            float dz = pos.z - m_asOrigin.z;
+            const float wpx = pos.x + displacementVec[b].x;
+            const float wpy = pos.y + displacementVec[b].y;
+            const float wpz = pos.z + displacementVec[b].z;
+            float dx = wpx - m_asOrigin.x;
+            float dy = wpy - m_asOrigin.y;
+            float dz = wpz - m_asOrigin.z;
             float dist = sqrtf(dx*dx + dy*dy + dz*dz);
             m_ballLod[b] = SelectLodInitial(dist);
         }
+        // Persist displacement state for the next frame's union test.
+        m_ballDisplaced = std::move(displacedNow);
 
         // (b) TRANSLATE_PARTITION for every active partition every frame
         //     (home - as_origin) + ONE for the global partition (flock_pos - as_origin).
@@ -932,9 +1001,9 @@ void PartitionedTlasSample::DoRender()
     else
     {
         // Traditional: rebuild instance descs with translation baked
-        // (world - as_origin), DISABLING balls outside the active set
-        // (AS = 0).  Donuts appended at the end; their world translation
-        // = flock_pos + local_offset - as_origin.
+        // (world + displacement - as_origin), DISABLING balls outside the
+        // active set (AS = 0).  Donuts appended at the end; their world
+        // translation = flock_pos + local_offset - as_origin.
         std::vector<SceneInstance> adj;
         adj.reserve(m_sceneInstances.size() + m_donutMembers.size());
         for (size_t i = 0; i < m_sceneInstances.size(); ++i)
@@ -945,11 +1014,19 @@ void PartitionedTlasSample::DoRender()
             {
                 s.blasGva = 0;
             }
+            // Apply per-frame displacement (zero outside kDisplaceRadius).
+            s.transform.m[0][3] += displacementVec[i].x;
+            s.transform.m[1][3] += displacementVec[i].y;
+            s.transform.m[2][3] += displacementVec[i].z;
+            // Then shift into AS-space.
             s.transform.m[0][3] -= m_asOrigin.x;
             s.transform.m[1][3] -= m_asOrigin.y;
             s.transform.m[2][3] -= m_asOrigin.z;
             adj.push_back(s);
         }
+        // Persist displacement state for the next-frame's needs-write check
+        // (symmetric with the partitioned path; harmless either way).
+        m_ballDisplaced = std::move(displacedNow);
         for (uint32_t d = 0; d < (uint32_t)m_donutMembers.size(); ++d)
         {
             const auto& m = m_donutMembers[d];

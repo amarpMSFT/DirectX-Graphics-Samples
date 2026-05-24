@@ -99,13 +99,26 @@ private:
     // ---- Scene layout (grid of partitions; each partition holds a sub-grid
     // of balls; balls are equally spaced across the whole lattice). ----
     SceneLayout m_scene;
-    std::vector<SceneInstance>      m_sceneInstances;          // world-space (built once)
-    std::vector<DirectX::XMFLOAT3>  m_ballWorldPos;            // ball positions only (fed to RollingPartitions)
-    std::vector<uint8_t>            m_ballLod;                 // per-ball current LOD (0=hi, 1=lo); reset on init/resize
+    std::vector<SceneInstance>      m_sceneInstances;          // world-space rest transforms (built once)
+    std::vector<DirectX::XMFLOAT3>  m_ballWorldPos;            // ball REST positions (fed to RollingPartitions)
+    std::vector<uint8_t>            m_ballLod;                 // per-ball current LOD (0=hi, 1=mid, 2=lo)
+    std::vector<uint8_t>            m_ballDisplaced;           // per-ball: displaced THIS frame? (set in DoRender)
     bool                            m_ptlasInitialWriteDone = false;
     DirectX::XMFLOAT3               m_asOrigin = { 0, 0, 0 };  // current frame's AS-space origin
     void BuildSceneInstances();
     void RecomputeAsOrigin();
+    // Compute the radial-push displacement applied at a ball's rest position
+    // given the flock center.  Returns zero outside kDisplaceRadius.
+    DirectX::XMFLOAT3 ComputeBallDisplacement(const DirectX::XMFLOAT3& restPos) const;
+
+    // Displacement parameters.  Smooth radial falloff: max push at
+    // distance 0, zero push beyond kDisplaceRadius.
+    static constexpr float kDisplaceRadius   = 3.0f;
+    static constexpr float kDisplaceMaxPush  = 0.85f;
+    // Conservative AABB pad applied during WRITE_INSTANCE for a ball that
+    // CAN be displaced -- the AABB encompasses the full displacement
+    // envelope so subsequent UPDATE_INSTANCE/UPDATE_INSTANCE remains cheap.
+    static constexpr float kDisplaceAabbPad  = kDisplaceMaxPush + 0.05f;
 
     // LOD thresholds.  Three bins (hi/mid/lo) selected by distance from
     // camera, with hysteresis to prevent per-frame flicker as a ball sits

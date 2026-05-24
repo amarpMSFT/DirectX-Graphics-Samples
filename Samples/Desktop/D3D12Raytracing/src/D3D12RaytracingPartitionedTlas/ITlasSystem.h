@@ -47,6 +47,19 @@ struct SceneInstance
     UINT contributionToHitGroupIndex;  // selects which hit-group record runs at this
                                        // instance's hits.  0 = HitGroup_Ball, 1 = HitGroup_Donut
                                        // in this sample.  See Raytracing.hlsl shader-table layout.
+
+    // ---- Optional ENABLE_EXPLICIT_AABB (PTLAS-only) ----
+    // When set, the PTLAS WRITE_INSTANCE op gets the
+    // D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_ENABLE_EXPLICIT_AABB flag and
+    // the explicit AABB is provided to bound all future LOD/cluster updates.
+    // This lets subsequent UPDATE_INSTANCE calls (LOD swap, cluster-template
+    // re-instantiation) take the CHEAP path -- no partition-internal refit.
+    // Without this flag the partition refits to the new BLAS bounds on
+    // every UPDATE_INSTANCE (per spec, "more expensive").  Traditional TLAS
+    // ignores both fields.
+    bool useExplicitAabb;
+    DirectX::XMFLOAT3 aabbMin;
+    DirectX::XMFLOAT3 aabbMax;
 };
 
 class ITlasSystem

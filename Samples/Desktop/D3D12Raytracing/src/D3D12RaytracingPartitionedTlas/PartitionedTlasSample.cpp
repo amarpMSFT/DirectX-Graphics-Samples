@@ -787,6 +787,20 @@ void PartitionedTlasSample::DoRender()
                 inst.blasGva = (lod == 0) ? m_ball.BlasGpuVa()
                              : (lod == 1) ? m_ballMid.BlasGpuVa()
                                           : m_ballLow.BlasGpuVa();
+                // ENABLE_EXPLICIT_AABB: provide a conservative AABB in
+                // partition-local space (= stored-transform space, which is
+                // what spec wants -- "after instance Transform, but excluding
+                // partition translation").  All LODs are unit-radius
+                // icospheres scaled by ballScale; the AABB is the partition-
+                // local ball position +/- ballScale (with a tiny pad so
+                // numerical rounding doesn't push a vertex outside the box).
+                const float local_x = inst.transform.m[0][3];
+                const float local_y = inst.transform.m[1][3];
+                const float local_z = inst.transform.m[2][3];
+                const float pad     = m_scene.ballScale * 1.05f;
+                inst.useExplicitAabb = true;
+                inst.aabbMin = { local_x - pad, local_y - pad, local_z - pad };
+                inst.aabbMax = { local_x + pad, local_y + pad, local_z + pad };
             }
             writes.push_back(inst);
         }

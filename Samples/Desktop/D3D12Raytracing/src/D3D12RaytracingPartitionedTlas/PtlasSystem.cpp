@@ -186,11 +186,25 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
         a.InstanceID                          = s.instanceID;
         a.InstanceMask                        = s.instanceMask;
         a.InstanceContributionToHitGroupIndex = s.contributionToHitGroupIndex;
-        a.InstanceFlags                       = D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_NONE;
+        a.InstanceFlags                       = s.useExplicitAabb
+            ? D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_ENABLE_EXPLICIT_AABB
+            : D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_NONE;
         a.AccelerationStructure               = s.blasGva;
         a.InstanceIndex                       = s.instanceIndex;
         a.PartitionIndex                      = s.partitionIndex;
-        a.ExplicitAABB                        = {};   // not used (flag not set)
+        if (s.useExplicitAabb)
+        {
+            a.ExplicitAABB.MinX = s.aabbMin.x;
+            a.ExplicitAABB.MinY = s.aabbMin.y;
+            a.ExplicitAABB.MinZ = s.aabbMin.z;
+            a.ExplicitAABB.MaxX = s.aabbMax.x;
+            a.ExplicitAABB.MaxY = s.aabbMax.y;
+            a.ExplicitAABB.MaxZ = s.aabbMax.z;
+        }
+        else
+        {
+            a.ExplicitAABB = {};
+        }
     }
 
     constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS);

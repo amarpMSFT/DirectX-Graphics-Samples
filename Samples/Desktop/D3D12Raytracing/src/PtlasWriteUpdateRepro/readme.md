@@ -1,23 +1,59 @@
 # PtlasWriteUpdateRepro
 
-Minimal D3D12 DXR2 repro: a PTLAS build call that contains both a
-`WRITE_INSTANCE` op and an `UPDATE_INSTANCE` op (on **disjoint** instance
-indices) TDRs the GPU on the preview NVIDIA driver.  Repros on **frame 1-2**
-with **4 instances, 1 partition** as the only PTLAS work in the call --
-no DispatchRays, no TRANSLATE_PARTITION, no `ENABLE_EXPLICIT_AABB`, no
-shaders or pipeline state in the program at all.
+Minimal D3D12 DXR2 repro: a PTLAS `ExecuteIndirectRTASOperations` call that
+contains BOTH a `WRITE_INSTANCE` op AND an `UPDATE_INSTANCE` op TDRs the GPU
+on the preview NVIDIA driver -- **specifically when the WRITE's
+`InstanceIndex` is non-zero AND the UPDATE's `InstanceIndex` is non-zero**.
+
+If either op targets `InstanceIndex = 0` the build is clean.
 
 ## TL;DR
 
 ```
-# REPROS (TDR within 1-2 frames):
-PtlasWriteUpdateRepro.exe
+# REPROS (TDR on frame 1):
+PtlasWriteUpdateRepro.exe                                  # W=1 U=2 (default)
+PtlasWriteUpdateRepro.exe --write 1 --update 3 --instances 4
+PtlasWriteUpdateRepro.exe --write 2 --update 3 --instances 4
 
 # CLEAN baselines (no TDR for 30 frames):
-PtlasWriteUpdateRepro.exe --no-update             # WRITE_INSTANCE only
-PtlasWriteUpdateRepro.exe --no-write              # UPDATE_INSTANCE only
-PtlasWriteUpdateRepro.exe --use-warp              # same EXE on WARP
+PtlasWriteUpdateRepro.exe --write 0 --update 1             # W targets InstanceIndex 0
+PtlasWriteUpdateRepro.exe --write 1 --update 0             # U targets InstanceIndex 0
+PtlasWriteUpdateRepro.exe --no-update                      # WRITE_INSTANCE only
+PtlasWriteUpdateRepro.exe --no-write                       # UPDATE_INSTANCE only
+PtlasWriteUpdateRepro.exe --use-warp                       # same EXE on WARP
 ```
+
+## The (W, U) bisect grid
+
+`--frames 15`, 4 instances, 1 partition, single BLAS shared by WRITE+UPDATE,
+no DispatchRays, no TRANSLATE, no `ENABLE_EXPLICIT_AABB`:
+
+```
+       U=0   U=1   U=2   U=3
+W=0     -    OK    OK    OK
+W=1    OK     -    TDR   TDR
+W=2    OK    TDR    -    TDR
+W=3    OK    TDR   TDR    -
+```
+
+**Rule: TDR iff `WRITE.InstanceIndex != 0` AND `UPDATE.InstanceIndex != 0`.**
+The driver's PTLAS update path appears to behave differently when either op
+references `InstanceIndex = 0`.  The very narrow `(W>0, U>0)` region is the
+entire bug.
+
+## Other knobs that DON'T affect the bug (all confirmed via bisect)
+
+| Knob                                         | Notes |
+| -------------------------------------------- | ----- |
+| `TRANSLATE_PARTITION` op present / not       | TDR either way |
+| `DispatchRays` consumer present / not        | TDR either way (build alone TDRs) |
+| `ENABLE_EXPLICIT_AABB` on the WRITE arg     | TDR either way |
+| `ENABLE_PARTITION_TRANSLATION` in inputs flags | TDR either way |
+| Partition count = 1, 2, 4                   | TDR either way |
+| Instance count = 3, 4, 16                   | TDR (min is 3, so W=1 U=2 fits) |
+| `D3D12_RAYTRACING_INSTANCE_FLAG_*` on writes | TDR either way (tested NONE + FORCE_OPAQUE) |
+| Same vs different BLAS pointer in W vs U    | TDR either way |
+| Same vs varying transform per frame         | TDR either way |
 
 ## Repro environment
 
@@ -26,52 +62,32 @@ PtlasWriteUpdateRepro.exe --use-warp              # same EXE on WARP
 - Windows 11
 - D3D12 SDK = 721 (experimental D3D12Core.dll)
 - DXR2 cluster + PTLAS experimental features enabled
-- Verified clean on WARP (Microsoft Basic Render Driver)
-- Verified spec-compliant: the public DXR2 conformance test
-  `IndirectBuild.cpp` exercises the same WRITE+UPDATE-on-disjoint-instances
-  pattern by default (both `DisablePartitionUpdateInstanceUnlessForced` and
-  `DisablePartitionWriteInstanceUnlessForced` default to `false`).
+- Verified clean on WARP (Microsoft Basic Render Driver) with the same EXE
+- Verified spec-compliant: `IndirectBuild.cpp` conformance test exercises
+  mixed WRITE+UPDATE-on-disjoint-instances by default and passes on the
+  same driver (just happens to often touch `InstanceIndex = 0` by chance,
+  not deterministically hitting the bug).
 
-## What it does
+## What the program does
 
 The single source file (~440 LOC, no shaders, no pipeline state, no
 DispatchRays) does:
 
-  1. Build two trivial 1-triangle BLASes (so we have two GPUVAs to alternate).
-  2. Create a PTLAS with `InstanceCount = 4`, `PartitionCount = 1`,
-     `Flags = NONE` (no global partition, no partition translation).
-  3. Initial `WRITE_INSTANCE` pass: populate all 4 instances.
-  4. Per frame, call `ExecuteIndirectRTASOperations` once with TWO ops in
-     the operation array:
-       - `WRITE_INSTANCE` × 1 -- args reference instance #i
-       - `UPDATE_INSTANCE` × 1 -- args reference instance #j  (i ≠ j)
-     Each op writes one distinct `InstanceIndex`.  The op order is
-     `WRITE_INSTANCE` first then `UPDATE_INSTANCE`.
-  5. Flush + wait fence.
+1. Build one trivial 1-triangle BLAS.
+2. Create a PTLAS with `InstanceCount = 3`, `PartitionCount = 1`,
+   `Flags = NONE`.
+3. Initial pass: a `WRITE_INSTANCE` op that populates all 3 instances.
+4. Per frame, call `ExecuteIndirectRTASOperations` once with TWO ops:
+     - `WRITE_INSTANCE`  (InstanceIndex = 1, by default)
+     - `UPDATE_INSTANCE` (InstanceIndex = 2, by default)
+   Both args reference the same BLAS pointer.
+5. Flush + wait fence.
 
-Per spec, mixing different op types in the same call is legal
+Per spec, mixing op types in the same call is legal
 (`Raytracing2.md`: "Multiple operations of different types can be used in
 the same call.").  Per-op-type uniqueness is satisfied (one arg each, on
-different instances).
-
-## Bisect that landed on this trim
-
-Earlier versions of this repro had a TRANSLATE_PARTITION op, a 64×64
-DispatchRays, and `ENABLE_EXPLICIT_AABB` on the writes.  Removing each
-in turn confirmed each is irrelevant to the bug; the bisect grid:
-
-| Config (--frames 20)                                  | Result            |
-| ----------------------------------------------------- | ----------------- |
-| WRITE + UPDATE (+ everything else removed)            | TDR after frame 2 |
-| `--no-update` (WRITE only)                            | OK 30 frames      |
-| `--no-write` (UPDATE only)                            | OK 30 frames      |
-| (previous, with translate+dispatch+AABB) default      | TDR after frame 1 |
-| `--use-warp` (same EXE on WARP)                       | OK 20+ frames     |
-
-Conclusion: TDR is triggered exclusively by the **coexistence of WRITE +
-UPDATE op types in a single `ExecuteIndirectRTASOperations` call**.  All
-other PTLAS feature toggles tested are irrelevant; the bug does not depend
-on a consumer of the PTLAS (no DispatchRays needed).
+different instances; the `or` clause prohibiting same-instance W+U is also
+satisfied).
 
 ## Build
 
@@ -92,32 +108,29 @@ msbuild PtlasWriteUpdateRepro.vcxproj /p:Configuration=Debug /p:Platform=x64
 
 Output: `bin\x64\Debug\PtlasWriteUpdateRepro.exe`
 (`D3D12Core.dll`, `D3D12SDKLayers.dll` copied into `bin\x64\Debug\D3D12\`;
-`d3d10warp.dll` copied next to the exe for `--use-warp`.)
+`d3d10warp.dll` copied next to the EXE for `--use-warp`.)
 
 There is no `.hlsl` file and no shader compile step -- the program contains
 zero shaders.
 
-## Run / CLI
+## CLI
 
 ```
 PtlasWriteUpdateRepro.exe [options]
 
-  --frames N           : run N frames (default 30)
-  --no-write           : skip the WRITE_INSTANCE arg (baseline: no TDR)
-  --no-update          : skip the UPDATE_INSTANCE arg (baseline: no TDR)
-  --partitions N       : partition count (default 1)
-  --instances N        : total instance count (default 4)
-  --use-warp           : force the WARP adapter (sanity comparison; no TDR)
+  --frames N         : run N frames (default 30)
+  --instances N      : PTLAS instance count (default 3; min 3 to trigger)
+  --write IDX        : WRITE_INSTANCE arg's InstanceIndex (default 1; -1 = vary)
+  --update IDX       : UPDATE_INSTANCE arg's InstanceIndex (default 2; -1 = vary)
+  --no-write         : skip the WRITE_INSTANCE arg  (baseline: no TDR)
+  --no-update        : skip the UPDATE_INSTANCE arg (baseline: no TDR)
+  --use-warp         : force the WARP adapter        (baseline: no TDR)
 ```
 
-Exit code: 0 = no TDR, 1 = TDR detected, 2 = setup error (no DXR2, build
-failure, etc.).
+Exit code: 0 = no TDR, 1 = TDR detected, 2 = setup error (no DXR2, etc.).
 
-## Source files
+## Source
 
-- `Main.cpp` (~440 LOC) -- the entire repro: D3D12 init, BLAS build, PTLAS
-  setup, per-frame `WRITE_INSTANCE` + `UPDATE_INSTANCE`, fence wait, TDR
-  detection via `ID3D12InfoQueue1::RegisterMessageCallback`.  No shaders,
-  no pipeline state, no DispatchRays.
-- `PtlasWriteUpdateRepro.vcxproj` -- minimal MSBuild project.
-- `ExperimentalD3D12.props` -- experimental D3D12 SDK hookup.
+- `Main.cpp` -- everything (D3D12 init, BLAS, PTLAS, per-frame W+U build,
+  fence wait, TDR detection via `ID3D12InfoQueue1::RegisterMessageCallback`).
+- `PtlasWriteUpdateRepro.vcxproj` + `ExperimentalD3D12.props` -- the build.

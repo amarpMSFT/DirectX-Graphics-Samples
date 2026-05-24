@@ -141,7 +141,9 @@ public:
     {
         UINT64 resultBytes;          // size of the top-level structure
         UINT64 scratchBytes;
-        UINT   instancesSubmitted;
+        UINT   instancesSubmitted;   // writes + updates combined (sum)
+        UINT   writesSubmitted;      // WRITE_INSTANCE arg count this frame
+        UINT   updatesSubmitted;     // UPDATE_INSTANCE arg count this frame
         UINT   partitionsTouched;    // 0 for Traditional
         // Future: GPU timestamp delta for build, instance-update fill CS, ...
     };

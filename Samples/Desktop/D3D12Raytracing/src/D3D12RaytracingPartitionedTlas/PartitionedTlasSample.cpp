@@ -1140,17 +1140,15 @@ void PartitionedTlasSample::DoRender()
         auto fs = m_tlas->GetLastFrameStats();
         const uint64_t deltaWrites = m_cumBallChanges - m_cumBallChangesLastLog;
         m_cumBallChangesLastLog = m_cumBallChanges;
-        SampleLog::LogF(L"[frame %llu] tlas=%s budget=%u "
-                        L"writes_delta=%llu cum_writes=%llu  updates_total=%u  part_trans=%u "
-                        L"build_ms=%.3f (raw %.3f)  flock=(%.2f, %.2f, %.2f)  "
-                        L"fwd=(%.2f, %.2f, %.2f)\n",
+        SampleLog::LogF(L"[frame %llu] tlas=%s blas=%s budget=%u "
+                        L"writes=%u updates=%u trans=%u  rolling_delta=%llu  "
+                        L"build_ms=%.3f (raw %.3f)  flock=(%.2f, %.2f, %.2f) fwd=(%.2f, %.2f, %.2f)\n",
                         (unsigned long long)m_framesRendered,
                         m_tlas->ModeName(),
+                        (m_blasMode == BlasMode::Cluster ? L"cluster" : L"dxr1"),
                         m_partitionBudget,
+                        fs.writesSubmitted, fs.updatesSubmitted, fs.partitionsTouched,
                         (unsigned long long)deltaWrites,
-                        (unsigned long long)m_cumBallChanges,
-                        fs.instancesSubmitted,
-                        fs.partitionsTouched,
                         m_tlasBuildMsEma, m_tlasBuildMsLast,
                         m_flock.position.x, m_flock.position.y, m_flock.position.z,
                         m_flock.forward.x, m_flock.forward.y, m_flock.forward.z);

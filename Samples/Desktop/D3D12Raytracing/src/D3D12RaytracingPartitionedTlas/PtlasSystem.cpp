@@ -377,6 +377,8 @@ ITlasSystem::FrameStats PtlasSystem::GetLastFrameStats() const
     s.resultBytes        = m_resultBytes;
     s.scratchBytes       = m_scratchBytes;
     s.instancesSubmitted = m_lastWriteCount + m_lastUpdateCount;
+    s.writesSubmitted    = m_lastWriteCount;
+    s.updatesSubmitted   = m_lastUpdateCount;
     s.partitionsTouched  = m_lastTranslateCount;
     return s;
 }

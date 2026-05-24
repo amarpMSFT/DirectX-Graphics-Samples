@@ -364,6 +364,11 @@ void PtlasSystem::Build(ID3D12GraphicsCommandList4* cl,
     }
 
     m_haveBuiltOnce = true;
+    // Clear pending ops so Build() can be re-called within the same frame
+    // for a follow-on build (e.g. a UPDATE_INSTANCE-only call after the
+    // WRITE_INSTANCE + TRANSLATE_PARTITION call).  Counts stay so the
+    // per-frame stats still reflect total work submitted this frame.
+    m_pendingOps.clear();
 }
 
 ITlasSystem::FrameStats PtlasSystem::GetLastFrameStats() const

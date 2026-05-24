@@ -801,6 +801,14 @@ void PartitionedTlasSample::DoRender()
     const UINT tsSlotBase = tsSlot * kTimestampsPerFrame;
     cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 0);
 
+    // Partitioned mode splits work into TWO PTLAS builds per frame: the
+    // first call carries WRITE_INSTANCE + TRANSLATE_PARTITION, the second
+    // carries UPDATE_INSTANCE only.  See the staged-build comment further
+    // down for the driver-bug rationale.  Declared here so the second
+    // build below can see the queued updates after the partitioned block
+    // closes.
+    std::vector<ITlasSystem::InstanceUpdate> deferredUpdates;
+
     if (m_tlasMode == TlasMode::Partitioned)
     {
         // (a) WRITE_INSTANCE for any ball that needs a fresh write this frame.
@@ -935,7 +943,6 @@ void PartitionedTlasSample::DoRender()
         //      bins with hysteresis to limit per-frame flicker.  With
         //      ENABLE_EXPLICIT_AABB set on the prior WRITE, the swap is
         //      cheap (no partition refit).
-        std::vector<ITlasSystem::InstanceUpdate> updates;
         if (m_ballLod.size() == ballN)
         {
             for (uint32_t b = 0; b < ballN; ++b)
@@ -955,28 +962,31 @@ void PartitionedTlasSample::DoRender()
                     u.newBlas = (newLod == 0) ? BallBlasFor(0)
                               : (newLod == 1) ? BallBlasFor(1)
                                               : BallBlasFor(2);
-                    updates.push_back(u);
+                    deferredUpdates.push_back(u);
                     m_ballLod[b] = newLod;
                 }
             }
             // KNOWN ISSUE on the current preview NVIDIA driver (2026-05): a
             // PTLAS build call that contains BOTH WRITE_INSTANCE and
-            // UPDATE_INSTANCE ops (on disjoint instance sets) TDRs the GPU
-            // within ~10 frames.  Verified spec-compliant via the
-            // IndirectBuild.cpp conformance test (which exercises exactly
-            // this mixed-op pattern with both flags `DisablePartition*Unless
-            // Forced` defaulting to false), and verified on WARP (Microsoft
-            // Basic Render Driver) which runs the same code with no TDR.
+            // UPDATE_INSTANCE args targeting non-zero InstanceIndex values
+            // TDRs the GPU within ~10 frames.  An attempt to bypass via
+            // two separate PTLAS builds per frame (W+T in one; U in the
+            // other) also TDRs at the same point on the same driver,
+            // suggesting the issue is broader than single-call op-type
+            // mixing.  See ../PtlasWriteUpdateRepro for the isolated single-
+            // call repro that NVIDIA can debug against.
             //
-            // Workaround: skip UPDATE when WRITE is non-empty.  LOD swap
-            // still works -- the LOD bin is refreshed on the same-frame WRITE,
-            // which already picks blasGva from SelectLodInitial(distance).
-            // We just lose the cheap UPDATE_INSTANCE optimization on those
-            // frames.  Drop the `writes.empty()` half of the gate once the
-            // driver fix ships.
-            if (!updates.empty() && writes.empty())
+            // Workaround: gate UPDATE off on frames that have any WRITE
+            // work.  LOD bin is still kept current via the same-frame
+            // WRITE_INSTANCE (which picks the LOD-appropriate blasGva at
+            // write time), so the only thing we lose is the cheap
+            // UPDATE_INSTANCE path on those frames -- updates DO happen
+            // on calm frames (no rolling-window transitions, no
+            // displacement) where writes is empty.
+            if (!deferredUpdates.empty() && writes.empty())
             {
-                m_tlas->UpdateInstances(updates.data(), (UINT)updates.size());
+                m_tlas->UpdateInstances(deferredUpdates.data(), (UINT)deferredUpdates.size());
+                deferredUpdates.clear();
             }
         }
         // For balls written this frame, also seed m_ballLod from current
@@ -1079,6 +1089,18 @@ void PartitionedTlasSample::DoRender()
         m_tlas->WriteInstances(adj.data(), (UINT)adj.size());
     }
     m_tlas->Build(cl, cl2);
+
+    // NOTE: an earlier attempt to split into two PTLAS builds per frame
+    // (BUILD #1 = WRITE+TRANSLATE; BUILD #2 = UPDATE-only) to bypass the
+    // WRITE+UPDATE same-call driver bug ALSO TDR'd on the same NVIDIA
+    // preview driver -- around frame 8, same timing as the same-call
+    // pattern.  So the bug isn't purely about W+U coexisting in a single
+    // ExecuteIndirectRTASOperations call; back-to-back PTLAS builds on
+    // the same PTLAS resource within one frame's CL also misbehave on
+    // this driver.  Keep the single-build pipeline with the workaround
+    // gate (below at the UPDATE block) until the driver fix lands.  The
+    // separate PtlasWriteUpdateRepro branch is the cleanest evidence
+    // we have for the IHV to investigate.
 
     // Timestamp AFTER TLAS build, resolve this slot's pair to readback.
     cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 1);

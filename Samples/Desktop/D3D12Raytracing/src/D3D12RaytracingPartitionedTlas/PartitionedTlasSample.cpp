@@ -935,14 +935,21 @@ void PartitionedTlasSample::DoRender()
                     m_ballLod[b] = newLod;
                 }
             }
-            // KNOWN ISSUE (preview NVIDIA driver, 2026-05): mixing
-            // WRITE_INSTANCE + UPDATE_INSTANCE in the same PTLAS build call
-            // can TDR after a few frames.  Workaround: skip UPDATE when
-            // WRITES are non-empty.  LOD swap still works -- the LOD bin
-            // gets refreshed every time a ball is WRITE'd (rolling-window
-            // transitions + per-frame displacement writes).  When the
-            // driver gates fix this, remove the gate; the UPDATE-only path
-            // is materially cheaper for static rolling LOD.
+            // KNOWN ISSUE on the current preview NVIDIA driver (2026-05): a
+            // PTLAS build call that contains BOTH WRITE_INSTANCE and
+            // UPDATE_INSTANCE ops (on disjoint instance sets) TDRs the GPU
+            // within ~10 frames.  Verified spec-compliant via the
+            // IndirectBuild.cpp conformance test (which exercises exactly
+            // this mixed-op pattern with both flags `DisablePartition*Unless
+            // Forced` defaulting to false), and verified on WARP (Microsoft
+            // Basic Render Driver) which runs the same code with no TDR.
+            //
+            // Workaround: skip UPDATE when WRITE is non-empty.  LOD swap
+            // still works -- the LOD bin is refreshed on the same-frame WRITE,
+            // which already picks blasGva from SelectLodInitial(distance).
+            // We just lose the cheap UPDATE_INSTANCE optimization on those
+            // frames.  Drop the `writes.empty()` half of the gate once the
+            // driver fix ships.
             if (!updates.empty() && writes.empty())
             {
                 m_tlas->UpdateInstances(updates.data(), (UINT)updates.size());

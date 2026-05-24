@@ -17,7 +17,11 @@ PTLAS resize via UI controls.
   by distance from the camera with hysteresis to avoid per-frame flicker.
 - **Camera trails a flock** along a Lissajous-style arcing path through
   the lattice.  Flock is a 9-donut ring (torus, 28×14 segments) orbiting
-  the flock center.  Donuts live in the PTLAS **global partition**.
+  the flock center.  Each donut spins around its local Y axis at a
+  slightly different rate per donut.  Donuts live in the PTLAS **global
+  partition** -- the per-frame `TRANSLATE_PARTITION(GLOBAL_PARTITION)`
+  moves the whole ring with the flock while per-frame `WRITE_INSTANCE`
+  on each donut rotates it in place.
 - **Rolling partition window**: configurable budget `P` (default 64,
   hotkey `[ ]` cycles 8/16/32/64/128/216) of PTLAS partition slots cover
   the `P` cells closest to the flock.  Cells outside the active set have

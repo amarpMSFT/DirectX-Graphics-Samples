@@ -44,6 +44,9 @@ struct SceneInstance
     UINT instanceID;                   // accessible via InstanceID() in HLSL
     UINT instanceMask;                 // 0xFF by default
     UINT partitionIndex;               // 0xFFFFFFFF = global (PTLAS); ignored by traditional
+    UINT contributionToHitGroupIndex;  // selects which hit-group record runs at this
+                                       // instance's hits.  0 = HitGroup_Ball, 1 = HitGroup_Donut
+                                       // in this sample.  See Raytracing.hlsl shader-table layout.
 };
 
 class ITlasSystem

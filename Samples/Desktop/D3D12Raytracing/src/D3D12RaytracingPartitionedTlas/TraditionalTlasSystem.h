@@ -89,7 +89,7 @@ public:
                     d.Transform[r][c] = s.transform.m[r][c];
             d.InstanceID                          = s.instanceID;
             d.InstanceMask                        = s.instanceMask;
-            d.InstanceContributionToHitGroupIndex = 0;
+            d.InstanceContributionToHitGroupIndex = s.contributionToHitGroupIndex;
             d.Flags                               = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
             d.AccelerationStructure               = s.blasGva;
             m_instUploadCpu[m_frameInstCount++] = d;

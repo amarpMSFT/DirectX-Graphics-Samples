@@ -127,6 +127,59 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS BlasGpuVa() const { return m_blas->GetGPUVirtualAddress(); }
     UINT64                    BlasResultBytes() const { return m_blasResultBytes; }
 
+    // ---- Optional: per-triangle face normals SRV ----
+    //
+    // BuildFaceNormalsBuffer() computes one OBJECT-SPACE face normal per
+    // triangle (cross product of (v1-v0) x (v2-v0), normalized) and uploads
+    // it into a DEFAULT-heap buffer.  Closest-hit shaders index it by
+    // PrimitiveIndex() to recover the true surface normal -- essential for
+    // meshes where the "unit-sphere" object-pos shortcut doesn't work (the
+    // donut/torus in this sample).  Buffer layout: tightly packed float3
+    // entries (12 bytes each).  Used as a ByteAddressBuffer SRV in HLSL.
+    //
+    // Records into the same cmd list as Initialize(); the upload staging
+    // buffer is kept as a member until the owner releases this object.
+    void BuildFaceNormalsBuffer(ID3D12Device5* device,
+                                ID3D12GraphicsCommandList4* cl,
+                                const wchar_t* nameHint = L"Mesh")
+    {
+        const uint32_t triCount = (uint32_t)(m_mesh.indices.size() / 3);
+        std::vector<DirectX::XMFLOAT3> faceN(triCount);
+        for (uint32_t t = 0; t < triCount; ++t)
+        {
+            const DirectX::XMFLOAT3& a = m_mesh.positions[m_mesh.indices[t*3 + 0]];
+            const DirectX::XMFLOAT3& b = m_mesh.positions[m_mesh.indices[t*3 + 1]];
+            const DirectX::XMFLOAT3& c = m_mesh.positions[m_mesh.indices[t*3 + 2]];
+            DirectX::XMFLOAT3 e1 = { b.x - a.x, b.y - a.y, b.z - a.z };
+            DirectX::XMFLOAT3 e2 = { c.x - a.x, c.y - a.y, c.z - a.z };
+            DirectX::XMFLOAT3 n  = { e1.y*e2.z - e1.z*e2.y,
+                                     e1.z*e2.x - e1.x*e2.z,
+                                     e1.x*e2.y - e1.y*e2.x };
+            float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+            if (len > 1e-12f) { n.x /= len; n.y /= len; n.z /= len; }
+            faceN[t] = n;
+        }
+        const UINT64 bytes = (UINT64)faceN.size() * sizeof(DirectX::XMFLOAT3);
+        std::wstring base = nameHint ? nameHint : L"Mesh";
+        m_faceNormalsUpload = PtSample::CreateUploadBufferWithData(
+            device, faceN.data(), bytes, (base + L"/FaceN upload").c_str());
+        m_faceNormals = PtSample::CreateDefaultBuffer(device, bytes, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON, (base + L"/FaceN").c_str());
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_faceNormals.Get(),
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->ResourceBarrier(1, &toCopy);
+        cl->CopyBufferRegion(m_faceNormals.Get(), 0, m_faceNormalsUpload.Get(), 0, bytes);
+        auto toSrv = CD3DX12_RESOURCE_BARRIER::Transition(m_faceNormals.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        cl->ResourceBarrier(1, &toSrv);
+        SampleLog::LogF(L"[mesh-assets] %s face normals: %u entries (%llu B)\n",
+                        base.c_str(), triCount, (unsigned long long)bytes);
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS FaceNormalsGpuVa() const
+    {
+        return m_faceNormals ? m_faceNormals->GetGPUVirtualAddress() : 0;
+    }
+
 private:
     ProceduralGeometry::Mesh m_mesh;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vb;
@@ -135,6 +188,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ibUpload;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blas;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blasScratch;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_faceNormals;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_faceNormalsUpload;
     UINT64 m_blasResultBytes  = 0;
     UINT64 m_blasScratchBytes = 0;
 };

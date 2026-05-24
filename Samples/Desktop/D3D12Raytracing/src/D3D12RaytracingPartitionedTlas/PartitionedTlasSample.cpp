@@ -268,10 +268,16 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // closes / executes / waits at the end of init.
     m_ball.Initialize    (m_dxrDevice.Get(), m_dxrCommandList.Get(),
                           ProceduralGeometry::MakeIcosphere(2), L"BallMeshHi");
+    m_ballMid.Initialize (m_dxrDevice.Get(), m_dxrCommandList.Get(),
+                          ProceduralGeometry::MakeIcosphere(1), L"BallMeshMid");
     m_ballLow.Initialize (m_dxrDevice.Get(), m_dxrCommandList.Get(),
                           ProceduralGeometry::MakeIcosphere(0), L"BallMeshLo");
     m_donut.Initialize   (m_dxrDevice.Get(), m_dxrCommandList.Get(),
                           ProceduralGeometry::MakeTorus(0.55f, 0.18f, 28, 14), L"DonutMesh");
+    // Donut needs accurate per-triangle normals for proper shading +
+    // reflection; balls use the unit-sphere shortcut in the shader so
+    // they don't.
+    m_donut.BuildFaceNormalsBuffer(m_dxrDevice.Get(), m_dxrCommandList.Get(), L"DonutMesh");
 
     // Donut flock-member roster.  Members orbit the flock center in a
     // small ring (3D positions baked here; later milestones can animate
@@ -434,16 +440,18 @@ void PartitionedTlasSample::CreateSceneConstantBuffer()
 void PartitionedTlasSample::CreateRaytracingPipeline()
 {
     // ---- Global root signature ----
-    //   param 0 : descriptor table -> 1 UAV (u0)  -> output texture
-    //   param 1 : root SRV (t0)                   -> TLAS (PTLAS or trad)
-    //   param 2 : root CBV (b0)                   -> SceneConstantBuffer
+    //   param 0 : descriptor table -> 1 UAV (u0)   -> output texture
+    //   param 1 : root SRV (t0)                    -> TLAS (PTLAS or trad)
+    //   param 2 : root CBV (b0)                    -> SceneConstantBuffer
+    //   param 3 : root SRV (t1)                    -> donut face-normals
     CD3DX12_DESCRIPTOR_RANGE uavRange = {};
     uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, /*BaseRegister*/0);
 
-    CD3DX12_ROOT_PARAMETER params[3] = {};
+    CD3DX12_ROOT_PARAMETER params[4] = {};
     params[PT_GRS_OutputUavSlot].InitAsDescriptorTable(1, &uavRange);
     params[PT_GRS_AccelerationStructureSlot].InitAsShaderResourceView(0);
     params[PT_GRS_SceneCBVSlot].InitAsConstantBufferView(0);
+    params[PT_GRS_DonutFaceNormalsSrvSlot].InitAsShaderResourceView(1);
 
     CD3DX12_ROOT_SIGNATURE_DESC rsDesc(_countof(params), params, 0, nullptr,
         D3D12_ROOT_SIGNATURE_FLAG_NONE);
@@ -462,21 +470,31 @@ void PartitionedTlasSample::CreateRaytracingPipeline()
     lib->SetDXILLibrary(&bc);
     lib->DefineExport(L"Raygen");
     lib->DefineExport(L"Miss");
-    lib->DefineExport(L"ClosestHit");
+    lib->DefineExport(L"ShadowMiss");
+    lib->DefineExport(L"ClosestHit_Ball");
+    lib->DefineExport(L"ClosestHit_Donut");
 
-    auto* hit = so.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-    hit->SetClosestHitShaderImport(L"ClosestHit");
-    hit->SetHitGroupExport(L"HitGroup");
-    hit->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+    auto* hgBall = so.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    hgBall->SetClosestHitShaderImport(L"ClosestHit_Ball");
+    hgBall->SetHitGroupExport(L"HitGroup_Ball");
+    hgBall->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+    auto* hgDonut = so.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+    hgDonut->SetClosestHitShaderImport(L"ClosestHit_Donut");
+    hgDonut->SetHitGroupExport(L"HitGroup_Donut");
+    hgDonut->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
     auto* cfg = so.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+    // Payload = float3 colour + uint depth = 16 bytes; ShadowPayload =
+    // uint shadowed = 4 bytes.  Pick the larger.  Attr = barycentric
+    // float2 = 8 bytes.
     cfg->Config(/*MaxPayload*/16, /*MaxAttr*/8);
 
     auto* gsig = so.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
     gsig->SetRootSignature(m_globalRootSig.Get());
 
     auto* pcfg = so.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
-    pcfg->Config(/*MaxRecursion*/1);
+    pcfg->Config(/*MaxRecursion*/2);   // primary + 1 reflection bounce
 
     ThrowIfFailed(m_dxrDevice->CreateStateObject(so, IID_PPV_ARGS(&m_rtStateObject)),
         L"CreateStateObject failed");
@@ -486,29 +504,41 @@ void PartitionedTlasSample::CreateShaderTable()
 {
     ComPtr<ID3D12StateObjectProperties> props;
     ThrowIfFailed(m_rtStateObject.As(&props));
-    void* idRaygen = props->GetShaderIdentifier(L"Raygen");
-    void* idMiss   = props->GetShaderIdentifier(L"Miss");
-    void* idHit    = props->GetShaderIdentifier(L"HitGroup");
+    void* idRaygen     = props->GetShaderIdentifier(L"Raygen");
+    void* idMiss       = props->GetShaderIdentifier(L"Miss");
+    void* idShadowMiss = props->GetShaderIdentifier(L"ShadowMiss");
+    void* idHitBall    = props->GetShaderIdentifier(L"HitGroup_Ball");
+    void* idHitDonut   = props->GetShaderIdentifier(L"HitGroup_Donut");
 
     const UINT64 idBytes  = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
     const UINT64 recAlign = D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT;
     const UINT64 tabAlign = D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT;
     const UINT64 recSize  = AlignUp(idBytes, recAlign);
-    m_rayGenRecordSize     = recSize;
-    m_missRecordStartOffset = AlignUp(recSize,                     tabAlign);
-    m_missRecordSize       = recSize;
-    m_hitRecordStartOffset = AlignUp(m_missRecordStartOffset + recSize, tabAlign);
-    m_hitRecordSize        = recSize;
-    const UINT64 total     = m_hitRecordStartOffset + recSize;
+
+    // Section layout: raygen | miss[2] | hit[2].  Each section starts at
+    // a `tabAlign`-aligned offset; within a section, records are spaced
+    // `recSize` apart (records contain only the shader identifier in this
+    // sample -- no local root-arg data).
+    m_rayGenStart       = 0;
+    m_rayGenSize        = recSize;
+    m_missStart         = AlignUp(m_rayGenStart + recSize, tabAlign);
+    m_missRecordSize    = recSize;
+    m_missTotalSize     = recSize * 2;       // primary + shadow
+    m_hitStart          = AlignUp(m_missStart + m_missTotalSize, tabAlign);
+    m_hitRecordSize     = recSize;
+    m_hitTotalSize      = recSize * 2;       // HitGroup_Ball + HitGroup_Donut
+    const UINT64 total  = m_hitStart + m_hitTotalSize;
 
     m_shaderTable = PtSample::CreateUploadBuffer(m_dxrDevice.Get(), total, L"ShaderTable");
     UINT8* cpu = nullptr;
     CD3DX12_RANGE noRead(0, 0);
     ThrowIfFailed(m_shaderTable->Map(0, &noRead, reinterpret_cast<void**>(&cpu)));
     memset(cpu, 0, (size_t)total);
-    memcpy(cpu + 0,                       idRaygen, idBytes);
-    memcpy(cpu + m_missRecordStartOffset, idMiss,   idBytes);
-    memcpy(cpu + m_hitRecordStartOffset,  idHit,    idBytes);
+    memcpy(cpu + m_rayGenStart,                   idRaygen,     idBytes);
+    memcpy(cpu + m_missStart,                     idMiss,       idBytes);
+    memcpy(cpu + m_missStart + m_missRecordSize,  idShadowMiss, idBytes);
+    memcpy(cpu + m_hitStart,                      idHitBall,    idBytes);
+    memcpy(cpu + m_hitStart + m_hitRecordSize,    idHitDonut,   idBytes);
     m_shaderTable->Unmap(0, nullptr);
 }
 
@@ -635,7 +665,7 @@ void PartitionedTlasSample::UpdateSceneConstantBuffer()
     XMStoreFloat4x4(&cb.projectionToWorld, XMMatrixTranspose(projToAs));
     XMStoreFloat4(&cb.cameraOriginAs, eyeAs);
     cb.asOriginWorld   = { m_asOrigin.x, m_asOrigin.y, m_asOrigin.z, 0 };
-    cb.lightDirAndPad  = { 0.5f, 0.8f, 0.3f, 0 };
+    cb.lightDirAndPad  = { 0.55f, 0.65f, 0.52f, 0 };   // sun off to the side + slightly above
     cb.missColorAndTime = { 0.02f, 0.04f, 0.06f, (float)tsec };
 
     const UINT slot = (UINT)(m_framesRendered % FrameCount);
@@ -747,13 +777,16 @@ void PartitionedTlasSample::DoRender()
                 inst.transform.m[0][3] -= home.x;
                 inst.transform.m[1][3] -= home.y;
                 inst.transform.m[2][3] -= home.z;
-                // LOD-aware BLAS swap: hi-LOD if close to camera, lo otherwise.
+                // LOD-aware BLAS swap: pick by distance from camera (3 bins).
                 const auto& wp = m_ballWorldPos[b];
                 const float dx = wp.x - m_asOrigin.x;
                 const float dy = wp.y - m_asOrigin.y;
                 const float dz = wp.z - m_asOrigin.z;
-                const bool nearCam = (dx*dx + dy*dy + dz*dz) < kLodNearDist * kLodNearDist;
-                inst.blasGva = nearCam ? m_ball.BlasGpuVa() : m_ballLow.BlasGpuVa();
+                const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                const uint8_t lod = SelectLodInitial(dist);
+                inst.blasGva = (lod == 0) ? m_ball.BlasGpuVa()
+                             : (lod == 1) ? m_ballMid.BlasGpuVa()
+                                          : m_ballLow.BlasGpuVa();
             }
             writes.push_back(inst);
         }
@@ -775,6 +808,7 @@ void PartitionedTlasSample::DoRender()
                 inst.instanceID     = 0x10000u | d;
                 inst.instanceMask   = 0xFF;
                 inst.partitionIndex = (UINT)D3D12_RTAS_PARTITIONED_TLAS_PARTITION_INDEX_GLOBAL_PARTITION;
+                inst.contributionToHitGroupIndex = 1;   // HitGroup_Donut
                 writes.push_back(inst);
             }
         }
@@ -819,13 +853,15 @@ void PartitionedTlasSample::DoRender()
                 float dx = pos.x - m_asOrigin.x;
                 float dy = pos.y - m_asOrigin.y;
                 float dz = pos.z - m_asOrigin.z;
-                float d2 = dx*dx + dy*dy + dz*dz;
-                const uint8_t newLod = (d2 < kLodNearDist * kLodNearDist) ? 0u : 1u;
+                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                const uint8_t newLod = SelectLod(dist, m_ballLod[b]);
                 if (newLod != m_ballLod[b])
                 {
                     ITlasSystem::InstanceUpdate u = {};
                     u.instanceIndex = kDonutCount + b;
-                    u.newBlas = (newLod == 0) ? m_ball.BlasGpuVa() : m_ballLow.BlasGpuVa();
+                    u.newBlas = (newLod == 0) ? m_ball.BlasGpuVa()
+                              : (newLod == 1) ? m_ballMid.BlasGpuVa()
+                                              : m_ballLow.BlasGpuVa();
                     updates.push_back(u);
                     m_ballLod[b] = newLod;
                 }
@@ -846,8 +882,8 @@ void PartitionedTlasSample::DoRender()
             float dx = pos.x - m_asOrigin.x;
             float dy = pos.y - m_asOrigin.y;
             float dz = pos.z - m_asOrigin.z;
-            float d2 = dx*dx + dy*dy + dz*dz;
-            m_ballLod[b] = (d2 < kLodNearDist * kLodNearDist) ? 0u : 1u;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+            m_ballLod[b] = SelectLodInitial(dist);
         }
 
         // (b) TRANSLATE_PARTITION for every active partition every frame
@@ -915,6 +951,7 @@ void PartitionedTlasSample::DoRender()
             inst.instanceMask   = 0xFF;
             inst.partitionIndex = 0;
             inst.instanceIndex  = (UINT)(m_sceneInstances.size() + d);
+            inst.contributionToHitGroupIndex = 1;   // HitGroup_Donut
             adj.push_back(inst);
         }
         m_tlas->WriteInstances(adj.data(), (UINT)adj.size());
@@ -983,6 +1020,7 @@ void PartitionedTlasSample::DoRender()
     uavGpu.ptr += SIZE_T(m_uavHeapIdx) * m_descSize;
     cl->SetComputeRootDescriptorTable(PT_GRS_OutputUavSlot, uavGpu);
     cl->SetComputeRootShaderResourceView(PT_GRS_AccelerationStructureSlot, m_tlas->Gva());
+    cl->SetComputeRootShaderResourceView(PT_GRS_DonutFaceNormalsSrvSlot, m_donut.FaceNormalsGpuVa());
     const UINT slot = (UINT)(m_framesRendered % FrameCount);
     cl->SetComputeRootConstantBufferView(PT_GRS_SceneCBVSlot,
         m_sceneCb->GetGPUVirtualAddress() + slot * m_sceneCbStride);
@@ -992,13 +1030,13 @@ void PartitionedTlasSample::DoRender()
     // ---- Dispatch ----
     D3D12_DISPATCH_RAYS_DESC drd = {};
     auto stGva = m_shaderTable->GetGPUVirtualAddress();
-    drd.RayGenerationShaderRecord.StartAddress = stGva;
-    drd.RayGenerationShaderRecord.SizeInBytes  = m_rayGenRecordSize;
-    drd.MissShaderTable.StartAddress  = stGva + m_missRecordStartOffset;
-    drd.MissShaderTable.SizeInBytes   = m_missRecordSize;
+    drd.RayGenerationShaderRecord.StartAddress = stGva + m_rayGenStart;
+    drd.RayGenerationShaderRecord.SizeInBytes  = m_rayGenSize;
+    drd.MissShaderTable.StartAddress  = stGva + m_missStart;
+    drd.MissShaderTable.SizeInBytes   = m_missTotalSize;
     drd.MissShaderTable.StrideInBytes = m_missRecordSize;
-    drd.HitGroupTable.StartAddress    = stGva + m_hitRecordStartOffset;
-    drd.HitGroupTable.SizeInBytes     = m_hitRecordSize;
+    drd.HitGroupTable.StartAddress    = stGva + m_hitStart;
+    drd.HitGroupTable.SizeInBytes     = m_hitTotalSize;
     drd.HitGroupTable.StrideInBytes   = m_hitRecordSize;
     drd.Width  = m_width;
     drd.Height = m_height;

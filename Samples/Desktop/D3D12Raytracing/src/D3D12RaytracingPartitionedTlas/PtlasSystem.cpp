@@ -185,7 +185,7 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
                 a.Transform[r][c] = s.transform.m[r][c];
         a.InstanceID                          = s.instanceID;
         a.InstanceMask                        = s.instanceMask;
-        a.InstanceContributionToHitGroupIndex = 0;
+        a.InstanceContributionToHitGroupIndex = s.contributionToHitGroupIndex;
         a.InstanceFlags                       = D3D12_RTAS_PARTITIONED_TLAS_INSTANCE_FLAG_NONE;
         a.AccelerationStructure               = s.blasGva;
         a.InstanceIndex                       = s.instanceIndex;

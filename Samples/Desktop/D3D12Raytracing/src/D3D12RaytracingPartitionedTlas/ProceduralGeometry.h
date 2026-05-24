@@ -159,7 +159,12 @@ namespace ProceduralGeometry
                 uint32_t i10 = un * segMinor + v;
                 uint32_t i01 = u  * segMinor + vn;
                 uint32_t i11 = un * segMinor + vn;
-                m.indices.insert(m.indices.end(), { i00, i10, i11, i00, i11, i01 });
+                // Winding reversed vs. {i00,i10,i11,i00,i11,i01} so the
+                // cross product (e1×e2) points OUTWARD (away from torus
+                // surface) matching the icosphere convention.  Without this
+                // reversal the torus's "front" face is the INSIDE -- which
+                // back-face culling then hides from external view.
+                m.indices.insert(m.indices.end(), { i00, i11, i10, i00, i01, i11 });
             }
         }
         return m;

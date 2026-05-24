@@ -79,8 +79,9 @@ private:
     std::unique_ptr<ITlasSystem> m_tlas;
 
     // ---- Static assets ----
-    MeshAssets m_ball;       // hi-LOD icosphere (subdiv=2, 320 tris)
-    MeshAssets m_ballLow;    // lo-LOD icosphere (subdiv=0, 20 tris) -- phase 5 LOD swap
+    MeshAssets m_ball;       // hi-LOD icosphere   (subdiv=2, 320 tris)
+    MeshAssets m_ballMid;    // mid-LOD icosphere  (subdiv=1, 80 tris)  -- phase 5
+    MeshAssets m_ballLow;    // lo-LOD icosphere   (subdiv=0, 20 tris)  -- phase 5 LOD swap
     MeshAssets m_donut;
     // The donut flock-members live in the PTLAS GLOBAL PARTITION (phase 4).
     // Their transforms are FLOCK-LOCAL (small offsets from flock center)
@@ -106,10 +107,41 @@ private:
     void BuildSceneInstances();
     void RecomputeAsOrigin();
 
-    // LOD threshold: balls within this AS-space distance from camera get
-    // hi-LOD; beyond -> lo-LOD.  Tuned so the swap is visible during the
-    // flock's transit through the lattice.
-    static constexpr float kLodNearDist = 3.5f;
+    // LOD thresholds.  Three bins (hi/mid/lo) selected by distance from
+    // camera, with hysteresis to prevent per-frame flicker as a ball sits
+    // near a threshold.  Margin = the band you have to clearly cross
+    // before the LOD changes; bigger margin = fewer transitions, more
+    // stable visual.
+    static constexpr float kLodHiDist  = 2.5f;
+    static constexpr float kLodMidDist = 5.0f;
+    static constexpr float kLodMargin  = 0.5f;
+    static uint8_t SelectLod(float dist, uint8_t cur)
+    {
+        // Hysteresis: only step DOWN (higher number = less detail) once
+        // we're past the threshold by +margin; only step UP once we're
+        // below by -margin.  In between, keep current.
+        if (cur == 0)
+        {
+            if (dist > kLodHiDist  + kLodMargin) return 1;
+        }
+        else if (cur == 1)
+        {
+            if (dist < kLodHiDist  - kLodMargin) return 0;
+            if (dist > kLodMidDist + kLodMargin) return 2;
+        }
+        else // cur == 2
+        {
+            if (dist < kLodMidDist - kLodMargin) return 1;
+        }
+        return cur;
+    }
+    // Initial-LOD selector ignores hysteresis (no "current" LOD yet).
+    static uint8_t SelectLodInitial(float dist)
+    {
+        if (dist < kLodHiDist)  return 0;
+        if (dist < kLodMidDist) return 1;
+        return 2;
+    }
 
     // ---- Camera / flock-follow rig.  --camera-mode orbit|flock-follow
     // selects between the static orbit camera (phase 2c) and the
@@ -138,11 +170,19 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_globalRootSig;
     Microsoft::WRL::ComPtr<ID3D12StateObject>   m_rtStateObject;
     Microsoft::WRL::ComPtr<ID3D12Resource>      m_shaderTable;
-    UINT64                                      m_rayGenRecordSize       = 0;
-    UINT64                                      m_missRecordStartOffset  = 0;
+    // Shader table layout (record size = D3D12_SHADER_RECORD_BYTE_ALIGNMENT
+    // aligned).  Table sections (each contiguous):
+    //   * 1 raygen record   at offset m_rayGenStart
+    //   * 2 miss records    at offset m_missStart    (primary, shadow)
+    //   * 2 hit-group recs  at offset m_hitStart     (HitGroup_Ball, HitGroup_Donut)
+    UINT64                                      m_rayGenStart            = 0;
+    UINT64                                      m_rayGenSize             = 0;
+    UINT64                                      m_missStart              = 0;
     UINT64                                      m_missRecordSize         = 0;
-    UINT64                                      m_hitRecordStartOffset   = 0;
+    UINT64                                      m_missTotalSize          = 0;
+    UINT64                                      m_hitStart               = 0;
     UINT64                                      m_hitRecordSize          = 0;
+    UINT64                                      m_hitTotalSize           = 0;
 
     // ---- Per-frame scene constants (3-deep upload-heap ring) ----
     Microsoft::WRL::ComPtr<ID3D12Resource>      m_sceneCb;

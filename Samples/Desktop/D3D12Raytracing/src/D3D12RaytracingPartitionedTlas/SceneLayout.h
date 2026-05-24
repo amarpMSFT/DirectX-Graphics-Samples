@@ -38,7 +38,7 @@ struct SceneLayout
     uint32_t gridZ        = 6;
     uint32_t ballsPerSide = 3;   // N in each axis per partition
     float    ballSpacing  = 1.5f;
-    float    ballScale    = 0.45f;  // radius (unit-sphere scaled)
+    float    ballScale    = 0.30f;  // radius (unit-sphere scaled) -- smaller per user request
 
     // Derived counts.
     uint32_t Partitions()       const { return gridX * gridY * gridZ; }

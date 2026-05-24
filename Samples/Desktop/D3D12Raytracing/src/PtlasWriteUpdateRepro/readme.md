@@ -76,6 +76,20 @@ Only this:
 - **Both ops in the same `ExecuteIndirectRTASOperations` call.**  Submitting them in two separate calls (each with one op) is clean.
 - **Both args' `InstanceIndex` non-zero.**  Either op touching index 0 makes the build clean.
 
+## Related observation (full sample only)
+
+Splitting the per-frame PTLAS work into TWO `ExecuteIndirectRTASOperations`
+calls back-to-back on the same PTLAS resource within one command list
+(first call = `WRITE_INSTANCE` + `TRANSLATE_PARTITION`, second call =
+`UPDATE_INSTANCE` only, with a UAV barrier on the PTLAS resource between
+them) also TDRs at the same ~frame-8 timing in the full sample
+(`user/amarp/ptlas-sample` branch, `PartitionedTlasSample::DoRender`).
+This is NOT reproduced in the minimal repro here (which does only one
+build per frame), but the observation is captured for the IHV's
+investigation: the bug surface may be broader than just single-call op-type
+mixing, and back-to-back PTLAS builds on the same resource within one CL
+may share whatever code path is misbehaving.
+
 ## Repro environment
 
 - NVIDIA GeForce RTX 4090

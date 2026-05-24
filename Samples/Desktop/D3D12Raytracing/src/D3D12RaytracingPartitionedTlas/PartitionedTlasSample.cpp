@@ -899,16 +899,25 @@ void PartitionedTlasSample::DoRender()
             }
             writes.push_back(inst);
         }
-        // (a2) Donut flock in the GLOBAL PARTITION.  Static partition-local
-        //      transforms (= flock-local offset + scale).  Written ONCE; the
-        //      global partition's translation, updated each frame below,
-        //      places them at flock_pos - as_origin in AS-space.
-        if (!m_ptlasInitialWriteDone)
+        // (a2) Donut flock in the GLOBAL PARTITION.  Each donut spins around
+        //      its local Y axis at a slightly different rate per donut for
+        //      visible per-frame motion + to exercise per-frame WRITE_INSTANCE
+        //      on global-partition instances.  Transforms are FLOCK-LOCAL
+        //      (offsets from flock center); the global partition's
+        //      TRANSLATE_PARTITION (issued below) moves the whole ring with
+        //      the flock.
         {
+            const double tsec = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m_startTime).count();
             for (uint32_t d = 0; d < (uint32_t)m_donutMembers.size(); ++d)
             {
                 const auto& m = m_donutMembers[d];
+                // Each donut rotates at (1 + 0.25 * donut_idx) rad/s around its
+                // local Y axis -- varied so the ring looks alive.
+                const float spinSpeed = 1.0f + 0.25f * (float)d;
+                const float angle     = (float)(tsec * spinSpeed);
                 XMMATRIX t = XMMatrixScaling(m.scale, m.scale, m.scale)
+                           * XMMatrixRotationY(angle)
                            * XMMatrixTranslation(m.localOffset.x, m.localOffset.y, m.localOffset.z);
                 SceneInstance inst = {};
                 XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(t));
@@ -1068,10 +1077,16 @@ void PartitionedTlasSample::DoRender()
         // Persist displacement state for the next-frame's needs-write check
         // (symmetric with the partitioned path; harmless either way).
         m_ballDisplaced = std::move(displacedNow);
+        const double tsecDonut = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m_startTime).count();
         for (uint32_t d = 0; d < (uint32_t)m_donutMembers.size(); ++d)
         {
             const auto& m = m_donutMembers[d];
+            // Per-donut Y-axis spin (same rate as partitioned path).
+            const float spinSpeed = 1.0f + 0.25f * (float)d;
+            const float angle     = (float)(tsecDonut * spinSpeed);
             XMMATRIX t = XMMatrixScaling(m.scale, m.scale, m.scale)
+                       * XMMatrixRotationY(angle)
                        * XMMatrixTranslation(
                             m_flock.position.x + m.localOffset.x - m_asOrigin.x,
                             m_flock.position.y + m.localOffset.y - m_asOrigin.y,

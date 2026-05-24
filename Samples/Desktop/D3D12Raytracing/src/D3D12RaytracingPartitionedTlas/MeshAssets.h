@@ -21,6 +21,7 @@
 #include "stdafx.h"
 #include "GpuBuffer.h"
 #include "ProceduralGeometry.h"
+#include <unordered_map>
 
 class MeshAssets
 {
@@ -187,6 +188,210 @@ public:
         return m_vertNormals ? m_vertNormals->GetGPUVirtualAddress() : 0;
     }
 
+    // ---- Optional: Cluster BLAS path (CLAS + BUILD_BLAS_FROM_CLAS) ----
+    //
+    // Splits the mesh into clusters of at most kTrianglesPerCluster
+    // triangles each.  Builds one CLAS per cluster via
+    // BUILD_CLAS_FROM_TRIANGLES (BATCHED operation, IMPLICIT destinations,
+    // result-address-array populated by the driver), then one Cluster BLAS
+    // from the list of CLAS GPUVAs via BUILD_BLAS_FROM_CLAS.  The Cluster
+    // BLAS is a drop-in replacement for the DXR1 BLAS the Initialize()
+    // path builds: same GPUVA semantics in the PTLAS instance
+    // AccelerationStructure field.
+    //
+    // For the sample's tiny meshes (up to 320 tris), kTrianglesPerCluster=64
+    // gives at most 5 clusters per mesh; well under the 256-vert limit.
+    //
+    // Spec: D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES and
+    //       D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS.
+    void BuildClusterBlas(ID3D12Device5* device,
+                          ID3D12DeviceRaytracing2* deviceRT2,
+                          ID3D12GraphicsCommandList4* cl,
+                          ID3D12CommandListRaytracing2* cl2,
+                          const wchar_t* nameHint = L"Mesh")
+    {
+        constexpr UINT16 kTrianglesPerCluster = 64;
+        std::wstring base = nameHint ? nameHint : L"Mesh";
+
+        const UINT triTotal = (UINT)(m_mesh.indices.size() / 3);
+        if (triTotal == 0) return;
+
+        // ---- Split triangles into clusters --------------------------------
+        struct ClusterRange { UINT firstTri; UINT triCount; UINT vertCount; };
+        std::vector<ClusterRange> clusters;
+        for (UINT t = 0; t < triTotal; t += kTrianglesPerCluster)
+        {
+            UINT triCount = std::min<UINT>(kTrianglesPerCluster, triTotal - t);
+            // Count unique vertex indices in this cluster's triangle range.
+            std::unordered_map<uint32_t, bool> seen;
+            for (UINT i = 0; i < triCount * 3; ++i)
+                seen.emplace(m_mesh.indices[(t + 0) * 3 + i], true);
+            clusters.push_back({ t, triCount, (UINT)seen.size() });
+        }
+        const UINT clasCount = (UINT)clusters.size();
+
+        // ---- Per-cluster build args (CPU side, uploaded once) -------------
+        std::vector<D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS> args(clasCount);
+        for (UINT c = 0; c < clasCount; ++c)
+        {
+            const ClusterRange& cl_ = clusters[c];
+            auto& a = args[c];
+            a.ClusterID                = c;
+            a.ClusterFlags             = D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_NONE;
+            a.TriangleCount            = (UINT16)cl_.triCount;
+            a.VertexCount              = (UINT16)cl_.vertCount;
+            a.BaseGeometryIndexAndFlags = 0;
+            a.OpacityMicromapBaseLocation = 0;
+            a.VertexBufferStride       = (UINT16)sizeof(DirectX::XMFLOAT3);
+            a.IndexBufferStride        = (UINT16)sizeof(uint32_t);
+            a.OpacityMicromapIndexBufferStride = 0;
+            a.GeometryIndexAndFlagsArrayStride = 0;
+            a.PositionTruncateBitCount = 0;
+            a.ReservedPadding          = 0;
+            a.VertexBuffer             = m_vb->GetGPUVirtualAddress();
+            a.IndexBuffer              = m_ib->GetGPUVirtualAddress() + cl_.firstTri * 3 * sizeof(uint32_t);
+            a.GeometryIndexAndFlagsArray       = 0;
+            a.GeometryIndexAndFlagsIndexBuffer = 0;
+            a.OpacityMicromapArray             = 0;
+            a.OpacityMicromapIndexBuffer       = 0;
+        }
+        const UINT64 argsBytes = clasCount * sizeof(args[0]);
+        m_clasArgsUpload = PtSample::CreateUploadBufferWithData(
+            device, args.data(), argsBytes, (base + L"/CLAS args").c_str());
+
+        // ---- Sizing -------------------------------------------------------
+        // CLAS prebuild: maxes for ClusterLimits.
+        D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC ctd = {};
+        ctd.ClusterLimits.MaxArgCount               = clasCount;
+        ctd.ClusterLimits.MaxGeometryIndexValue     = 0;
+        ctd.ClusterLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
+        ctd.ClusterLimits.MaxTriangleCountPerCluster = kTrianglesPerCluster;
+        ctd.ClusterLimits.MaxVertexCountPerCluster  = kTrianglesPerCluster * 3;
+        ctd.ClusterLimits.MaxTotalTriangleCount     = triTotal;
+        ctd.ClusterLimits.MaxTotalVertexCount       = triTotal * 3;
+        ctd.ClusterLimits.MaxOpacityMicromapIndicesPerCluster = 0;
+        ctd.Flags                                   = D3D12_RTAS_OPERATION_FLAG_NONE;
+        ctd.Mode                                    = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+        ctd.VertexFormat                            = D3D12_VERTEX_FORMAT_FLOAT32_3;
+        ctd.IndexFormat                             = D3D12_INDEX_FORMAT_UINT32;
+        ctd.GeometryIndexAndFlagsIndexFormat        = D3D12_INDEX_FORMAT_NONE;
+        ctd.OpacityMicromapIndexFormat              = D3D12_INDEX_FORMAT_NONE;
+        ctd.MinPositionTruncateBitCount             = 0;
+
+        D3D12_RTAS_OPERATION_INPUTS clasOpIn = {};
+        clasOpIn.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_CLAS_FROM_TRIANGLES;
+        clasOpIn.pClusterTrianglesDesc = &ctd;
+        D3D12_RTAS_OPERATION_PREBUILD_INFO clasPre = {};
+        deviceRT2->GetRTASOperationPrebuildInfo(&clasOpIn, &clasPre);
+
+        // Cluster BLAS prebuild.
+        D3D12_RTAS_CLAS_INPUTS_DESC blasInputs = {};
+        blasInputs.Flags              = D3D12_RTAS_OPERATION_FLAG_NONE;
+        blasInputs.MaxArgCount        = 1;       // one BLAS-from-CLAS arg
+        blasInputs.Mode               = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
+        blasInputs.MaxTotalClasCount  = clasCount;
+        blasInputs.MaxClasCountPerArg = clasCount;
+        D3D12_RTAS_OPERATION_INPUTS blasOpIn = {};
+        blasOpIn.Type = D3D12_RTAS_OPERATION_TYPE_BUILD_BLAS_FROM_CLAS;
+        blasOpIn.pClasDesc = &blasInputs;
+        D3D12_RTAS_OPERATION_PREBUILD_INFO blasPre = {};
+        deviceRT2->GetRTASOperationPrebuildInfo(&blasOpIn, &blasPre);
+
+        // ---- Allocate result + scratch buffers ----------------------------
+        m_clasResult = PtSample::CreateDefaultBuffer(device, clasPre.ResultDataMaxSizeInBytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+            D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            (base + L"/CLAS result").c_str());
+        m_clasScratch = PtSample::CreateDefaultBuffer(device, clasPre.ScratchDataSizeInBytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON, (base + L"/CLAS scratch").c_str());
+        m_clasAddresses = PtSample::CreateDefaultBuffer(device,
+            clasCount * sizeof(D3D12_GPU_VIRTUAL_ADDRESS),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON, (base + L"/CLAS addresses").c_str());
+        m_clusterBlas = PtSample::CreateDefaultBuffer(device, blasPre.ResultDataMaxSizeInBytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+            D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE,
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            (base + L"/ClusterBLAS").c_str());
+        m_clusterBlasScratch = PtSample::CreateDefaultBuffer(device, blasPre.ScratchDataSizeInBytes,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON, (base + L"/ClusterBLAS scratch").c_str());
+
+        // ---- 1) CLAS build (BATCHED, IMPLICIT destinations) ---------------
+        D3D12_RTAS_BATCHED_OPERATION_DATA clasBatch = {};
+        clasBatch.AddressResolutionFlags = D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_NONE;
+        clasBatch.BatchResultData        = m_clasResult->GetGPUVirtualAddress();
+        clasBatch.BatchScratchData       = m_clasScratch->GetGPUVirtualAddress();
+        clasBatch.ResultAddressArray.StartAddress  = m_clasAddresses->GetGPUVirtualAddress();
+        clasBatch.ResultAddressArray.StrideInBytes = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+        clasBatch.ResultSizeArray = {};
+        clasBatch.IndirectArgumentArray.StartAddress  = m_clasArgsUpload->GetGPUVirtualAddress();
+        clasBatch.IndirectArgumentArray.StrideInBytes = sizeof(args[0]);
+        clasBatch.IndirectArgumentArraySize = 0;     // 0 = use MaxArgCount
+        clasBatch.ToolsInfo = 0;
+        D3D12_RTAS_OPERATION_DESC clasDesc = {};
+        clasDesc.Inputs                = clasOpIn;
+        clasDesc.pBatchedOperationData = &clasBatch;
+        cl2->ExecuteIndirectRTASOperations(1, &clasDesc,
+            D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+        {
+            // CLAS results read by the next op; UAV barrier on the result
+            // buffer (the acceleration structure) and addresses buffer.
+            D3D12_RESOURCE_BARRIER bars[2] = {};
+            bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            bars[0].UAV.pResource = m_clasResult.Get();
+            bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            bars[1].UAV.pResource = m_clasAddresses.Get();
+            cl->ResourceBarrier(2, bars);
+        }
+
+        // ---- 2) BLAS-from-CLAS (BATCHED, IMPLICIT destinations) -----------
+        // Build args: one D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS
+        // pointing at the CLAS addresses buffer.
+        D3D12_RTAS_OPERATION_BUILD_BLAS_FROM_CLAS_ARGS blasArgs = {};
+        blasArgs.ClasAddressCount  = clasCount;
+        blasArgs.ClasAddressStride = sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
+        blasArgs.ClasAddressArray  = m_clasAddresses->GetGPUVirtualAddress();
+        m_clusterBlasArgsUpload = PtSample::CreateUploadBufferWithData(
+            device, &blasArgs, sizeof(blasArgs), (base + L"/ClusterBLAS args").c_str());
+
+        D3D12_RTAS_BATCHED_OPERATION_DATA blasBatch = {};
+        blasBatch.AddressResolutionFlags = D3D12_RTAS_OPERATION_ADDRESS_RESOLUTION_FLAG_NONE;
+        blasBatch.BatchResultData        = m_clusterBlas->GetGPUVirtualAddress();
+        blasBatch.BatchScratchData       = m_clusterBlasScratch->GetGPUVirtualAddress();
+        blasBatch.IndirectArgumentArray.StartAddress  = m_clusterBlasArgsUpload->GetGPUVirtualAddress();
+        blasBatch.IndirectArgumentArray.StrideInBytes = sizeof(blasArgs);
+        blasBatch.IndirectArgumentArraySize = 0;
+        blasBatch.ToolsInfo = 0;
+        D3D12_RTAS_OPERATION_DESC blasDesc = {};
+        blasDesc.Inputs                = blasOpIn;
+        blasDesc.pBatchedOperationData = &blasBatch;
+        cl2->ExecuteIndirectRTASOperations(1, &blasDesc,
+            D3D12_EXECUTE_INDIRECT_RTAS_OPERATIONS_FLAG_NONE);
+        {
+            D3D12_RESOURCE_BARRIER uav = {};
+            uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav.UAV.pResource = m_clusterBlas.Get();
+            cl->ResourceBarrier(1, &uav);
+        }
+
+        m_clasCount = clasCount;
+        SampleLog::LogF(L"[mesh-assets] %s ClusterBLAS: %u CLAS (max %u tris each), "
+                        L"result=%llu B  CLAS_result=%llu B  scratch=%llu+%llu B\n",
+                        base.c_str(), clasCount, (UINT)kTrianglesPerCluster,
+                        (unsigned long long)blasPre.ResultDataMaxSizeInBytes,
+                        (unsigned long long)clasPre.ResultDataMaxSizeInBytes,
+                        (unsigned long long)clasPre.ScratchDataSizeInBytes,
+                        (unsigned long long)blasPre.ScratchDataSizeInBytes);
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS ClusterBlasGpuVa() const
+    {
+        return m_clusterBlas ? m_clusterBlas->GetGPUVirtualAddress() : 0;
+    }
+    UINT ClasCount() const { return m_clasCount; }
+
 private:
     ProceduralGeometry::Mesh m_mesh;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vb;
@@ -197,6 +402,16 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blasScratch;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vertNormals;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_vertNormalsUpload;
+    // Cluster BLAS path (CLAS + BUILD_BLAS_FROM_CLAS).  Allocated +
+    // populated by BuildClusterBlas() if the sample uses the cluster path.
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clasArgsUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clasResult;          // CLAS data (BatchResultData)
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clasScratch;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clasAddresses;       // GPUVAs of each built CLAS (driver-populated)
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clusterBlas;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clusterBlasScratch;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_clusterBlasArgsUpload;
+    UINT m_clasCount = 0;
     UINT64 m_blasResultBytes  = 0;
     UINT64 m_blasScratchBytes = 0;
 };

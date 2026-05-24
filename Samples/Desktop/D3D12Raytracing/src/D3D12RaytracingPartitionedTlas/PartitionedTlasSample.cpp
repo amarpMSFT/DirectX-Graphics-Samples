@@ -106,6 +106,12 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
                      _wcsicmp(argv[i+1], L"flock")        == 0) m_cameraMode = CameraMode::FlockFollow;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--blas-mode") == 0 && i + 1 < argc)
+        {
+            if      (_wcsicmp(argv[i+1], L"dxr1")    == 0) m_blasMode = BlasMode::Dxr1;
+            else if (_wcsicmp(argv[i+1], L"cluster") == 0) m_blasMode = BlasMode::Cluster;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--partitions") == 0 && i + 1 < argc)
         {
             int n = _wtoi(argv[i + 1]);
@@ -278,6 +284,20 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // reflection; balls use the unit-sphere shortcut in the shader so
     // they don't.
     m_donut.BuildPerTriVertexNormalsBuffer(m_dxrDevice.Get(), m_dxrCommandList.Get(), L"DonutMesh");
+
+    // Cluster BLAS path (CLAS + BUILD_BLAS_FROM_CLAS).  Built unconditionally
+    // -- if --blas-mode dxr1 is selected the cluster BLAS sits unused at the
+    // cost of a few KB, but the A/B compare stays trivial.
+    {
+        ComPtr<ID3D12DeviceRaytracing2> dRT2;
+        ThrowIfFailed(m_dxrDevice.As(&dRT2), L"QI(ID3D12DeviceRaytracing2) for cluster BLAS");
+        ComPtr<ID3D12CommandListRaytracing2> clRT2;
+        ThrowIfFailed(m_dxrCommandList.As(&clRT2), L"QI(ID3D12CommandListRaytracing2) for cluster BLAS");
+        m_ball.BuildClusterBlas    (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"BallMeshHi");
+        m_ballMid.BuildClusterBlas (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"BallMeshMid");
+        m_ballLow.BuildClusterBlas (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"BallMeshLo");
+        m_donut.BuildClusterBlas   (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"DonutMesh");
+    }
 
     // Donut flock-member roster.  Members orbit the flock center in a
     // small ring (3D positions baked here; later milestones can animate
@@ -554,7 +574,11 @@ void PartitionedTlasSample::BuildSceneInstances()
     m_ballWorldPos.clear();
     m_ballWorldPos.reserve(m_scene.TotalBalls());
 
-    const D3D12_GPU_VIRTUAL_ADDRESS blas = m_ball.BlasGpuVa();
+    // Pick the BLAS GPUVA for the active path (`--blas-mode dxr1|cluster`).
+    // Cluster mode uses the CLAS+BLAS_FROM_CLAS-built BLAS; DXR1 mode uses
+    // the classic BuildRaytracingAccelerationStructure-built BLAS.
+    const bool useCluster = (m_blasMode == BlasMode::Cluster);
+    const D3D12_GPU_VIRTUAL_ADDRESS blas = useCluster ? m_ball.ClusterBlasGpuVa() : m_ball.BlasGpuVa();
     // PTLAS InstanceIndex layout: donuts occupy [0..kDonutCount), balls
     // start at kDonutCount.  Recorded in inst.instanceIndex so PtlasSystem
     // writes to the correct slot even when we only WRITE_INSTANCE a subset.
@@ -846,9 +870,9 @@ void PartitionedTlasSample::DoRender()
                 const float dz = wpz - m_asOrigin.z;
                 const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
                 const uint8_t lod = SelectLodInitial(dist);
-                inst.blasGva = (lod == 0) ? m_ball.BlasGpuVa()
-                             : (lod == 1) ? m_ballMid.BlasGpuVa()
-                                          : m_ballLow.BlasGpuVa();
+                inst.blasGva = (lod == 0) ? BallBlasFor(0)
+                             : (lod == 1) ? BallBlasFor(1)
+                                          : BallBlasFor(2);
                 // ENABLE_EXPLICIT_AABB: a CONSERVATIVE AABB around the
                 // ball's REST partition-local position, padded out by the
                 // displacement envelope (kDisplaceAabbPad) so the AABB
@@ -880,7 +904,7 @@ void PartitionedTlasSample::DoRender()
                            * XMMatrixTranslation(m.localOffset.x, m.localOffset.y, m.localOffset.z);
                 SceneInstance inst = {};
                 XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(t));
-                inst.blasGva        = m_donut.BlasGpuVa();
+                inst.blasGva        = DonutBlas();
                 inst.instanceIndex  = kFlockInstBase + d;
                 inst.instanceID     = 0x10000u | d;
                 inst.instanceMask   = 0xFF;
@@ -928,9 +952,9 @@ void PartitionedTlasSample::DoRender()
                 {
                     ITlasSystem::InstanceUpdate u = {};
                     u.instanceIndex = kDonutCount + b;
-                    u.newBlas = (newLod == 0) ? m_ball.BlasGpuVa()
-                              : (newLod == 1) ? m_ballMid.BlasGpuVa()
-                                              : m_ballLow.BlasGpuVa();
+                    u.newBlas = (newLod == 0) ? BallBlasFor(0)
+                              : (newLod == 1) ? BallBlasFor(1)
+                                              : BallBlasFor(2);
                     updates.push_back(u);
                     m_ballLod[b] = newLod;
                 }
@@ -1044,7 +1068,7 @@ void PartitionedTlasSample::DoRender()
                             m_flock.position.z + m.localOffset.z - m_asOrigin.z);
             SceneInstance inst = {};
             XMStoreFloat4x4(&inst.transform, XMMatrixTranspose(t));
-            inst.blasGva        = m_donut.BlasGpuVa();
+            inst.blasGva        = DonutBlas();
             inst.instanceID     = 0x10000u | d;
             inst.instanceMask   = 0xFF;
             inst.partitionIndex = 0;

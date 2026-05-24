@@ -78,6 +78,15 @@ private:
     TlasMode m_tlasMode = TlasMode::Partitioned;
     std::unique_ptr<ITlasSystem> m_tlas;
 
+    // ---- BLAS mode: which BLAS path the per-instance AccelerationStructure
+    // pointer references.  `dxr1` uses the classic DXR1 BLAS built by
+    // MeshAssets::Initialize().  `cluster` uses the DXR2 CLAS +
+    // BUILD_BLAS_FROM_CLAS path built by MeshAssets::BuildClusterBlas().
+    // Both produce a BLAS GPUVA usable as `AccelerationStructure` -- the
+    // PTLAS doesn't care which path produced it.
+    enum class BlasMode { Dxr1, Cluster };
+    BlasMode m_blasMode = BlasMode::Cluster;   // default to cluster (new path)
+
     // ---- Static assets ----
     MeshAssets m_ball;       // hi-LOD icosphere   (subdiv=2, 320 tris)
     MeshAssets m_ballMid;    // mid-LOD icosphere  (subdiv=1, 80 tris)  -- phase 5
@@ -154,6 +163,24 @@ private:
         if (dist < kLodHiDist)  return 0;
         if (dist < kLodMidDist) return 1;
         return 2;
+    }
+
+    // BLAS GPUVA selector helpers -- pick DXR1 vs Cluster BLAS based on
+    // the current --blas-mode.  ball LOD index: 0=hi, 1=mid, 2=lo.
+    D3D12_GPU_VIRTUAL_ADDRESS BallBlasFor(uint8_t lod) const
+    {
+        const bool useCluster = (m_blasMode == BlasMode::Cluster);
+        switch (lod)
+        {
+        case 0:  return useCluster ? m_ball.ClusterBlasGpuVa()    : m_ball.BlasGpuVa();
+        case 1:  return useCluster ? m_ballMid.ClusterBlasGpuVa() : m_ballMid.BlasGpuVa();
+        default: return useCluster ? m_ballLow.ClusterBlasGpuVa() : m_ballLow.BlasGpuVa();
+        }
+    }
+    D3D12_GPU_VIRTUAL_ADDRESS DonutBlas() const
+    {
+        return (m_blasMode == BlasMode::Cluster) ? m_donut.ClusterBlasGpuVa()
+                                                  : m_donut.BlasGpuVa();
     }
 
     // ---- Camera / flock-follow rig.  --camera-mode orbit|flock-follow

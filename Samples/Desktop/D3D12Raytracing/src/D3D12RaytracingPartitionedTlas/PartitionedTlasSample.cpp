@@ -277,7 +277,7 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
     // Donut needs accurate per-triangle normals for proper shading +
     // reflection; balls use the unit-sphere shortcut in the shader so
     // they don't.
-    m_donut.BuildFaceNormalsBuffer(m_dxrDevice.Get(), m_dxrCommandList.Get(), L"DonutMesh");
+    m_donut.BuildPerTriVertexNormalsBuffer(m_dxrDevice.Get(), m_dxrCommandList.Get(), L"DonutMesh");
 
     // Donut flock-member roster.  Members orbit the flock center in a
     // small ring (3D positions baked here; later milestones can animate
@@ -451,7 +451,7 @@ void PartitionedTlasSample::CreateRaytracingPipeline()
     params[PT_GRS_OutputUavSlot].InitAsDescriptorTable(1, &uavRange);
     params[PT_GRS_AccelerationStructureSlot].InitAsShaderResourceView(0);
     params[PT_GRS_SceneCBVSlot].InitAsConstantBufferView(0);
-    params[PT_GRS_DonutFaceNormalsSrvSlot].InitAsShaderResourceView(1);
+    params[PT_GRS_DonutVertNormalsSrvSlot].InitAsShaderResourceView(1);
 
     CD3DX12_ROOT_SIGNATURE_DESC rsDesc(_countof(params), params, 0, nullptr,
         D3D12_ROOT_SIGNATURE_FLAG_NONE);
@@ -1118,7 +1118,7 @@ void PartitionedTlasSample::DoRender()
     uavGpu.ptr += SIZE_T(m_uavHeapIdx) * m_descSize;
     cl->SetComputeRootDescriptorTable(PT_GRS_OutputUavSlot, uavGpu);
     cl->SetComputeRootShaderResourceView(PT_GRS_AccelerationStructureSlot, m_tlas->Gva());
-    cl->SetComputeRootShaderResourceView(PT_GRS_DonutFaceNormalsSrvSlot, m_donut.FaceNormalsGpuVa());
+    cl->SetComputeRootShaderResourceView(PT_GRS_DonutVertNormalsSrvSlot, m_donut.VertNormalsGpuVa());
     const UINT slot = (UINT)(m_framesRendered % FrameCount);
     cl->SetComputeRootConstantBufferView(PT_GRS_SceneCBVSlot,
         m_sceneCb->GetGPUVirtualAddress() + slot * m_sceneCbStride);

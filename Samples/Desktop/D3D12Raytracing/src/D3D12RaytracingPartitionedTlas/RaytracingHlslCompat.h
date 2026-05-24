@@ -32,7 +32,7 @@
 #define PT_GRS_OutputUavSlot              0
 #define PT_GRS_AccelerationStructureSlot  1
 #define PT_GRS_SceneCBVSlot               2
-#define PT_GRS_DonutFaceNormalsSrvSlot    3   // milestone 6: per-mesh SRV for donut face normals
+#define PT_GRS_DonutVertNormalsSrvSlot    3   // milestone 6: per-mesh SRV for donut face normals
 
 // Per-frame constants for raygen / closest-hit.
 //

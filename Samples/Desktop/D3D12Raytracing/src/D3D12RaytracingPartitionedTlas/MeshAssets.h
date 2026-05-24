@@ -127,57 +127,64 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS BlasGpuVa() const { return m_blas->GetGPUVirtualAddress(); }
     UINT64                    BlasResultBytes() const { return m_blasResultBytes; }
 
-    // ---- Optional: per-triangle face normals SRV ----
+    // ---- Optional: per-triangle vertex normals SRV ----
     //
-    // BuildFaceNormalsBuffer() computes one OBJECT-SPACE face normal per
-    // triangle (cross product of (v1-v0) x (v2-v0), normalized) and uploads
-    // it into a DEFAULT-heap buffer.  Closest-hit shaders index it by
-    // PrimitiveIndex() to recover the true surface normal -- essential for
-    // meshes where the "unit-sphere" object-pos shortcut doesn't work (the
-    // donut/torus in this sample).  Buffer layout: tightly packed float3
-    // entries (12 bytes each).  Used as a ByteAddressBuffer SRV in HLSL.
+    // BuildPerTriVertexNormalsBuffer() packs THREE OBJECT-SPACE vertex
+    // normals per triangle (the .normals of the triangle's three vertices,
+    // in IB order) into a tightly-packed buffer.  Closest-hit shaders read
+    // a triangle's three vertex normals by PrimitiveIndex() * 36, then
+    // interpolate them via the barycentric attributes for smooth shading
+    // (the "vertex-normal interpolation" pattern used by the clustered
+    // sample at line 550 of its Raytracing.hlsl).  Buffer layout:
+    //
+    //   bytes [primIdx * 36     .. primIdx * 36 + 12) : vertex 0 normal
+    //   bytes [primIdx * 36 + 12.. primIdx * 36 + 24) : vertex 1 normal
+    //   bytes [primIdx * 36 + 24.. primIdx * 36 + 36) : vertex 2 normal
     //
     // Records into the same cmd list as Initialize(); the upload staging
     // buffer is kept as a member until the owner releases this object.
-    void BuildFaceNormalsBuffer(ID3D12Device5* device,
-                                ID3D12GraphicsCommandList4* cl,
-                                const wchar_t* nameHint = L"Mesh")
+    //
+    // The "barycentric weight 0 = 1 - x - y" convention used in the shader
+    // assumes the same vertex order as IB[primIdx*3 + 0/1/2] which is what
+    // we pack here.
+    void BuildPerTriVertexNormalsBuffer(ID3D12Device5* device,
+                                        ID3D12GraphicsCommandList4* cl,
+                                        const wchar_t* nameHint = L"Mesh")
     {
+        if (m_mesh.normals.size() != m_mesh.positions.size())
+        {
+            // Caller forgot to populate per-vertex normals for this mesh.
+            // (ProceduralGeometry::MakeIcosphere / MakeTorus both fill them;
+            // a foreign mesh might not.)
+            return;
+        }
         const uint32_t triCount = (uint32_t)(m_mesh.indices.size() / 3);
-        std::vector<DirectX::XMFLOAT3> faceN(triCount);
+        std::vector<DirectX::XMFLOAT3> packed(triCount * 3);
         for (uint32_t t = 0; t < triCount; ++t)
         {
-            const DirectX::XMFLOAT3& a = m_mesh.positions[m_mesh.indices[t*3 + 0]];
-            const DirectX::XMFLOAT3& b = m_mesh.positions[m_mesh.indices[t*3 + 1]];
-            const DirectX::XMFLOAT3& c = m_mesh.positions[m_mesh.indices[t*3 + 2]];
-            DirectX::XMFLOAT3 e1 = { b.x - a.x, b.y - a.y, b.z - a.z };
-            DirectX::XMFLOAT3 e2 = { c.x - a.x, c.y - a.y, c.z - a.z };
-            DirectX::XMFLOAT3 n  = { e1.y*e2.z - e1.z*e2.y,
-                                     e1.z*e2.x - e1.x*e2.z,
-                                     e1.x*e2.y - e1.y*e2.x };
-            float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
-            if (len > 1e-12f) { n.x /= len; n.y /= len; n.z /= len; }
-            faceN[t] = n;
+            packed[t*3 + 0] = m_mesh.normals[m_mesh.indices[t*3 + 0]];
+            packed[t*3 + 1] = m_mesh.normals[m_mesh.indices[t*3 + 1]];
+            packed[t*3 + 2] = m_mesh.normals[m_mesh.indices[t*3 + 2]];
         }
-        const UINT64 bytes = (UINT64)faceN.size() * sizeof(DirectX::XMFLOAT3);
+        const UINT64 bytes = (UINT64)packed.size() * sizeof(DirectX::XMFLOAT3);
         std::wstring base = nameHint ? nameHint : L"Mesh";
-        m_faceNormalsUpload = PtSample::CreateUploadBufferWithData(
-            device, faceN.data(), bytes, (base + L"/FaceN upload").c_str());
-        m_faceNormals = PtSample::CreateDefaultBuffer(device, bytes, D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COMMON, (base + L"/FaceN").c_str());
-        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_faceNormals.Get(),
+        m_vertNormalsUpload = PtSample::CreateUploadBufferWithData(
+            device, packed.data(), bytes, (base + L"/VertN upload").c_str());
+        m_vertNormals = PtSample::CreateDefaultBuffer(device, bytes, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON, (base + L"/VertN").c_str());
+        auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(m_vertNormals.Get(),
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->ResourceBarrier(1, &toCopy);
-        cl->CopyBufferRegion(m_faceNormals.Get(), 0, m_faceNormalsUpload.Get(), 0, bytes);
-        auto toSrv = CD3DX12_RESOURCE_BARRIER::Transition(m_faceNormals.Get(),
+        cl->CopyBufferRegion(m_vertNormals.Get(), 0, m_vertNormalsUpload.Get(), 0, bytes);
+        auto toSrv = CD3DX12_RESOURCE_BARRIER::Transition(m_vertNormals.Get(),
             D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         cl->ResourceBarrier(1, &toSrv);
-        SampleLog::LogF(L"[mesh-assets] %s face normals: %u entries (%llu B)\n",
-                        base.c_str(), triCount, (unsigned long long)bytes);
+        SampleLog::LogF(L"[mesh-assets] %s per-tri vertex normals: %u entries (%llu B)\n",
+                        base.c_str(), triCount * 3, (unsigned long long)bytes);
     }
-    D3D12_GPU_VIRTUAL_ADDRESS FaceNormalsGpuVa() const
+    D3D12_GPU_VIRTUAL_ADDRESS VertNormalsGpuVa() const
     {
-        return m_faceNormals ? m_faceNormals->GetGPUVirtualAddress() : 0;
+        return m_vertNormals ? m_vertNormals->GetGPUVirtualAddress() : 0;
     }
 
 private:
@@ -188,8 +195,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> m_ibUpload;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blas;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_blasScratch;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_faceNormals;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_faceNormalsUpload;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_vertNormals;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_vertNormalsUpload;
     UINT64 m_blasResultBytes  = 0;
     UINT64 m_blasScratchBytes = 0;
 };

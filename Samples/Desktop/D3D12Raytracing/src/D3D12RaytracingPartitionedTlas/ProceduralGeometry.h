@@ -15,9 +15,11 @@
 //   * MakeIcosphere(subdivisions) -- unit sphere centered at origin
 //   * MakeTorus    (major, minor, segMajor, segMinor) -- torus around Y axis
 //
-// Both return tightly-packed float3 positions + uint32 indices.  Normals are
-// derived in the closest-hit shader from the triangle's barycentric position
-// + world geometry, so no per-vertex normals are needed.
+// Each mesh carries per-vertex positions + indices + per-vertex NORMALS.
+// For the icosphere the normal == the (unit-length) position by construction;
+// for the torus the normal is the analytic parametric normal at (u,v) --
+// independent of majorR -- so closest-hit shaders that interpolate
+// per-vertex normals across barycentric coords produce smooth shading.
 //
 #pragma once
 
@@ -34,6 +36,7 @@ namespace ProceduralGeometry
     struct Mesh
     {
         std::vector<XMFLOAT3>   positions;
+        std::vector<XMFLOAT3>   normals;        // per-vertex, unit length
         std::vector<uint32_t>   indices;        // 3 per triangle
 
         uint32_t TriangleCount() const { return (uint32_t)(indices.size() / 3u); }
@@ -123,6 +126,8 @@ namespace ProceduralGeometry
             m.indices = std::move(nextIdx);
         }
 
+        // Per-vertex normal == position for the unit-radius icosphere.
+        m.normals = m.positions;
         return m;
     }
 
@@ -134,6 +139,7 @@ namespace ProceduralGeometry
     {
         Mesh m;
         m.positions.reserve(segMajor * segMinor);
+        m.normals.reserve  (segMajor * segMinor);
         m.indices.reserve(segMajor * segMinor * 6);
 
         const float kTwoPi = 6.28318530718f;
@@ -147,6 +153,10 @@ namespace ProceduralGeometry
                 const float cb = std::cos(b), sb = std::sin(b);
                 const float r = majorR + minorR * cb;
                 m.positions.push_back({ r * ca, minorR * sb, r * sa });
+                // Analytic per-vertex normal at (u, v) on a torus.  Pointing
+                // away from the minor circle's centre; doesn't depend on
+                // majorR.  Unit length by construction (cos^2+sin^2 = 1).
+                m.normals.push_back({ cb * ca, sb, cb * sa });
             }
         }
         for (uint32_t u = 0; u < segMajor; ++u)

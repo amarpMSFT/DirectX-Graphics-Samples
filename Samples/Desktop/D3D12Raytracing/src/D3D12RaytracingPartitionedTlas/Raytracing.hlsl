@@ -14,10 +14,13 @@
 //   * ClosestHit_Ball     -- icosphere closest-hit (unit-sphere normal shortcut;
 //                            valid for our unit-radius procedural icospheres).
 //                            Casts a shadow ray toward the sun.
-//   * ClosestHit_Donut    -- torus closest-hit; reads true face normal from a
-//                            per-mesh SRV (g_donutFaceNormals).  Casts shadow
-//                            ray AND a reflection ray; mixes reflected color
-//                            into the surface color (reflective donuts).
+//   * ClosestHit_Donut    -- torus closest-hit; reads three vertex normals
+//                            (one per triangle vertex, packed 3-per-triangle)
+//                            from a per-mesh SRV (g_donutVertNormals) and
+//                            interpolates them via barycentrics for smooth
+//                            shading.  Casts shadow ray AND a reflection
+//                            ray; mixes reflected color into the surface
+//                            color (reflective donuts).
 //
 // Per-instance ContributionToHitGroupIndex selects between the two hit groups:
 //   0 -> HitGroup_Ball, 1 -> HitGroup_Donut.
@@ -40,7 +43,7 @@
 #include "RaytracingHlslCompat.h"
 
 RaytracingAccelerationStructure g_tlas             : register(t0);
-ByteAddressBuffer               g_donutFaceNormals : register(t1);
+ByteAddressBuffer               g_donutVertNormals : register(t1);   // 3 float3 per triangle, IB-order
 RWTexture2D<float4>             g_output           : register(u0);
 ConstantBuffer<SceneConstantBuffer> g_scene        : register(b0);
 
@@ -176,11 +179,23 @@ void ClosestHit_Ball(inout Payload pay, in BuiltInTriangleIntersectionAttributes
 [shader("closesthit")]
 void ClosestHit_Donut(inout Payload pay, in BuiltInTriangleIntersectionAttributes attr)
 {
-    // Real face normal from the per-mesh SRV (g_donutFaceNormals).  Each
-    // entry is a float3 (12 bytes) in object space; CPU pre-computed via
-    // cross-product on the donut mesh's triangle vertices.
+    // Smooth normal: read the THREE per-vertex normals for this triangle
+    // (packed 3-per-triangle in g_donutVertNormals by
+    // MeshAssets::BuildPerTriVertexNormalsBuffer) and interpolate them via
+    // the barycentric attributes.  Same pattern as the clustered sample's
+    // LoadHitContext at Raytracing.hlsl:550-557.
+    //
+    // attr.barycentrics: x = weight of vertex 1, y = weight of vertex 2.
+    // Vertex 0's weight = 1 - x - y.  Order matches IB[primIdx*3 + 0/1/2].
     uint primIdx = PrimitiveIndex();
-    float3 nObj  = asfloat(g_donutFaceNormals.Load3(primIdx * 12));
+    uint base    = primIdx * 36;     // 3 normals * 12 bytes
+    float3 n0 = asfloat(g_donutVertNormals.Load3(base +  0));
+    float3 n1 = asfloat(g_donutVertNormals.Load3(base + 12));
+    float3 n2 = asfloat(g_donutVertNormals.Load3(base + 24));
+    float  bw1 = attr.barycentrics.x;
+    float  bw2 = attr.barycentrics.y;
+    float  bw0 = 1.0 - bw1 - bw2;
+    float3 nObj   = normalize(n0 * bw0 + n1 * bw1 + n2 * bw2);
     float3 nWorld = normalize(mul((float3x3)ObjectToWorld3x4(), nObj));
     if (dot(nWorld, WorldRayDirection()) > 0) nWorld = -nWorld;
 
@@ -211,8 +226,8 @@ void ClosestHit_Donut(inout Payload pay, in BuiltInTriangleIntersectionAttribute
     }
 
     // Donut surface color: warm metallic-ish tint.
-    float3 base    = float3(0.65, 0.45, 0.20);
-    float3 surface = base * (0.12 + 0.88 * ndotl * vis);
+    float3 base_col = float3(0.65, 0.45, 0.20);
+    float3 surface  = base_col * (0.12 + 0.88 * ndotl * vis);
 
     // 55% reflective; brighter on rim (Fresnel-ish).
     float fres = pow(1.0 - saturate(dot(-WorldRayDirection(), nWorld)), 2.0);

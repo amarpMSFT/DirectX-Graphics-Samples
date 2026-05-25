@@ -120,6 +120,10 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
                 m_donutAnimate = true;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--lod-via-update") == 0)
+        {
+            m_lodViaUpdate = true;
+        }
         else if (_wcsicmp(argv[i], L"--partitions") == 0 && i + 1 < argc)
         {
             int n = _wtoi(argv[i + 1]);
@@ -831,6 +835,16 @@ void PartitionedTlasSample::DoRender()
         m_animatedDonut.Tick(cl, cl2, tsec);
     }
 
+    // Partitioned mode: deferred UPDATE_INSTANCE queue for the diagnostic
+    // --lod-via-update path (off by default).  When on, LOD-bin changes
+    // are emitted as UPDATE_INSTANCE ops AFTER the WRITE_INSTANCE +
+    // TRANSLATE_PARTITION block, so the per-frame PTLAS build call
+    // contains WRITE + UPDATE in the same ExecuteIndirectRTASOperations
+    // call.  Tests the preview NVIDIA driver's alignment fix; without
+    // the fix this combination TDRs the GPU.  Declared here so the
+    // submit after the partitioned block can see it.
+    std::vector<ITlasSystem::InstanceUpdate> deferredUpdates;
+
     if (m_tlasMode == TlasMode::Partitioned)
     {
         // (a) WRITE_INSTANCE for any ball that needs a fresh write this frame.
@@ -872,8 +886,25 @@ void PartitionedTlasSample::DoRender()
                 const uint8_t newLod = SelectLod(dist, m_ballLod[b]);
                 if (newLod != m_ballLod[b])
                 {
-                    writeNow[b]   = 1;
-                    m_ballLod[b]  = newLod;
+                    if (m_lodViaUpdate)
+                    {
+                        // Diagnostic path: emit UPDATE_INSTANCE for this ball
+                        // in the same PTLAS build as the (separate) WRITE_INSTANCEs.
+                        // Verifies the alignment-fix path on the driver.
+                        ITlasSystem::InstanceUpdate u = {};
+                        u.instanceIndex = kDonutCount + b;
+                        u.newBlas = (newLod == 0) ? BallBlasFor(0)
+                                  : (newLod == 1) ? BallBlasFor(1)
+                                                  : BallBlasFor(2);
+                        deferredUpdates.push_back(u);
+                        m_ballLod[b] = newLod;
+                    }
+                    else
+                    {
+                        // Default path: promote LOD swap to WRITE_INSTANCE.
+                        writeNow[b]  = 1;
+                        m_ballLod[b] = newLod;
+                    }
                 }
             }
         }
@@ -1116,6 +1147,17 @@ void PartitionedTlasSample::DoRender()
             adj.push_back(inst);
         }
         m_tlas->WriteInstances(adj.data(), (UINT)adj.size());
+    }
+    // Diagnostic UPDATE_INSTANCE submission for --lod-via-update.  Issued
+    // BEFORE Build() so the queued UPDATE ops land in the SAME
+    // ExecuteIndirectRTASOperations call as the WRITE + TRANSLATE ops
+    // assembled by PtlasSystem during the partitioned branch above.  On
+    // a pre-alignment-fix driver this combination TDRs; with the
+    // alignment fix shipped (or with our 16B-aligned arena layout) it
+    // runs clean.
+    if (m_tlasMode == TlasMode::Partitioned && !deferredUpdates.empty())
+    {
+        m_tlas->UpdateInstances(deferredUpdates.data(), (UINT)deferredUpdates.size());
     }
     m_tlas->Build(cl, cl2);
 

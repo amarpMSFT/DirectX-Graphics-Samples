@@ -88,6 +88,14 @@ private:
     enum class BlasMode { Dxr1, Cluster };
     BlasMode m_blasMode = BlasMode::Cluster;   // default to cluster (new path)
 
+    // Diagnostic: emit UPDATE_INSTANCE for ball LOD swaps instead of the
+    // default WRITE_INSTANCE-promotion path.  Used to verify the preview
+    // NVIDIA driver's WRITE+UPDATE-same-call bug is resolved after the
+    // alignment fix; defaults OFF so the sample stays bug-free on un-fixed
+    // drivers.  See PtlasSystem::WriteInstances comment for the alignment
+    // background.
+    bool m_lodViaUpdate = false;
+
     // ---- Static assets ----
     MeshAssets m_ball;       // hi-LOD icosphere   (subdiv=2, 320 tris)
     MeshAssets m_ballMid;    // mid-LOD icosphere  (subdiv=1, 80 tris)  -- phase 5

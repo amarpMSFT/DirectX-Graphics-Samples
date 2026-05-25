@@ -208,8 +208,15 @@ void PtlasSystem::WriteInstances(const SceneInstance* instances, UINT count)
     }
 
     constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_WRITE_INSTANCE_ARGS);
+    // 16-byte align: preview NVIDIA driver (2026-05) was assuming a 16B
+    // alignment of the indirect arg structs while the spec/natural alignment
+    // is only 8B.  Leszek Godlewski (NVIDIA) confirmed the assumption + made
+    // a driver fix; on his branch with the fix the 8B-aligned arena layout
+    // also runs clean.  Bumping to 16B here so the sample is correct on BOTH
+    // pre-fix and post-fix drivers.  Same rationale at the UPDATE_INSTANCE
+    // and TRANSLATE_PARTITION callsites below + at the ops header below.
     D3D12_GPU_VIRTUAL_ADDRESS gva =
-        WriteToFrameArena(args.data(), (UINT64)args.size() * kStride, /*align*/8);
+        WriteToFrameArena(args.data(), (UINT64)args.size() * kStride, /*align*/16);
     AppendPendingOp(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_WRITE_INSTANCE,
                     gva, count, kStride);
     m_lastWriteCount += count;
@@ -240,7 +247,7 @@ void PtlasSystem::UpdateInstances(const InstanceUpdate* args, UINT count)
     }
     constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_UPDATE_INSTANCE_ARGS);
     D3D12_GPU_VIRTUAL_ADDRESS gva =
-        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/8);
+        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/16);   // 16B: see WriteInstances comment
     AppendPendingOp(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_UPDATE_INSTANCE,
                     gva, count, kStride);
     m_lastUpdateCount += count;
@@ -281,7 +288,7 @@ void PtlasSystem::TranslatePartitions(const PartitionTranslate* args, UINT count
 
     constexpr UINT kStride = (UINT)sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TRANSLATE_PARTITION_ARGS);
     D3D12_GPU_VIRTUAL_ADDRESS gva =
-        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/4);
+        WriteToFrameArena(a.data(), (UINT64)a.size() * kStride, /*align*/16);   // 16B: see WriteInstances comment
     AppendPendingOp(D3D12_RTAS_PARTITIONED_TLAS_OPERATION_TYPE_TRANSLATE_PARTITION,
                     gva, count, kStride);
     m_lastTranslateCount += count;
@@ -323,12 +330,12 @@ void PtlasSystem::Build(ID3D12GraphicsCommandList4* cl,
         return;
     }
     const UINT64 opsBytes = numOps * sizeof(D3D12_RTAS_PARTITIONED_TLAS_OPERATION);
-    D3D12_GPU_VIRTUAL_ADDRESS opsGva = WriteToFrameArena(ops, opsBytes, /*align*/8);
+    D3D12_GPU_VIRTUAL_ADDRESS opsGva = WriteToFrameArena(ops, opsBytes, /*align*/16);  // 16B: see WriteInstances comment
 
     // (b) Stage the operation count (one UINT32 in upload memory).
     UINT32 numOps32 = numOps;
     D3D12_GPU_VIRTUAL_ADDRESS countGva =
-        WriteToFrameArena(&numOps32, sizeof(numOps32), /*align*/4);
+        WriteToFrameArena(&numOps32, sizeof(numOps32), /*align*/16);  // 16B: see WriteInstances comment
 
     // (c) Fill in the operation data + inputs.
     D3D12_RTAS_OPERATION_INPUTS opInputs   = {};

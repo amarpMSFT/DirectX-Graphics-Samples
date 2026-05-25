@@ -15,6 +15,7 @@
 #include "StepTimer.h"
 #include "ITlasSystem.h"
 #include "MeshAssets.h"
+#include "AnimatedDonutMesh.h"
 #include "SceneLayout.h"
 #include "FlockMotion.h"
 #include "RollingPartitions.h"
@@ -92,6 +93,14 @@ private:
     MeshAssets m_ballMid;    // mid-LOD icosphere  (subdiv=1, 80 tris)  -- phase 5
     MeshAssets m_ballLow;    // lo-LOD icosphere   (subdiv=0, 20 tris)  -- phase 5 LOD swap
     MeshAssets m_donut;
+    // Animated donut: per-frame BUILD_CLAS_FROM_TRIANGLES +
+    // BUILD_BLAS_FROM_CLAS rebuild with pulsating vertex positions.  The
+    // resulting Cluster BLAS gets WRITE_INSTANCE'd into the PTLAS donut
+    // instances each frame -- exercises the canonical "vertex animation
+    // via cluster pipeline + per-frame BLAS swap" workflow.  Selected by
+    // `--animate-donuts on|off` (default on).
+    AnimatedDonutMesh m_animatedDonut;
+    bool m_donutAnimate = true;
     // The donut flock-members live in the PTLAS GLOBAL PARTITION (phase 4).
     // Their transforms are FLOCK-LOCAL (small offsets from flock center)
     // and the global partition's translation is updated each frame to
@@ -179,6 +188,13 @@ private:
     }
     D3D12_GPU_VIRTUAL_ADDRESS DonutBlas() const
     {
+        // Animated path: per-frame Cluster BLAS built by AnimatedDonutMesh
+        // (BUILD_CLAS_FROM_TRIANGLES + BUILD_BLAS_FROM_CLAS with pulsating
+        // vertex data).  Available regardless of --blas-mode since it's a
+        // separate cluster pipeline.  Static path: the donut MeshAssets'
+        // BLAS (DXR1 or cluster, per --blas-mode).
+        if (m_donutAnimate && m_animatedDonut.ClasCount() > 0)
+            return m_animatedDonut.BlasGpuVa();
         return (m_blasMode == BlasMode::Cluster) ? m_donut.ClusterBlasGpuVa()
                                                   : m_donut.BlasGpuVa();
     }

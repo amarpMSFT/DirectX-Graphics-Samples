@@ -112,6 +112,14 @@ void PartitionedTlasSample::ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[],
             else if (_wcsicmp(argv[i+1], L"cluster") == 0) m_blasMode = BlasMode::Cluster;
             i += 1;
         }
+        else if (_wcsicmp(argv[i], L"--animate-donuts") == 0 && i + 1 < argc)
+        {
+            if (_wcsicmp(argv[i+1], L"off") == 0 || _wcsicmp(argv[i+1], L"0") == 0)
+                m_donutAnimate = false;
+            else
+                m_donutAnimate = true;
+            i += 1;
+        }
         else if (_wcsicmp(argv[i], L"--partitions") == 0 && i + 1 < argc)
         {
             int n = _wtoi(argv[i + 1]);
@@ -297,6 +305,15 @@ void PartitionedTlasSample::CreateDeviceDependentResources()
         m_ballMid.BuildClusterBlas (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"BallMeshMid");
         m_ballLow.BuildClusterBlas (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"BallMeshLo");
         m_donut.BuildClusterBlas   (m_dxrDevice.Get(), dRT2.Get(), m_dxrCommandList.Get(), clRT2.Get(), L"DonutMesh");
+        // Animated donut: separate cluster pipeline that re-instantiates
+        // the donut's CLAS+Cluster BLAS each frame with pulsating vertex
+        // positions.  Initialized here; ticked each frame in DoRender
+        // before donut WRITE_INSTANCEs use its BLAS GPUVA.
+        m_animatedDonut.Initialize(m_dxrDevice.Get(), dRT2.Get(),
+                                   m_dxrCommandList.Get(), clRT2.Get(),
+                                   /*majorR*/0.55f, /*minorR*/0.18f,
+                                   /*segMajor*/28, /*segMinor*/14,
+                                   L"AnimatedDonut");
     }
 
     // Donut flock-member roster.  Members orbit the flock center in a
@@ -800,6 +817,19 @@ void PartitionedTlasSample::DoRender()
     const UINT tsSlot     = m_timestampSlotIdx;
     const UINT tsSlotBase = tsSlot * kTimestampsPerFrame;
     cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 0);
+
+    // Animated donut: pulsate vertex positions + rebuild CLAS+Cluster BLAS.
+    // Runs BEFORE the per-frame WRITE_INSTANCE for donuts so the BLAS the
+    // PTLAS sees points at the freshly-built cluster geometry.  Output
+    // BLAS GPUVA is stable (same dest buffer reused per frame), so the
+    // donut WRITE_INSTANCE just consumes m_animatedDonut.BlasGpuVa() via
+    // DonutBlas() -- no extra plumbing.
+    if (m_donutAnimate)
+    {
+        const double tsec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - m_startTime).count();
+        m_animatedDonut.Tick(cl, cl2, tsec);
+    }
 
     if (m_tlasMode == TlasMode::Partitioned)
     {

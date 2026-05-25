@@ -801,29 +801,52 @@ void PartitionedTlasSample::DoRender()
     const UINT tsSlotBase = tsSlot * kTimestampsPerFrame;
     cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 0);
 
-    // Partitioned mode splits work into TWO PTLAS builds per frame: the
-    // first call carries WRITE_INSTANCE + TRANSLATE_PARTITION, the second
-    // carries UPDATE_INSTANCE only.  See the staged-build comment further
-    // down for the driver-bug rationale.  Declared here so the second
-    // build below can see the queued updates after the partitioned block
-    // closes.
-    std::vector<ITlasSystem::InstanceUpdate> deferredUpdates;
-
     if (m_tlasMode == TlasMode::Partitioned)
     {
         // (a) WRITE_INSTANCE for any ball that needs a fresh write this frame.
-        //     Three reasons a ball needs writing:
+        //     Four reasons a ball needs writing:
         //       1. Owner changed (rolling-window transfer or active/inactive flip)
         //       2. Currently displaced by the flock (translation moves per frame)
         //       3. Just left the displacement zone (settle back to rest)
+        //       4. LOD bin just transitioned across a hysteresis threshold
+        //          (was UPDATE_INSTANCE before; promoted to WRITE to avoid the
+        //          NVIDIA W+U same-call driver bug)
         //     #1 comes from RollingPartitions::ChangedBalls(); #2/#3 from
-        //     the displacedNow + previous-frame m_ballDisplaced union above.
+        //     the displacedNow + previous-frame m_ballDisplaced union above;
+        //     #4 from the pre-write LOD scan immediately below.
         //     On the initial pass (m_ptlasInitialWriteDone == false) we
         //     write the full set unconditionally.
         std::vector<SceneInstance> writes;
         // Union ChangedBalls into the writeNow bitmap (it's a tight union).
         for (uint32_t b : m_rollingParts.ChangedBalls())
             if (b < writeNow.size()) writeNow[b] = 1;
+
+        // Pre-write LOD-change scan: bump writeNow[] for any ball whose LOD
+        // bin would transition this frame.  Using SelectLod (with hysteresis)
+        // so per-frame flicker is dampened.  The write loop's blasGva pick
+        // uses SelectLodInitial(dist) which matches the new bin -- so the
+        // emitted WRITE carries the right BLAS automatically.
+        if (m_ballLod.size() == ballN)
+        {
+            for (uint32_t b = 0; b < ballN; ++b)
+            {
+                if (writeNow[b]) continue;     // already writing -- LOD refreshed below
+                if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) continue;
+                const float wpx = m_ballWorldPos[b].x + displacementVec[b].x;
+                const float wpy = m_ballWorldPos[b].y + displacementVec[b].y;
+                const float wpz = m_ballWorldPos[b].z + displacementVec[b].z;
+                const float dx = wpx - m_asOrigin.x;
+                const float dy = wpy - m_asOrigin.y;
+                const float dz = wpz - m_asOrigin.z;
+                const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                const uint8_t newLod = SelectLod(dist, m_ballLod[b]);
+                if (newLod != m_ballLod[b])
+                {
+                    writeNow[b]   = 1;
+                    m_ballLod[b]  = newLod;
+                }
+            }
+        }
 
         const uint32_t fullCount = ballN;
         const bool initialPass   = !m_ptlasInitialWriteDone;
@@ -946,58 +969,19 @@ void PartitionedTlasSample::DoRender()
                             m_partitionBudget);
         }
 
-        // (a3) UPDATE_INSTANCE for balls whose LOD just changed (and that
-        //      did NOT get a fresh WRITE_INSTANCE this frame, since those
-        //      already carry the latest LOD).  LOD = distance from camera;
-        //      bins with hysteresis to limit per-frame flicker.  With
-        //      ENABLE_EXPLICIT_AABB set on the prior WRITE, the swap is
-        //      cheap (no partition refit).
-        if (m_ballLod.size() == ballN)
-        {
-            for (uint32_t b = 0; b < ballN; ++b)
-            {
-                if (writeNow[b]) continue;       // already written
-                if (m_rollingParts.Owner(b) == RollingPartitions::kNoPartition) continue;
-                const auto& pos = m_ballWorldPos[b];
-                float dx = pos.x - m_asOrigin.x;
-                float dy = pos.y - m_asOrigin.y;
-                float dz = pos.z - m_asOrigin.z;
-                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                const uint8_t newLod = SelectLod(dist, m_ballLod[b]);
-                if (newLod != m_ballLod[b])
-                {
-                    ITlasSystem::InstanceUpdate u = {};
-                    u.instanceIndex = kDonutCount + b;
-                    u.newBlas = (newLod == 0) ? BallBlasFor(0)
-                              : (newLod == 1) ? BallBlasFor(1)
-                                              : BallBlasFor(2);
-                    deferredUpdates.push_back(u);
-                    m_ballLod[b] = newLod;
-                }
-            }
-            // KNOWN ISSUE on the current preview NVIDIA driver (2026-05): a
-            // PTLAS build call that contains BOTH WRITE_INSTANCE and
-            // UPDATE_INSTANCE args targeting non-zero InstanceIndex values
-            // TDRs the GPU within ~10 frames.  An attempt to bypass via
-            // two separate PTLAS builds per frame (W+T in one; U in the
-            // other) also TDRs at the same point on the same driver,
-            // suggesting the issue is broader than single-call op-type
-            // mixing.  See ../PtlasWriteUpdateRepro for the isolated single-
-            // call repro that NVIDIA can debug against.
-            //
-            // Workaround: gate UPDATE off on frames that have any WRITE
-            // work.  LOD bin is still kept current via the same-frame
-            // WRITE_INSTANCE (which picks the LOD-appropriate blasGva at
-            // write time), so the only thing we lose is the cheap
-            // UPDATE_INSTANCE path on those frames -- updates DO happen
-            // on calm frames (no rolling-window transitions, no
-            // displacement) where writes is empty.
-            if (!deferredUpdates.empty() && writes.empty())
-            {
-                m_tlas->UpdateInstances(deferredUpdates.data(), (UINT)deferredUpdates.size());
-                deferredUpdates.clear();
-            }
-        }
+        // (a3) LOD-change handling: any ball whose LOD bin just transitioned
+        //      already had writeNow[b] bumped in the pre-write LOD scan
+        //      above (see "Pre-write LOD-change scan").  The write loop's
+        //      blasGva pick uses SelectLodInitial(dist) which always returns
+        //      the bin matching the current distance, so the WRITE_INSTANCE
+        //      carries the right BLAS automatically.  Result: LOD swap is a
+        //      regular WRITE_INSTANCE, no separate UPDATE_INSTANCE op needed
+        //      -- sidesteps the preview NVIDIA W+U driver bug.
+        //
+        //      Cost: WRITE triggers a partition refit (vs UPDATE which is
+        //      no-refit with ENABLE_EXPLICIT_AABB).  In practice negligible
+        //      because LOD-only transitions are rare per frame (LOD bins
+        //      are coarse + hysteresis dampens flicker).
         // For balls written this frame, also seed m_ballLod from current
         // (possibly-displaced) distance so UPDATE_INSTANCE doesn't fire for
         // them next frame when nothing actually changed.
@@ -1105,17 +1089,20 @@ void PartitionedTlasSample::DoRender()
     }
     m_tlas->Build(cl, cl2);
 
-    // NOTE: an earlier attempt to split into two PTLAS builds per frame
-    // (BUILD #1 = WRITE+TRANSLATE; BUILD #2 = UPDATE-only) to bypass the
-    // WRITE+UPDATE same-call driver bug ALSO TDR'd on the same NVIDIA
-    // preview driver -- around frame 8, same timing as the same-call
-    // pattern.  So the bug isn't purely about W+U coexisting in a single
-    // ExecuteIndirectRTASOperations call; back-to-back PTLAS builds on
-    // the same PTLAS resource within one frame's CL also misbehave on
-    // this driver.  Keep the single-build pipeline with the workaround
-    // gate (below at the UPDATE block) until the driver fix lands.  The
-    // separate PtlasWriteUpdateRepro branch is the cleanest evidence
-    // we have for the IHV to investigate.
+    // NOTE: this sample no longer emits UPDATE_INSTANCE ops at all -- the
+    // only place it used UPDATE_INSTANCE was the per-frame ball LOD swap,
+    // and that's been promoted to WRITE_INSTANCE (see the pre-write LOD
+    // scan above).  The reason: a preview NVIDIA driver bug TDRs the GPU
+    // when WRITE_INSTANCE and UPDATE_INSTANCE coexist in the same
+    // ExecuteIndirectRTASOperations call AND both target non-zero
+    // InstanceIndex values, AND an attempt to bypass it via two
+    // back-to-back PTLAS builds (W+T in one call, U in the other) also
+    // TDR'd at the same point.  See ../PtlasWriteUpdateRepro for the
+    // isolated repro NVIDIA can debug against.  Once the driver fix lands,
+    // LOD swap can move back to UPDATE_INSTANCE for the cheap-update path
+    // (with ENABLE_EXPLICIT_AABB, no partition refit), and cluster-template
+    // animation can use UPDATE_INSTANCE to swap freshly-instantiated BLASes
+    // into the donut instances without paying for a global-partition refit.
 
     // Timestamp AFTER TLAS build, resolve this slot's pair to readback.
     cl->EndQuery(m_timestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsSlotBase + 1);

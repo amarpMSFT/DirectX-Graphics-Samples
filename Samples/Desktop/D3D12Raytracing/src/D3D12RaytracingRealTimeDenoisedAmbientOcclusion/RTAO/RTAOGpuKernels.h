@@ -84,11 +84,14 @@ namespace RTAOGpuKernels
             ID3D12DescriptorHeap* descriptorHeap,
             D3D12_GPU_DESCRIPTOR_HANDLE inputDepthResourceHandle,
             D3D12_GPU_DESCRIPTOR_HANDLE inputBlurStrengthResourceHandle,
-            GpuResource* inputOutputResource);
+            GpuResource* inputOutputResource,
+            bool useWaveReadLanePath = false);
 
     private:
         ComPtr<ID3D12RootSignature>         m_rootSignature;
-        ComPtr<ID3D12PipelineState>         m_pipelineStateObject;
+        ComPtr<ID3D12PipelineState>         m_pipelineStateObject;                 // portable groupshared path (default)
+        ComPtr<ID3D12PipelineState>         m_pipelineStateObjectWaveReadLane;     // optional wave-intrinsic fast path
+        bool                                m_waveReadLanePathSupported = false;
 
         ConstantBuffer<FilterConstantBuffer> m_CB;
         UINT                                m_CBinstanceID = 0;
@@ -171,11 +174,14 @@ namespace RTAOGpuKernels
             D3D12_GPU_DESCRIPTOR_HANDLE outputMeanVarianceResourceHandle,
             UINT kernelWidth,
             bool doCheckerboardSampling = false,
-            bool checkerboardLoadEvenPixels = false);
+            bool checkerboardLoadEvenPixels = false,
+            bool useWaveReadLanePath = false);
 
     private:
         ComPtr<ID3D12RootSignature>         m_rootSignature;
-        ComPtr<ID3D12PipelineState>         m_pipelineStateObject;
+        ComPtr<ID3D12PipelineState>         m_pipelineStateObject;                 // portable groupshared path (default)
+        ComPtr<ID3D12PipelineState>         m_pipelineStateObjectWaveReadLane;     // optional wave-intrinsic fast path
+        bool                                m_waveReadLanePathSupported = false;
         ConstantBuffer<CalculateMeanVarianceConstantBuffer> m_CB;
         UINT                                m_CBinstanceID = 0;
     };

@@ -262,3 +262,17 @@ inline bool IsDirectXRaytracingSupported(IDXGIAdapter1* adapter)
         && SUCCEEDED(testDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &featureSupportData, sizeof(featureSupportData)))
         && featureSupportData.RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 }
+
+// Returns whether the device can run the wave-intrinsic denoiser filter permutations.
+// Those permutations exchange a row of values/depths across wave lanes and require wave ops
+// plus a wave width of at least 16 lanes. They additionally assume threads map to lanes in
+// row-major SV_GroupIndex order, which HLSL does not guarantee but which holds on the
+// wave >= 16 GPUs the fast path targets; the portable groupshared permutation is used
+// otherwise and is the safe default.
+inline bool SupportsWaveIntrinsicDenoiserFilterPath(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1 = {};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1)))
+        && options1.WaveOps
+        && options1.WaveLaneCountMin >= 16;
+}

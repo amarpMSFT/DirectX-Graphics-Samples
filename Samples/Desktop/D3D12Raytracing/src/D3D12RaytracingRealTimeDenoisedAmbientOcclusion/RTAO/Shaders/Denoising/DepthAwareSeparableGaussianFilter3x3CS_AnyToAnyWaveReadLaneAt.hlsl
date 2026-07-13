@@ -47,6 +47,12 @@ static const uint NumValuesToLoadPerRowOrColumn =
 groupshared uint PackedValueDepthCache[NumValuesToLoadPerRowOrColumn][8];   // 16bit float value, depth.
 groupshared float FilteredResultCache[NumValuesToLoadPerRowOrColumn][8];    // 32 bit float filteredValue.
 
+#ifndef RTAO_WAVE_READ_LANE_PATH
+// Portable (non-wave) path: cache of loaded (value, depth) so each output lane can read its
+// kernel-window neighbours via groupshared memory instead of wave-lane reads.
+groupshared float2 ValueDepthCache[NumValuesToLoadPerRowOrColumn][NumValuesToLoadPerRowOrColumn];
+#endif
+
 
 // Find a DTID with steps in between the group threads and groups interleaved to cover all pixels.
 uint2 GetPixelIndex(in uint2 Gid, in uint2 GTid)
@@ -71,6 +77,11 @@ void FilterHorizontally(in uint2 Gid, in uint GI)
     uint2 GTid4x16_row0 = uint2(GI % 16, GI / 16);
     int2 GroupKernelBasePixel = GetPixelIndex(Gid, 0) - int(FilterKernel::Radius * cb.step);
     const uint NumRowsToLoadPerThread = 4;
+
+#ifdef RTAO_WAVE_READ_LANE_PATH
+    // ---- Fast path: exchange each row's (value, depth) across lanes with wave-lane reads. ----
+    // Valid only when waves have >= 16 lanes AND threads are packed to lanes in row-major
+    // SV_GroupIndex order; the host selects this permutation only when WaveLaneCountMin >= 16.
     const uint Row_BaseWaveLaneIndex = (WaveGetLaneIndex() / 16) * 16;
 
     [unroll]
@@ -189,6 +200,100 @@ void FilterHorizontally(in uint2 Gid, in uint GI)
             }
         }
     }
+#else
+    // ---- Portable path: exchange each row's (value, depth) through groupshared memory. ----
+    // Independent of wave size and of any lane<->SV_GroupIndex ordering assumption.
+
+    // Phase 1: cooperatively load values/depths into shared memory and cache kernel centers.
+    [unroll]
+    for (uint i = 0; i < NumRowsToLoadPerThread; i++)
+    {
+        uint2 GTid4x16 = GTid4x16_row0 + uint2(0, i * 4);
+        if (GTid4x16.y < NumValuesToLoadPerRowOrColumn && GTid4x16.x < NumValuesToLoadPerRowOrColumn)
+        {
+            int2 pixel = GroupKernelBasePixel + GTid4x16 * cb.step;
+            float value = RTAO::InvalidAOCoefficientValue;
+            float depth = 0;
+            if (IsWithinBounds(pixel, cb.textureDim))
+            {
+                value = g_inOutValue[pixel];
+                depth = g_inDepth[pixel];
+            }
+            ValueDepthCache[GTid4x16.y][GTid4x16.x] = float2(value, depth);
+
+            // Cache the kernel center values for the vertical pass.
+            if (IsInRange(GTid4x16.x, FilterKernel::Radius, FilterKernel::Radius + GroupDim.x - 1))
+            {
+                PackedValueDepthCache[GTid4x16.y][GTid4x16.x - FilterKernel::Radius] = Float2ToHalf(float2(value, depth));
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 2: depth-aware gaussian accumulation for the first GroupDim (8) columns of each row.
+    [unroll]
+    for (uint j = 0; j < NumRowsToLoadPerThread; j++)
+    {
+        uint2 GTid4x16 = GTid4x16_row0 + uint2(0, j * 4);
+        if (GTid4x16.y >= NumValuesToLoadPerRowOrColumn || GTid4x16.x >= GroupDim.x)
+        {
+            continue;
+        }
+
+        // Kernel center values.
+        float2 kc = ValueDepthCache[GTid4x16.y][GTid4x16.x + FilterKernel::Radius];
+        float kcValue = kc.x;
+        float kcDepth = kc.y;
+
+        float weightedValueSum = 0;
+        float weightSum = 0;
+        float gaussianWeightedValueSum = 0;
+        float gaussianWeightedSum = 0;
+
+        // Kernel center contribution.
+        if (kcValue != RTAO::InvalidAOCoefficientValue && kcDepth != 0)
+        {
+            float w_h = FilterKernel::Kernel1D[FilterKernel::Radius];
+            gaussianWeightedValueSum = w_h * kcValue;
+            gaussianWeightedSum = w_h;
+            weightedValueSum = gaussianWeightedValueSum;
+            weightSum = w_h;
+        }
+
+        // Remaining kernel cells.
+        for (uint k = 0; k < FilterKernel::Width; k++)
+        {
+            if (k == FilterKernel::Radius)
+            {
+                continue;   // center already accumulated
+            }
+
+            float2 cvd = ValueDepthCache[GTid4x16.y][GTid4x16.x + k];
+            float cValue = cvd.x;
+            float cDepth = cvd.y;
+
+            if (cValue != RTAO::InvalidAOCoefficientValue && kcDepth != 0 && cDepth != 0)
+            {
+                float w_h = FilterKernel::Kernel1D[k];
+
+                // Simple depth test with tolerance growing as the kernel radius increases.
+                float depthThreshold = 0.05 + cb.step * 0.001 * abs(int(FilterKernel::Radius) - int(k));
+                float w_d = abs(kcDepth - cDepth) <= depthThreshold * kcDepth;
+                float w = w_h * w_d;
+
+                weightedValueSum += w * cValue;
+                weightSum += w;
+                gaussianWeightedValueSum += w_h * cValue;
+                gaussianWeightedSum += w_h;
+            }
+        }
+
+        float gaussianFilteredValue = gaussianWeightedSum > 1e-6 ? gaussianWeightedValueSum / gaussianWeightedSum : RTAO::InvalidAOCoefficientValue;
+        float filteredValue = weightSum > 1e-6 ? weightedValueSum / weightSum : gaussianFilteredValue;
+
+        FilteredResultCache[GTid4x16.y][GTid4x16.x] = filteredValue;
+    }
+#endif
 }
 
 void FilterVertically(uint2 DTid, in uint2 GTid, in float blurStrength)

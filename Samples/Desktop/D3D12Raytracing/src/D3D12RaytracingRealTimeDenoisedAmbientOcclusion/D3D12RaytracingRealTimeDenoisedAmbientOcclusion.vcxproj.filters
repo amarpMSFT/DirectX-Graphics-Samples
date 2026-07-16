@@ -329,6 +329,12 @@
     <FxCompile Include="RTAO\Shaders\Denoising\DisocclusionBlur3x3CS.hlsl">
       <Filter>Shaders\RTAO\Denoising\Filtering</Filter>
     </FxCompile>
+    <FxCompile Include="RTAO\Shaders\Denoising\CalculateMeanVarianceCS_WaveReadLaneAt.hlsl">
+      <Filter>Shaders\RTAO\Denoising\Filtering</Filter>
+    </FxCompile>
+    <FxCompile Include="RTAO\Shaders\Denoising\DisocclusionBlur3x3CS_WaveReadLaneAt.hlsl">
+      <Filter>Shaders\RTAO\Denoising\Filtering</Filter>
+    </FxCompile>
     <FxCompile Include="RTAO\Shaders\Denoising\EdgeStoppingFilter_Gaussian3x3CS.hlsl">
       <Filter>Shaders\RTAO\Denoising\Filtering</Filter>
     </FxCompile>

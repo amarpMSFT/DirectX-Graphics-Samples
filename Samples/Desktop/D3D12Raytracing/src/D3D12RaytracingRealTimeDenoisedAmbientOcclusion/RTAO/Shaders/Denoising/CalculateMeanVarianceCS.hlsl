@@ -9,8 +9,11 @@
 //
 //*********************************************************
 
-// Desc: Calculate Local Mean and Variance via a separable kernel and using wave intrinsics.
-// Requirements:
+// Desc: Calculate Local Mean and Variance via a separable kernel. The per-row aggregation is
+//   exchanged either through groupshared memory (default, portable) or, on devices with a
+//   wave width >= 16, across wave lanes (compile with RTAO_WAVE_READ_LANE_PATH; the host
+//   selects the permutation at runtime, see RTAOGpuKernels::CalculateMeanVariance).
+// Requirements (wave-intrinsic permutation only):
 //  - Wave lane size 16 or higher.
 //  - WaveReadLaneAt() with any to any to wave read lane support.
 // Supports:
@@ -19,8 +22,6 @@
 //     Active pixel is a pixel on the checkerboard pattern and has a valid / 
 //     generated value for it. The kernel is stretched in y direction 
 //    to sample only from active pixels. 
-// Performance:
-// - 4K, 2080Ti, 9x9 kernel: 0.37ms (separable) -> 0.305 ms (separable + wave intrinsics)
 
 #define HLSL
 #include "RaytracingHlslCompat.h"
@@ -50,6 +51,12 @@ int2 GetActivePixelIndex(int2 pixel)
         ? pixel + int2(0, 1)
         : pixel;
 }
+#ifndef RTAO_WAVE_READ_LANE_PATH
+// Portable (non-wave) path: cache of loaded input values so each output lane can read its
+// kernel-window neighbours via groupshared memory instead of wave-lane reads.
+groupshared float ValueCache[16][16];                   // [row][column] loaded input values.
+#endif
+
 // Load up to 16x16 pixels and filter them horizontally.
 // The output is cached in Shared Memory and contains NumRows x 8 results.
 void FilterHorizontally(in uint2 Gid, in uint GI)
@@ -63,6 +70,12 @@ void FilterHorizontally(in uint2 Gid, in uint GI)
     uint2 GTid4x16_row0 = uint2(GI % 16, GI / 16);
     const int2 KernelBasePixel = (Gid * GroupDim - int(cb.kernelRadius)) * int2(1, cb.pixelStepY);
     const uint NumRowsToLoadPerThread = 4;
+
+#ifdef RTAO_WAVE_READ_LANE_PATH
+    // ---- Fast path: exchange each row's values across lanes with wave-lane reads. ----
+    // Valid only when waves have >= 16 lanes AND threads are packed to lanes in row-major
+    // SV_GroupIndex order. Neither is guaranteed by HLSL; the host selects this permutation
+    // at runtime only when WaveLaneCountMin >= 16 (otherwise the LDS path below is used).
     const uint Row_BaseWaveLaneIndex = (WaveGetLaneIndex() / 16) * 16;
 
     [unroll]
@@ -144,6 +157,58 @@ void FilterHorizontally(in uint2 Gid, in uint GI)
             }
         }
     }
+#else
+    // ---- Portable path: exchange each row's values through groupshared memory. ----
+    // Independent of wave size and of any lane<->SV_GroupIndex ordering assumption, so it is
+    // correct on every device (used whenever the fast wave path above is not selected).
+
+    // Phase 1: cooperatively load up to 16x16 input values into shared memory.
+    [unroll]
+    for (uint i = 0; i < NumRowsToLoadPerThread; i++)
+    {
+        uint2 GTid4x16 = GTid4x16_row0 + uint2(0, i * 4);
+        if (GTid4x16.y < NumValuesToLoadPerRowOrColumn)
+        {
+            int2 pixel = GetActivePixelIndex(KernelBasePixel + GTid4x16 * int2(1, cb.pixelStepY));
+            float value = RTAO::InvalidAOCoefficientValue;
+            if (GTid4x16.x < NumValuesToLoadPerRowOrColumn && IsWithinBounds(pixel, cb.textureDim))
+            {
+                value = g_inValue[pixel];
+            }
+            ValueCache[GTid4x16.y][GTid4x16.x] = value;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 2: accumulate the whole kernel width for the first GroupDim (8) columns of each row.
+    [unroll]
+    for (uint j = 0; j < NumRowsToLoadPerThread; j++)
+    {
+        uint2 GTid4x16 = GTid4x16_row0 + uint2(0, j * 4);
+        if (GTid4x16.y >= NumValuesToLoadPerRowOrColumn || GTid4x16.x >= GroupDim.x)
+        {
+            continue;
+        }
+
+        float valueSum = 0;
+        float squaredValueSum = 0;
+        uint numValues = 0;
+
+        for (uint c = 0; c < cb.kernelWidth; c++)
+        {
+            float cValue = ValueCache[GTid4x16.y][GTid4x16.x + c];
+            if (cValue != RTAO::InvalidAOCoefficientValue)
+            {
+                valueSum += cValue;
+                squaredValueSum += cValue * cValue;
+                numValues++;
+            }
+        }
+
+        PackedRowResultCache[GTid4x16.y][GTid4x16.x] = Float2ToHalf(float2(valueSum, squaredValueSum));
+        NumValuesCache[GTid4x16.y][GTid4x16.x] = numValues;
+    }
+#endif
 }
 
 void FilterVertically(uint2 DTid, in uint2 GTid)

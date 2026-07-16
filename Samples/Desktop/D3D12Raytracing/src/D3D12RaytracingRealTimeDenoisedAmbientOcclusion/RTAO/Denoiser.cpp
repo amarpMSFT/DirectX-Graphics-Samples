@@ -18,6 +18,7 @@
 #include "Denoiser.h"
 #include "D3D12RaytracingRealTimeDenoisedAmbientOcclusion.h"
 #include "Composition.h"
+#include "DirectXRaytracingHelper.h"
 
 using namespace std;
 using namespace DX;
@@ -67,6 +68,16 @@ namespace Denoiser_Args
     const WCHAR* Modes[RTAOGpuKernels::AtrousWaveletTransformCrossBilateralFilter::FilterType::Count] = { L"3x3", L"5x5" };
     EnumVar Mode(L"Render/AO/Denoising/Fullscreen blur/Kernel", RTAOGpuKernels::AtrousWaveletTransformCrossBilateralFilter::FilterType::EdgeStoppingGaussian3x3, RTAOGpuKernels::AtrousWaveletTransformCrossBilateralFilter::FilterType::Count, Modes);
 
+    // Row-exchange implementation used by the mean/variance and disocclusion-blur compute shaders:
+    //  - Groupshared: portable, correct on any device (default).
+    //  - Wave intrinsics: faster, but relies on a wave width >= 16 AND threads being packed to
+    //    lanes in row-major SV_GroupIndex order (not guaranteed by HLSL). This option is limited
+    //    to Groupshared only on devices that can't run the wave path (see
+    //    Denoiser::CreateAuxilaryDeviceResources).
+    namespace WaveFilterPath { enum Enum { Groupshared = 0, WaveIntrinsics, Count }; }
+    const WCHAR* WaveFilterPathNames[WaveFilterPath::Count] = { L"Groupshared (portable)", L"Wave intrinsics (fast)" };
+    EnumVar FilterRowExchange(L"Render/AO/Denoising/Filter row exchange", WaveFilterPath::Groupshared, WaveFilterPath::Count, WaveFilterPathNames);
+
 }
 
 
@@ -105,6 +116,14 @@ void Denoiser::CreateAuxilaryDeviceResources()
     m_atrousWaveletTransformFilter.Initialize(device, Sample::FrameCount);
     m_calculateMeanVarianceKernel.Initialize(device, Sample::FrameCount); 
     m_disocclusionBlurKernel.Initialize(device, Sample::FrameCount, c_MaxNumDisocllusionBlurPasses);
+
+    // If the device can't run the wave-intrinsic filter path (needs wave ops + wave width >= 16),
+    // restrict the "Filter row exchange" UI option to the portable groupshared path only.
+    if (!SupportsWaveIntrinsicDenoiserFilterPath(device))
+    {
+        Denoiser_Args::FilterRowExchange.SetValue(Denoiser_Args::WaveFilterPath::Groupshared);
+        Denoiser_Args::FilterRowExchange.SetListLength(1);
+    }
 }
 
 
@@ -291,7 +310,8 @@ void Denoiser::TemporalSupersamplingBlendWithCurrentFrame(RTAO& rtao)
             m_localMeanVarianceResources[AOVarianceResource::Raw].gpuDescriptorWriteAccess,
             Denoiser_Args::Variance_BilateralFilterKernelWidth,
             isCheckerboardSamplingEnabled,
-            checkerboardLoadEvenPixels);
+            checkerboardLoadEvenPixels,
+            Denoiser_Args::FilterRowExchange == Denoiser_Args::WaveFilterPath::WaveIntrinsics);
 
         // Interpolate the variance for the inactive cells from the valid checherkboard cells.
         if (isCheckerboardSamplingEnabled)
@@ -421,7 +441,8 @@ void Denoiser::BlurDisocclusions(Pathtracer& pathtracer)
             m_cbvSrvUavHeap->GetHeap(),
             GBufferResources[GBufferResource::Depth].gpuDescriptorReadAccess,
             m_disocclusionBlurStrength.gpuDescriptorReadAccess,
-            inOutResource);
+            inOutResource,
+            Denoiser_Args::FilterRowExchange == Denoiser_Args::WaveFilterPath::WaveIntrinsics);
         filterStep *= 2;
     }
 

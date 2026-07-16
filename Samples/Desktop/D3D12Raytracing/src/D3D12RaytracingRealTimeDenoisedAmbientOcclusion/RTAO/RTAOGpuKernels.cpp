@@ -24,6 +24,8 @@
 #include "CompiledShaders\CountingSort_SortRays_64x128rayGroupCS.hlsl.h"
 #include "CompiledShaders\AORayGenCS.hlsl.h"
 #include "CompiledShaders\DisocclusionBlur3x3CS.hlsl.h"
+#include "CompiledShaders\CalculateMeanVarianceCS_WaveReadLaneAt.hlsl.h"
+#include "CompiledShaders\DisocclusionBlur3x3CS_WaveReadLaneAt.hlsl.h"
 #include "CompiledShaders\FillInCheckerboard_CrossBox4TapFilterCS.hlsl.h"
 
 using namespace std;
@@ -180,6 +182,19 @@ namespace RTAOGpuKernels
             m_pipelineStateObject->SetName(L"Pipeline state object: DisocclusionBilateralFilter");
         }
 
+        // Optionally create the wave-intrinsic fast-path pipeline state (see Run()); only used on
+        // devices with wave ops and a wave width >= 16, otherwise the groupshared default is used.
+        m_waveReadLanePathSupported = SupportsWaveIntrinsicDenoiserFilterPath(device);
+        if (m_waveReadLanePathSupported)
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC descComputePSO = {};
+            descComputePSO.pRootSignature = m_rootSignature.Get();
+            descComputePSO.CS = CD3DX12_SHADER_BYTECODE(static_cast<const void*>(g_pDisocclusionBlur3x3CS_WaveReadLaneAt), ARRAYSIZE(g_pDisocclusionBlur3x3CS_WaveReadLaneAt));
+
+            ThrowIfFailed(device->CreateComputePipelineState(&descComputePSO, IID_PPV_ARGS(&m_pipelineStateObjectWaveReadLane)));
+            m_pipelineStateObjectWaveReadLane->SetName(L"Pipeline state object: DisocclusionBilateralFilter (wave read-lane)");
+        }
+
         // Create shader resources
         {
             m_CB.Create(device, frameCount * numCallsPerFrame, L"Constant Buffer: DisocclusionBilateralFilter");
@@ -194,7 +209,8 @@ namespace RTAOGpuKernels
         ID3D12DescriptorHeap* descriptorHeap,
         D3D12_GPU_DESCRIPTOR_HANDLE inputDepthResourceHandle,
         D3D12_GPU_DESCRIPTOR_HANDLE inputBlurStrengthResourceHandle,
-        GpuResource* inputOutputResource)
+        GpuResource* inputOutputResource,
+        bool useWaveReadLanePath)
     {
         using namespace RootSignature::DisocclusionBilateralFilter;
         using namespace DefaultComputeShaderParams;
@@ -222,7 +238,8 @@ namespace RTAOGpuKernels
             commandList->SetComputeRootDescriptorTable(Slot::Debug1, debugResources[0].gpuDescriptorWriteAccess);
             commandList->SetComputeRootDescriptorTable(Slot::Debug2, debugResources[1].gpuDescriptorWriteAccess);
 
-            commandList->SetPipelineState(m_pipelineStateObject.Get());
+            const bool runWaveReadLanePath = useWaveReadLanePath && m_waveReadLanePathSupported && m_pipelineStateObjectWaveReadLane;
+            commandList->SetPipelineState((runWaveReadLanePath ? m_pipelineStateObjectWaveReadLane : m_pipelineStateObject).Get());
         }
 
         // Account for interleaved Group execution
@@ -447,6 +464,20 @@ namespace RTAOGpuKernels
             m_pipelineStateObject->SetName(L"Pipeline state object: CalculateMeanVariance");
         }
 
+        // Optionally create the wave-intrinsic fast-path pipeline state. It is only selected at
+        // run time on devices that report support (wave ops + wave width >= 16); otherwise the
+        // portable groupshared pipeline state above is always used (see Run()).
+        m_waveReadLanePathSupported = SupportsWaveIntrinsicDenoiserFilterPath(device);
+        if (m_waveReadLanePathSupported)
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC descComputePSO = {};
+            descComputePSO.pRootSignature = m_rootSignature.Get();
+            descComputePSO.CS = CD3DX12_SHADER_BYTECODE(static_cast<const void*>(g_pCalculateMeanVarianceCS_WaveReadLaneAt), ARRAYSIZE(g_pCalculateMeanVarianceCS_WaveReadLaneAt));
+
+            ThrowIfFailed(device->CreateComputePipelineState(&descComputePSO, IID_PPV_ARGS(&m_pipelineStateObjectWaveReadLane)));
+            m_pipelineStateObjectWaveReadLane->SetName(L"Pipeline state object: CalculateMeanVariance (wave read-lane)");
+        }
+
         // Create shader resources.
         {
             m_CB.Create(device, frameCount * numCallsPerFrame, L"Constant Buffer: CalculateMeanVariance");
@@ -463,7 +494,8 @@ namespace RTAOGpuKernels
         D3D12_GPU_DESCRIPTOR_HANDLE outputMeanVarianceResourceHandle,
         UINT kernelWidth,
         bool doCheckerboardSampling,
-        bool checkerboardLoadEvenPixels)
+        bool checkerboardLoadEvenPixels,
+        bool useWaveReadLanePath)
     {
         using namespace RootSignature::CalculateMeanVariance;
         using namespace DefaultComputeShaderParams;
@@ -476,7 +508,8 @@ namespace RTAOGpuKernels
         {
             commandList->SetDescriptorHeaps(1, &descriptorHeap);
             commandList->SetComputeRootSignature(m_rootSignature.Get());
-            commandList->SetPipelineState(m_pipelineStateObject.Get());
+            const bool runWaveReadLanePath = useWaveReadLanePath && m_waveReadLanePathSupported && m_pipelineStateObjectWaveReadLane;
+            commandList->SetPipelineState((runWaveReadLanePath ? m_pipelineStateObjectWaveReadLane : m_pipelineStateObject).Get());
             commandList->SetComputeRootDescriptorTable(Slot::Input, inputValuesResourceHandle);
             commandList->SetComputeRootDescriptorTable(Slot::OutputMeanVariance, outputMeanVarianceResourceHandle);
 

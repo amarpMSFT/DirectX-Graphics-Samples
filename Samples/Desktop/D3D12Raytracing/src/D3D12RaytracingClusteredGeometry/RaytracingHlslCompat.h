@@ -12,31 +12,6 @@
 //
 #pragma once
 
-// =====================================================================================
-// Driver-bug workaround gate: non-zero BaseGeometryIndexAndFlags on CLAS
-// triggers an immediate GPU TDR hang in BUILD_BLAS_FROM_CLAS on the
-// NVIDIA DXR2 preview driver (RTX 4090, Apr 2026 SDK).  The HLK test
-// at experimental\src\d3d12conf\raytracing\indirectbuild.cpp only
-// exercises the per-triangle GeometryIndexAndFlagsArray route and
-// always sets BaseGeometryIndexAndFlags = 0, so the per-CLAS route
-// isn't covered by certification.  WARP renders correctly without
-// this workaround -- confirmed on the experimental WARP runtime.
-//
-// When the driver lands a fix, set this to 0.  At that point:
-//   - CLAS get stamped with the real matRegionIdx so GeometryIndex()
-//     at hit time returns the correct per-region slot in BOTH paths,
-//   - the cluster path stops needing ClusterMeta::materialSlot and
-//     joins the traditional path on g_perInstGeomMaterial,
-//   - the ClusterMeta struct shrinks by one uint (the slot becomes
-//     padding), shader's LoadClusterMeta drops one Load,
-//   - LoadHitContext's material branch collapses to a single
-//     g_perInstGeomMaterial lookup.
-// Sites guarded with `#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND`
-// can be deleted wholesale -- they all carry the matching
-// `#else` / `#endif` arms with the canonical code.
-// =====================================================================================
-#define DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND 1
-
 #ifdef HLSL
 #include "HlslCompat.h"
 #else
@@ -150,21 +125,10 @@ struct ClusterMeta
     float surfTintMul;         // surface base-colour blend.  1.0 = use clusterTint as-is.
     float refrTintMul;         // refraction tint blend.  Default 0.50.
     float reflTintMul;         // reflection tint blend.  Default ~1.08 (= 0.70 / 0.65).
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    // Per-cluster material-slot fallback for the cluster path while the
-    // NVIDIA DXR2 preview driver can't accept non-zero BaseGeometryIndex
-    // on CLAS (see RaytracingHlslCompat.h).  Cluster-path closest-hit
-    // reads g_materials[meta.materialSlot] in lieu of the canonical
-    // g_perInstGeomMaterial lookup, since GeometryIndex() is stuck at 0.
-    // For single-material objects this just equals obj.instanceID; for
-    // multi-material objects (mixed sphere) it follows the cluster's
-    // matRegionIdx into ClusterObject::perRegionMaterialSlot[].
+    // Per-cluster material-slot fallback retained for the traditional path's
+    // mixed-region geometry lookup.  Cluster mode uses the canonical
+    // g_perInstGeomMaterial[InstanceIndex(), GeometryIndex()] table.
     uint  materialSlot;
     uint  _pad0;
     uint  _pad1;
-#else
-    uint  _pad0;
-    uint  _pad1;
-    uint  _pad2;
-#endif
 };

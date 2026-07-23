@@ -75,14 +75,11 @@ ByteAddressBuffer                 g_tradGeomTriBase   : register(t7);
 ByteAddressBuffer                 g_perInstGeomMaterial : register(t8);
 
 // Per-instance material override.  One UINT per TLAS instance, indexed
-// by InstanceIndex().  Sentinel 0xFFFFFFFFu = "use the per-cluster
-// CPU-baked materialSlot from ctx.meta" (default for non-clone source
-// instances).  Anything else = apply that material slot uniformly to
-// every cluster of this instance.  Driven by the [N] workload-scaling
-// toggle: cloned source objects get a random override here so visually
-// distinct copies can share a single source BLAS/CLAS set.  Sentinel
-// path keeps multi-region instances (mixed sphere) rendering correctly
-// since the per-cluster materialSlot is region-aware.
+// by InstanceIndex().  Sentinel 0xFFFFFFFFu keeps the path-specific lookup
+// (clustered: g_perInstGeomMaterial; traditional: ctx.meta.materialSlot).
+// Anything else applies that material slot uniformly to every cluster of
+// the instance.  Driven by the [N] workload-scaling toggle so clones can be
+// visually distinct without per-clone material tables.
 StructuredBuffer<uint>            g_instanceMatOverride : register(t9);
 
 ClusterMeta LoadClusterMeta(uint cid)
@@ -100,15 +97,9 @@ ClusterMeta LoadClusterMeta(uint cid)
     m.surfTintMul    = asfloat(g_clusterMeta.Load(base + 24));
     m.refrTintMul    = asfloat(g_clusterMeta.Load(base + 28));
     m.reflTintMul    = asfloat(g_clusterMeta.Load(base + 32));
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
     m.materialSlot   = g_clusterMeta.Load(base + 36);
     m._pad0          = 0;
     m._pad1          = 0;
-#else
-    m._pad0          = 0;
-    m._pad1          = 0;
-    m._pad2          = 0;
-#endif
     return m;
 }
 
@@ -477,46 +468,20 @@ void LoadHitContext(in Attribs a, in bool allowBackFaceFlip, out HitContext ctx)
 
     ctx.meta = LoadClusterMeta(cid);
     {
-        // Per-(region) material lookup.  Canonical path: every hit reads
-        // g_perInstGeomMaterial[InstanceIndex()*MaxGeoms + GeometryIndex()]
-        // -- the geometry-index slot is set up correctly in both modes
-        // (trad path via per-region geom-desc layout, cluster path via
-        // BaseGeometryIndex stamping on each CLAS).  Combined with
-        // MultiplierForGeometryContributionToHitGroupIndex=2 in TraceRay
-        // this is what gets the chrome region of the mixed sphere to
-        // OpaqueHitGroup (no any-hit dispatch) and the glass region to
-        // GlassHitGroup automatically -- the canonical DXR way to
-        // express multi-material objects.
+        // Per-(region) material lookup.
         //
-        // Workaround path: the cluster path falls back to per-cluster
-        // ClusterMeta::materialSlot (CPU-baked from matRegionIdx +
-        // ClusterObject::perRegionMaterialSlot), because the NVIDIA
-        // DXR2 preview driver hangs on non-zero CLAS BaseGeometryIndex
-        // so GeometryIndex() in cluster mode is stuck at 0 and the
-        // canonical lookup would always return geom 0's material.
-        // See RaytracingHlslCompat.h for the gate definition.
-        // Per-(region) material lookup.  Both paths use ctx.meta.materialSlot
-        // (CPU-baked from per-cluster matRegionIdx +
-        // obj.perRegionMaterialSlot) since the canonical
-        // g_perInstGeomMaterial path requires GeometryIndex() to identify
-        // the region and that doesn't work in either mode:
-        //   - Cluster path: GeometryIndex() is stuck at 0 because the
-        //     NVIDIA DXR2 preview driver hangs on non-zero CLAS
-        //     BaseGeometryIndex (see DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND).
-        //   - Traditional path: with multi-geom-desc BLAS (only happens
-        //     for the mixed sphere -- instance 3 splits clusters by
-        //     hemisphere centroid into two material regions) the runtime
-        //     appears to consume only the first geom desc, so
-        //     GeometryIndex() also stays at 0.  Debug-paint diagnosis
-        //     in agent session 79874719: matSlot debug shows the entire
-        //     sphere reading slot 0 in trad mode (chrome) while cluster
-        //     mode correctly splits slot 0 (upper) / slot 3 (lower).
-        // ctx.meta.materialSlot is CPU-baked per-cluster from
-        // matRegionIdx, correct in both modes (the trad path recovers
-        // cid from g_tradTriToCid which is keyed by PrimitiveIndex
-        // independent of GeometryIndex), so using it uniformly is the
-        // simplest correct fix.
-        uint matSlot = ctx.meta.materialSlot;
+        // Cluster mode uses the canonical DXR path: every CLAS stamps its
+        // matRegionIdx into BaseGeometryIndex, so GeometryIndex() selects the
+        // matching g_perInstGeomMaterial slot.  The old vendor workaround is gone.
+        //
+        // Traditional mode retains its established per-cluster fallback for
+        // visual parity.  Its cid recovery still uses GeometryIndex() to find
+        // the correct per-region triangle-table base; ClusterMeta then supplies
+        // the CPU-baked material slot for that recovered cluster.
+        uint matSlot = isTraditional
+            ? ctx.meta.materialSlot
+            : g_perInstGeomMaterial.Load(
+                (InstanceIndex() * MAX_GEOMS_PER_INSTANCE + GeometryIndex()) * 4);
         // Per-instance material override (workload-scaling clones).
         // Sentinel 0xFFFFFFFFu = no override.  Cloned instances get a
         // random material slot here so duplicates of one source object

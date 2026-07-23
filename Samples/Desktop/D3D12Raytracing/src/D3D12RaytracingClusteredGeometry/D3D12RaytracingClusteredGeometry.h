@@ -43,15 +43,14 @@ namespace GlobalRootSig {
         // clusters into one material-region geometry.
         TradTriToCidSRVSlot,
         TradGeomTriBaseSRVSlot,
-        // Per-(InstIdx, GeomIdx) material-slot lookup.  Read by both
-        // paths -- replaces the InstanceID()-based g_materials lookup
-        // so multi-geometry instances can present different materials
-        // per geom (the mixed-material small sphere demo).
+        // Per-(InstIdx, GeomIdx) material-slot lookup used by the clustered
+        // path.  The traditional path retains its per-cluster materialSlot
+        // fallback for the mixed-material sphere (see LoadHitContext).
         PerInstGeomMaterialSRVSlot,
         // Per-instance material override.  One UINT per TLAS instance,
         // indexed by InstanceIndex().  Sentinel 0xFFFFFFFF = "use the
-        // per-cluster CPU-baked materialSlot" (default for non-clone
-        // instances).  Anything else = apply that material slot
+        // path-specific material lookup" (default for non-clone instances).
+        // Anything else = apply that material slot
         // uniformly to every cluster of the instance.  Used by the
         // [N] workload-scaling toggle to give cloned instances visual
         // variety without per-clone CLAS/BLAS storage.
@@ -121,14 +120,11 @@ struct ClusterObject
     DirectX::XMFLOAT3                        worldRotEuler = { 0, 0, 0 };
     UINT                                     instanceID    = 0;
     // Per-(material-region) material-slot override.  Empty for single-
-    // region (single-material) objects -- closest-hit then falls back
-    // to instanceID for every region.  For mixed-material objects (one
-    // GeometryIndex() per matRegionIdx), provide one entry per region
-    // -- index N is the g_materials[] slot to use for the cluster's
-    // matRegionIdx == N.  Drives both the shader-side material lookup
-    // AND the InstanceContributionToHitGroupIndex picked at TLAS-
-    // build time (so geom 0 chrome -> OpaqueHitGroup, geom 1 glass ->
-    // GlassHitGroup via the shader-table multiplier).
+    // region (single-material) objects -- material lookup then falls back
+    // to instanceID.  For mixed-material objects, index N is the material
+    // slot for matRegionIdx N.  The clustered path reads this mapping through
+    // g_perInstGeomMaterial; the traditional mixed-region fallback bakes the
+    // same mapping into ClusterMeta.
     std::vector<UINT>                        perRegionMaterialSlot;
 
     // ------------------------------------------------------------------
@@ -178,9 +174,6 @@ public:
     virtual IDXGISwapChain* GetSwapchain() override { return m_deviceResources->GetSwapChain(); }
     virtual void ParseCommandLineArgs(_In_reads_(argc) WCHAR* argv[], int argc) override;
 
-    // Read-only accessor consumed by the BuildSharedClusterTrianglesInputs
-    // free function in the .cpp - keeps the helper's signature short.
-    UINT PositionTruncateBits() const { return m_positionTruncateBits; }
 private:
     static const UINT FrameCount = 3;
 
@@ -223,12 +216,9 @@ private:
     // material small sphere with chrome upper / glass lower) each
     // region gets its own material slot.
     //
-    // Combined with shader-table indexing
-    // MultiplierForGeometryContributionToHitGroupIndex=2, the chrome
-    // region routes to OpaqueHitGroup (no any-hit dispatch) and the
-    // glass region routes to GlassHitGroup (any-hit runs for
-    // stochastic translucency) -- no per-pixel branch needed.  This
-    // is the canonical DXR way to express multi-material objects.
+    // Mixed-material instances select a dedicated shader-table block at TLAS
+    // build time.  Both regions use GlassHit; the material lookup above makes
+    // refractivity 0 on chrome (no refraction trace) and nonzero on glass.
     ComPtr<ID3D12Resource>               m_perInstGeomMaterialBuffer;
     // Max geometries per instance the shader is willing to look up.
     // Padding for the flat per-(InstIdx, GeomIdx) layout.  Bump if a
@@ -236,9 +226,7 @@ private:
     static constexpr UINT                kMaxGeomsPerInstance = 8;
 
     // Vertex format for cluster builds. Toggle via --vertex-format float|compressed.
-    // Default is FLOAT32_3. The COMPRESSED1 path produces correct bytes (WARP
-    // renders them cleanly) but hits a current NVIDIA driver bug; see the
-    // banner in BuildScene() in the .cpp.
+    // Default is FLOAT32_3; both formats are validated on experimental WARP.
     enum class VertexMode { Compressed1, Float32_3 };
     VertexMode                           m_vertexMode = VertexMode::Float32_3;
 
@@ -500,9 +488,9 @@ public:
     }
 private:
     // Per-instance material override buffer: one UINT per TLAS instance.
-    // Sentinel 0xFFFFFFFF = "use ctx.meta.materialSlot (per-cluster CPU-
-    // baked default)".  Any other value = use g_materials[value] uniformly
-    // for every cluster of that instance.  Set 0xFFFFFFFF for non-clone
+    // Sentinel 0xFFFFFFFF = "keep the path-specific material lookup".
+    // Any other value = use g_materials[value] uniformly for every cluster
+    // of that instance.  Set 0xFFFFFFFF for non-clone
     // instances and a randomly-picked slot for each clone.  Lives in the
     // global root signature so the closesthit shader can read it via
     // InstanceIndex().

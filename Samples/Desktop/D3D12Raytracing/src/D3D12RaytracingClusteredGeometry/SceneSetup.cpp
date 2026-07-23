@@ -120,37 +120,13 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
     //     geom desc per region, NOT per cluster),
     //   - per-(InstIdx, GeomIdx) material lookup
     //     (chrome for region 0, amethyst glass for region 1),
-    //   - fixed-function shader-table routing via
-    //     MultiplierForGeometryContributionToHitGroupIndex=2 (chrome
-    //     hemisphere -> OpaqueHitGroup with no any-hit dispatch;
-    //     glass hemisphere -> GlassHitGroup whose any-hit runs for
-    //     stochastic translucency).
+    //   - a mixed-instance shader-table block selected at TLAS build time.
+    //     Both regions use GlassHit; with refractivity 0 the chrome region
+    //     skips refraction while the glass region executes the full path.
     // Region split is by cluster centroid Y in object space -- the
     // cluster's tile boundaries already align with parametric latitude
     // rings on the UV sphere, so the equator is a clean cluster seam
     // (no partial-cluster splits).
-    // -------------------------------------------------------------
-    // -------------------------------------------------------------
-    // Mixed-material demo: split the smallest sphere (sphere3, was
-    // amethyst glass) into chrome upper hemisphere + amethyst glass
-    // lower hemisphere.  Per-cluster matRegionIdx assignment drives:
-    //   - the traditional path's per-region geom-desc layout (one
-    //     geom desc per region, NOT per cluster) + per-(InstIdx,
-    //     GeomIdx) material lookup + fixed-function shader-table
-    //     routing via MultiplierForGeometryContributionToHitGroupIndex=2
-    //     so chrome hits OpaqueHitGroup (no any-hit dispatch) and
-    //     glass hits GlassHitGroup (any-hit runs).
-    //   - the cluster path's per-cluster material override via
-    //     ClusterMeta::materialSlot (CPU-baked from matRegionIdx +
-    //     ClusterObject::perRegionMaterialSlot).
-    //     [TODO: when the NVIDIA DXR2 preview driver fixes the
-    //     non-zero-BaseGeometryIndex hang on CLAS, the cluster path
-    //     can also route via GeometryIndex() and the per-cluster
-    //     materialSlot becomes redundant -- both paths converge.]
-    // Region split is by cluster centroid Y in object space -- the
-    // cluster's tile boundaries already align with parametric latitude
-    // rings on the UV sphere, so the equator is a clean cluster seam.
-    // -------------------------------------------------------------
     for (auto& obj : m_objects)
     {
         if (obj.instanceID != 3) continue;  // only sphere3 (amethyst -> mixed)
@@ -209,39 +185,9 @@ void D3D12RaytracingClusteredGeometry::BuildScene()
                     m_vertexMode == VertexMode::Compressed1 ? L"COMPRESSED1 (shared-exponent quantized)"
                                                             : L"FLOAT32_3 (no quantization)");
 
-    // ============================================================================
-    // COMPRESSED1 STATIC PATH - NVIDIA DRIVER BUG (open as of 2026-05-15)
-    // ----------------------------------------------------------------------------
-    // SUMMARY: The exact same compressed1 byte stream produced by this sample's
-    // encoder renders correctly on experimental WARP and incorrectly on NVIDIA
-    // (RTX 4090, D3D12Core 1.10 preview, agility SDK 722). On NVIDIA, the cube
-    // renders cleanly but sphere/torus clusters are mangled: one cluster appears
-    // as a stretched "tail" reaching well beyond the object's bounds, an
-    // adjacent cluster goes missing, the rest of the scene renders correctly.
-    //
-    // EVIDENCE:
-    //   1. Force-warp=true: all 7 objects (animated sphere + 4 static spheres +
-    //      torus + cube) render pixel-equivalent to the FLOAT32_3 path.
-    //   2. Force-warp=false (NVIDIA): same input bytes, same args -> broken.
-    //   3. CPU-side Compressed1::Decode is bit-exact (max error ~0.0002 units,
-    //      sub-quantization-step).
-    //   4. Byte-for-byte cluster dumps via DUMP_COMPRESSED1_DIAG match the
-    //      d3d12conf reference encoder's header layout and bitstream packing
-    //      (see Compressed1.h header for the side-by-side derivation).
-    //   5. Breakage on NVIDIA persists across every variable I tried:
-    //        - 8 / 12 / 16 bits/axis
-    //        - uniform vs per-axis bit counts
-    //        - 16-byte vs 256-byte vertex-buffer alignment
-    //        - positive-only anchors (mesh shifted to +x +y +z)
-    //        - MaxCompressedClusterPositionsSize exact vs 4x oversize
-    //        - UPLOAD heap vs DEFAULT heap for the vertex buffer
-    //
-    // CONCLUSION: The bug is in NVIDIA's COMPRESSED1 BVH-build implementation,
-    // not in this sample. Filed as: <TODO bug-tracker link>. Until resolved,
-    // the sample defaults to FLOAT32_3 (VertexMode::Float32_3 in the header);
-    // pass --vertex-format compressed to exercise the broken path against a
-    // future NVIDIA driver update.
-    // ============================================================================
+    // COMPRESSED1 is encoded eagerly so the runtime format toggle can rebuild
+    // without reconstructing the scene.  The exact per-cluster vertex bound is
+    // validated on the current experimental WARP.
     EncodeCompressedClusters();
     // FLOAT32_3 path uses obj.mesh.clusters[i].positions directly at upload
     // time; obj.rawPositions is unused and intentionally left empty.  Log

@@ -3,13 +3,9 @@
 This sample demonstrates **DXR2 clustered geometry** in D3D12: building Cluster
 Level Acceleration Structures (CLAS) and Cluster BLAS via the new GPU-driven
 indirect acceleration-structure operations API, with both the static path
-(`BUILD_CLAS_FROM_TRIANGLES` + compressed1 vertex format) and the animated path
-(`BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES` + per-frame
+(`BUILD_CLAS_FROM_TRIANGLES` + selectable `FLOAT32_3` / `COMPRESSED1` vertex
+formats) and the animated path (`BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES` + per-frame
 `INSTANTIATE_CLUSTER_TEMPLATES`).
-
-> Status: **work in progress**. Milestone 1 currently builds, queries DXR2
-> support, and clears the back buffer to teal. Cluster build + render lands in
-> milestone 2.
 
 ## Build
 
@@ -60,8 +56,10 @@ d3dconfig device force-warp=false    # use the system's hardware adapter
 ```
 
 Currently exercised against:
-- **WARP**: works.
-### Controls (placeholder for milestone 2+)
+- **Experimental WARP**: FLOAT32_3 and COMPRESSED1 clustered paths.
+
+On the current NVIDIA RTX 4090 setup, the runtime reports clustered geometry as
+unsupported and the sample falls back to the traditional BLAS path.
 
 ### Runtime controls
 
@@ -75,7 +73,9 @@ On-screen overlay (right column) lists the active value for each toggle.
 | `[V]`    | Vertex format: `FLOAT32_3` ↔ `COMPRESSED1` (shared-exponent quantized).                 |
 | `[F]`    | Trad mode: animated BLAS update strategy (`rebuild` ↔ `refit`).                         |
 | `[R]`    | Cluster mode: per-frame static-AS rebuild (`off` → `BLAS only` → `CLAS+BLAS`).          |
-| `[P]`    | Pause / resume animation.                                                               |
+| `[B]`    | Build preference: `none` → `fast-build` → `fast-trace`.                               |
+| `Space`  | Pause / resume camera motion.                                                           |
+| `[M]`    | Pause / resume animation.                                                               |
 | `[N]`    | Workload scaling — cycle extra clones (`0` → `100` → `1,000` → `10,000` → `0`).         |
 |          | Each clone gets its OWN CLAS array + BLAS (1:1 instance:BLAS), so toggling progressively |
 |          | stresses the CLAS/BLAS/template paths.  Clones spiral out from the floor in a           |
@@ -86,10 +86,23 @@ On-screen overlay (right column) lists the active value for each toggle.
 |          | `COMPRESSED1` bits/component). Triggers full static rebuild on change.                  |
 
 ### Headless / scripted runs
-- **WARP**: works.
-- **NVIDIA preview driver**: works.
 
-### Stress-test sweep (RTX 4090, N=10K, ~10M tris)
+For a timed run that writes a JSON snapshot and exits:
+
+```
+D3D12RaytracingClusteredGeometry.exe --geometry-mode clusters --vertex-format compressed --bench-seconds 5 --bench-out result.json
+```
+
+Use `--exit-after-frames N` for a frame-count smoke test. The command
+`--screenshot-at S path.png` jumps the camera/animation time to `S`, warms up
+the swap chain, saves a PNG, and exits.
+
+### Historical stress-test sweep (RTX 4090, N=10K, ~10M tris)
+
+These measurements came from an earlier experimental runtime/driver combination
+that exposed clustered geometry on the RTX 4090. The current setup described
+above reports clustered geometry unsupported and therefore cannot reproduce the
+cluster row on hardware.
 
 | Mode    | BLAS time / frame | FPS  | What it shows                                                  |
 | ------- | ----------------- | ---- | -------------------------------------------------------------- |
@@ -100,10 +113,11 @@ On-screen overlay (right column) lists the active value for each toggle.
 with the same per-clone animated geometry.  The cluster-mode N=10K
 result spends most of its frame time on ray traversal, not on AS work
 anymore.
-takes a screenshot, then quits. Useful for unattended visual diffs.
 
-`--at <seconds>:<action>` queues a runtime action that fires at the given
-wall-clock time. Combine multiple `--at` for scripted state sweeps. Actions:
+### Scheduled actions
+
+`--at <frame>:<action>` queues an action for a zero-based rendered-frame index.
+Combine multiple `--at` arguments for scripted state sweeps. Actions:
 
 | Action               | Equivalent hotkey                          |
 | -------------------- | ------------------------------------------ |
@@ -123,6 +137,11 @@ wall-clock time. Combine multiple `--at` for scripted state sweeps. Actions:
 | `extra-100`          | `[N]` → 100                                |
 | `extra-1k`           | `[N]` → 1,000                              |
 | `extra-10k`          | `[N]` → 10,000                             |
+| `flags-none`         | `[B]` → no build preference                |
+| `flags-fast-build`   | `[B]` → prefer fast build                  |
+| `flags-fast-trace`   | `[B]` → prefer fast trace                  |
+| `log`                | Write a timing snapshot to the sample log  |
+| `exit`               | Exit the sample                            |
 
 ### Window behavior
 
@@ -175,14 +194,14 @@ into your own renderer are concentrated in one place.
 
 ## Things to note
 
-- The static region of the scene uses the new **compressed1** vertex format
-  (DXR2's recommended encoding for static cluster geometry). The animated
-  region uses float32 positions because per-frame requantization would obscure
-  the templates story.
+- The static clustered scene can use either `FLOAT32_3` or **COMPRESSED1** via
+  the `[V]` toggle or `--vertex-format`. The animated template path uses
+  `FLOAT32_3` positions because per-frame requantization would obscure the
+  templates story.
 - Cluster size statistics are read back via the
   `D3D12_RTAS_OPERATION_MODE_GET_SIZES` mode and via `ResultSizeArray` on
   implicit-destination builds.
-- Per-frame cluster-template instantiate args are populated by a tiny compute
-  shader (`IndirectArgs.hlsl`) - illustrating the spec's GPU-driven intent
-  even though the demo's argument count is small enough that CPU upload would
-  also work.
+- Per-frame cluster-template instantiate args are populated by the
+  `FillInstantiateArgs.hlsl` compute shader, illustrating the spec's GPU-driven
+  intent even though the demo's argument count is small enough that CPU upload
+  would also work.

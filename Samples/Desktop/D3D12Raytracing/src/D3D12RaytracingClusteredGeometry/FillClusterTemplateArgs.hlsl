@@ -11,11 +11,17 @@
 // D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS array
 // used during BUILD_CLUSTER_TEMPLATES for the animated showpiece ball.
 //
-// Layout (88 bytes per cluster):
+// Layout (96 bytes per cluster, DXR2 spec v0.30):
 //   bytes  0..79  -- D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS
 //                    (same shape as the static path; see FillClasFromTrianglesArgs.hlsl)
 //   bytes 80..87  -- u64 InstantiationBoundingBoxLimit (we always pass 0 --
 //                    driver derives the AABB from the hint vertex AABB)
+//   bytes 88..95  -- format-specific union.  FLOAT32_3 has no format-specific
+//                    arguments, so both reserved dwords MUST be zero.
+//
+// Before spec v0.30 the struct ended at byte 87.  Continuing to step by 88
+// makes argument N+1 overwrite argument N's new format-specific tail; WARP
+// then faults while decoding the first template build.
 //
 // Per-cluster metadata is simpler than the static path:
 //   - ClusterID is implicit (= dispatch thread index)
@@ -38,7 +44,7 @@ cbuffer Constants : register(b0)
 };
 
 ByteAddressBuffer   g_meta    : register(t0);  // 16 B/cluster
-RWByteAddressBuffer g_argsOut : register(u0);  // 88 B/cluster
+RWByteAddressBuffer g_argsOut : register(u0);  // 96 B/cluster (spec v0.30)
 
 uint2 add64(uint gvaLo, uint gvaHi, uint offset)
 {
@@ -67,11 +73,12 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint2 vbGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, vbOff);
     const uint2 ibGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, ibOff);
 
-    const uint baseByte = idx * 88u;
+    const uint baseByte = idx * 96u;
     // --- TrianglesArgs sub-struct (80 bytes) ------------------------------
     g_argsOut.Store (baseByte +  0, idx);                                   // ClusterID = thread index
     g_argsOut.Store (baseByte +  4, 0u);                                    // ClusterFlags
     g_argsOut.Store (baseByte +  8, pack16(triCount, vertCount));           // TriCount/VertCount
+    // The animated ball is single-region, so its geometry index and flags are zero.
     g_argsOut.Store (baseByte + 12, 0u);                                    // BaseGeometryIndexAndFlags
     g_argsOut.Store (baseByte + 16, 0u);                                    // OpacityMicromapBaseLocation
     g_argsOut.Store (baseByte + 20, pack16(12u, 1u));                       // VBStride=12, IBStride=1
@@ -85,4 +92,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     g_argsOut.Store2(baseByte + 72, uint2(0, 0));                           // OpacityMicromapIndexBuffer
     // --- InstantiationBoundingBoxLimit (8 bytes) --------------------------
     g_argsOut.Store2(baseByte + 80, uint2(0, 0));                           // = 0 -> driver derives from hint
+    // --- Format-specific union (8 bytes, spec v0.30) ----------------------
+    // FLOAT32_3 has no format-specific arguments.  Zero the reserved region;
+    // COMPRESSED1 would instead write {template header, reserved padding}.
+    g_argsOut.Store2(baseByte + 88, uint2(0, 0));
 }

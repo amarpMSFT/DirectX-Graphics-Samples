@@ -30,7 +30,7 @@
 //   offset  4 (4 B)   UINT   ClusterFlags                       = 0
 //   offset  8 (2 B)   UINT16 TriangleCount
 //   offset 10 (2 B)   UINT16 VertexCount
-//   offset 12 (4 B)   UINT   BaseGeometryIndexAndFlags          = opaqueFlag
+//   offset 12 (4 B)   UINT   BaseGeometryIndexAndFlags          = matRegionIdx | opaqueFlag
 //   offset 16 (4 B)   UINT   OpacityMicromapBaseLocation        = 0
 //   offset 20 (2 B)   UINT16 VertexBufferStride                 = g_vertexBufferStride
 //   offset 22 (2 B)   UINT16 IndexBufferStride                  = 1
@@ -47,8 +47,6 @@
 //
 //---------------------------------------------------------------------------
 
-// Pulls in DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND for the
-// BaseGeometryIndex stamping gate further down.
 #define HLSL
 #include "RaytracingHlslCompat.h"
 
@@ -68,8 +66,8 @@ cbuffer Constants : register(b0)
 //   offset 12 (4 B)   UINT   vbByteOffset    (from g_baseGpuVa)
 //   offset 16 (4 B)   UINT   ibByteOffset    (from g_baseGpuVa)
 //   offset 20 (4 B)   UINT   opaqueFlag      (0 or D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE)
-//   offset 24 (4 B)   UINT   matRegionIdx    (24-bit unsigned, packed into upper 24
-//                                              bits of BaseGeometryIndexAndFlags so
+//   offset 24 (4 B)   UINT   matRegionIdx    (24-bit unsigned, packed into bits 0..23
+//                                              of BaseGeometryIndexAndFlags so
 //                                              GeometryIndex() at hit time returns it)
 ByteAddressBuffer   g_meta    : register(t0);
 
@@ -112,15 +110,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint2 vbGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, vbOff);
     const uint2 ibGva = add64(g_baseGpuVaLo, g_baseGpuVaHi, ibOff);
 
-    // BaseGeometryIndex packed into upper 24 bits of BaseGeometryIndexAndFlags.
-    // See RaytracingHlslCompat.h's DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    // gate for the rationale -- non-zero values currently hang
-    // BUILD_BLAS_FROM_CLAS on the NVIDIA DXR2 preview driver.
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    const uint baseGeomIdxAndFlags = (0u << 8) | (opaqueFlag & 0xFFu);
-#else
-    const uint baseGeomIdxAndFlags = (matRegionIdx << 8) | (opaqueFlag & 0xFFu);
-#endif
+    // DXR2 spec v0.27+: geometry index occupies bits 0..23 and clustered
+    // geometry flags occupy bits 31..30.  `opaqueFlag` is already the full
+    // D3D12_RTAS_CLUSTERED_GEOMETRY_FLAG_OPAQUE mask (or zero), not a boolean.
+    const uint baseGeomIdxAndFlags = (matRegionIdx & 0x00FFFFFFu) | opaqueFlag;
 
     const uint baseByte = idx * 80u;
     g_argsOut.Store (baseByte +  0, clusterID);                                                // ClusterID

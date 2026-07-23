@@ -13,13 +13,12 @@
 // acceleration-structure management + rendering.
 //
 // Contains:
-//   * ParseCommandLineArgs -- recognized: -forceAdapter, --screenshot,
-//     --screenshot-at, --exit-after-frames, --at scheduled-action,
-//     --stats-snap-at scheduled-stats-snapshot.
-//   * OnKeyDown            -- hotkey routing for [P], [A], [V], [R], [T],
-//     [F], [N], "," ".", "[" "]" runtime toggles.  Each hotkey either
-//     mutates a piece of state and triggers a RebuildStaticAccelerationStructures,
-//     or just flips a per-frame flag (e.g. pause).
+//   * ParseCommandLineArgs -- CLI options for screenshots, benchmarks,
+//     geometry/build modes, scheduled actions, and deterministic captures.
+//   * OnKeyDown            -- hotkey routing for Space, [M], [A], [V], [R],
+//     [T], [F], [N], [B], "," ".", "[" "]" runtime toggles.  Each hotkey
+//     either mutates a piece of state and triggers a
+//     RebuildStaticAccelerationStructures, or flips a per-frame flag.
 //
 // All methods here are still members of D3D12RaytracingClusteredGeometry.
 // ============================================================================
@@ -347,11 +346,8 @@ void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
     }
     else if (key == 'V' || key == 'v')
     {
-        // Cycle vertex format: FLOAT32_3 <-> COMPRESSED1.
-        // NOTE: COMPRESSED1 currently exposes an NVIDIA driver bug (see the
-        // long comment in BuildScene above); on RTX hardware the second
-        // cycle may render geometry artifacts on some clusters.  WARP
-        // ("d3dconfig device force-warp=true") renders both paths cleanly.
+        // Cycle vertex format: FLOAT32_3 <-> COMPRESSED1.  Both paths are
+        // validated on the current experimental WARP.
         m_vertexMode = (m_vertexMode == VertexMode::Float32_3)
                      ? VertexMode::Compressed1
                      : VertexMode::Float32_3;

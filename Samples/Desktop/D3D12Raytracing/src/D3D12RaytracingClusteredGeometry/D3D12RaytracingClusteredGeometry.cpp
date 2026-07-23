@@ -935,18 +935,14 @@ void D3D12RaytracingClusteredGeometry::BuildClusterMetadata()
             m.surfTintMul    = surfTintMul;
             m.refrTintMul    = refrTintMul;
             m.reflTintMul    = reflTintMul;
-#if DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-            // Per-cluster material slot for the cluster-path fallback
-            // (see RaytracingHlslCompat.h driver-workaround gate).  When
-            // the gate goes to 0 this whole field disappears and the
-            // cluster path joins the trad path on g_perInstGeomMaterial.
+            // Per-cluster material slot for the traditional path's mixed-region
+            // fallback.  Cluster mode uses GeometryIndex() +
+            // g_perInstGeomMaterial; keeping this CPU-baked slot costs no extra
+            // stride (the struct remains 48 bytes) and avoids regressing the
+            // separately diagnosed traditional multi-geometry behavior.
             m.materialSlot   = (perRegionMaterialSlot && c.matRegionIdx < perRegionMaterialSlot->size())
                                 ? (*perRegionMaterialSlot)[c.matRegionIdx]
                                 : defaultMaterialSlot;
-#else
-            (void)perRegionMaterialSlot;
-            (void)defaultMaterialSlot;
-#endif
 
             if (checker.enabled)
             {
@@ -1096,8 +1092,8 @@ void D3D12RaytracingClusteredGeometry::UploadClusterInputs()
     // Per-cluster metadata for the FillClasFromTrianglesArgs CS.
     // 28 bytes/cluster: see ClasArgsMeta layout in FillClasFromTrianglesArgs.hlsl.
     //   { clusterID, triCount, vertCount, vbOff, ibOff, opaqueFlag, matRegionIdx }
-    // matRegionIdx becomes BaseGeometryIndex in the CLAS (upper 24 bits
-    // of BaseGeometryIndexAndFlags), so GeometryIndex() in the closest-
+    // matRegionIdx becomes BaseGeometryIndex in the CLAS (bits 0..23 of
+    // BaseGeometryIndexAndFlags), so GeometryIndex() in the closest-
     // hit returns this per-cluster value -- the same identifier the
     // traditional path's per-material-region geom-desc layout produces.
     // ------------------------------------------------------------------
@@ -1246,41 +1242,23 @@ void D3D12RaytracingClusteredGeometry::BuildClasIndirect()
 // avoids drift between the three paths.
 // ---------------------------------------------------------------------------------
 static void BuildSharedClusterTrianglesInputs(
-    const D3D12RaytracingClusteredGeometry& self,
     UINT N, bool useFloat, UINT maxTris, UINT maxVerts, UINT totalTris, UINT totalVerts,
-    UINT maxCompressedSize,
+    UINT maxCompressedSize, UINT maxGeometryIndexValue, UINT positionTruncateBits,
+    D3D12_RTAS_OPERATION_FLAGS buildFlags,
     D3D12_RTAS_CLUSTER_LIMITS& outLimits,
     D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC& outClasDesc)
 {
-    (void)self;
     outLimits = {};
     outLimits.MaxArgCount                                   = N;
-    outLimits.MaxGeometryIndexValue                         = 0;
+    // matRegionIdx is stamped into each CLAS BaseGeometryIndex.  Keep the
+    // declared prebuild bound aligned with the flat material-table stride so
+    // GeometryIndex() in cluster hit shaders can legally address every slot.
+    outLimits.MaxGeometryIndexValue                         = maxGeometryIndexValue;
     outLimits.MaxUniqueGeometryIndexAndFlagsCountPerCluster = 1;
     outLimits.MaxTriangleCountPerCluster                    = maxTris;
-    // NVIDIA preview-driver COMPRESSED1 workaround: BUILD_CLAS_FROM_TRIANGLES
-    // with VERTEX_FORMAT_COMPRESSED1 silently corrupts all-but-the-first
-    // cluster's geometry when MaxVertexCountPerCluster isn't a multiple of
-    // 32 (= NVIDIA warp size; the driver appears to compute a per-cluster
-    // vertex-storage stride that overlaps adjacent clusters' storage).
-    // Bisection (RTX 4090 preview driver):
-    //   4..10  broken (only cluster 0 renders)
-    //   11..16 distorted
-    //   17..20 broken
-    //   24..31 distorted
-    //   32     ✓ correct
-    //   33     broken again
-    //   64/128/256 ✓ correct
-    // FLOAT32_3 works at any value; only COMPRESSED1 needs the bump.  See
-    // commit message for the repro + d3d12conf gap that hides this bug.
-    UINT effectiveMaxVerts = maxVerts;
-    if (!useFloat)
-    {
-        // Round up to next multiple of 32, clamped to spec max of 256.
-        effectiveMaxVerts = ((std::max<UINT>(maxVerts, 1u) + 31u) & ~31u);
-        if (effectiveMaxVerts > 256u) effectiveMaxVerts = 256u;
-    }
-    outLimits.MaxVertexCountPerCluster                      = effectiveMaxVerts;
+    // Use the exact scene bound required by the current API contract.  The
+    // final-tree FLOAT32_3 and COMPRESSED1 paths are validated on WARP.
+    outLimits.MaxVertexCountPerCluster                      = maxVerts;
     outLimits.MaxTotalTriangleCount                         = totalTris;
     outLimits.MaxTotalVertexCount                           = totalVerts;
     outLimits.MaxOpacityMicromapIndicesPerCluster           = 0;
@@ -1295,7 +1273,7 @@ static void BuildSharedClusterTrianglesInputs(
     // intrinsic can read them back. Per-cluster ClusterFlags can override with
     // D3D12_RTAS_CLUSTER_OPERATION_CLAS_FLAG_DISALLOW_DATA_ACCESS to opt some
     // clusters out (we don't).
-    outClasDesc.Flags                               = self.BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
+    outClasDesc.Flags                               = buildFlags | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     outClasDesc.VertexFormat                        = useFloat ? D3D12_VERTEX_FORMAT_FLOAT32_3
                                                                : D3D12_VERTEX_FORMAT_COMPRESSED1;
     outClasDesc.IndexFormat                         = D3D12_INDEX_FORMAT_UINT8;
@@ -1307,7 +1285,7 @@ static void BuildSharedClusterTrianglesInputs(
     // floor on per-cluster mantissa-truncation; per-cluster
     // PositionTruncateBitCount in the args struct must be >= this).
     if (useFloat)
-        outClasDesc.MinPositionTruncateBitCount = self.PositionTruncateBits();
+        outClasDesc.MinPositionTruncateBitCount = positionTruncateBits;
     else
         outClasDesc.MaxCompressedClusterPositionsSize = maxCompressedSize;
     // .Mode set by each caller.
@@ -1340,8 +1318,10 @@ void D3D12RaytracingClusteredGeometry::BuildClasImplicit()
 
     D3D12_RTAS_CLUSTER_LIMITS limits;
     D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc;
-    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+    BuildSharedClusterTrianglesInputs(N, useFloat, maxTris, maxVerts,
                                       totalTris, totalVerts, maxCompressedSize,
+                                      kMaxGeomsPerInstance - 1,
+                                      m_positionTruncateBits, BuildFlagModeRtas(),
                                       limits, clasDesc);
     clasDesc.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
@@ -1466,8 +1446,10 @@ void D3D12RaytracingClusteredGeometry::BuildClasGetSizes()
 
     D3D12_RTAS_CLUSTER_LIMITS limits;
     D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDescBase;
-    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+    BuildSharedClusterTrianglesInputs(N, useFloat, maxTris, maxVerts,
                                       totalTris, totalVerts, maxCompressedSize,
+                                      kMaxGeomsPerInstance - 1,
+                                      m_positionTruncateBits, BuildFlagModeRtas(),
                                       limits, clasDescBase);
 
     // ---- Phase 1: GET_SIZES pass ----
@@ -1661,8 +1643,10 @@ void D3D12RaytracingClusteredGeometry::BuildClasCompact()
 
     D3D12_RTAS_CLUSTER_LIMITS limits;
     D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDescBase;
-    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+    BuildSharedClusterTrianglesInputs(N, useFloat, maxTris, maxVerts,
                                       totalTris, totalVerts, maxCompressedSize,
+                                      kMaxGeomsPerInstance - 1,
+                                      m_positionTruncateBits, BuildFlagModeRtas(),
                                       limits, clasDescBase);
     clasDescBase.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
@@ -2925,8 +2909,10 @@ void D3D12RaytracingClusteredGeometry::RebuildStaticClasPerFrame()
 
     D3D12_RTAS_CLUSTER_LIMITS limits;
     D3D12_RTAS_CLUSTER_TRIANGLES_INPUTS_DESC clasDesc;
-    BuildSharedClusterTrianglesInputs(*this, N, useFloat, maxTris, maxVerts,
+    BuildSharedClusterTrianglesInputs(N, useFloat, maxTris, maxVerts,
                                       totalTris, totalVerts, maxCompressedSize,
+                                      kMaxGeomsPerInstance - 1,
+                                      m_positionTruncateBits, BuildFlagModeRtas(),
                                       limits, clasDesc);
     clasDesc.Mode = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
 
@@ -4416,10 +4402,9 @@ void D3D12RaytracingClusteredGeometry::BuildTlasClassic()
         // GlassHit's Fresnel-Schlick degenerates cleanly on chrome
         // material (refr=0 -> Tw=0 -> no refraction trace), so the
         // chrome region still looks chrome and the glass region gets
-        // full refraction.  This avoids relying on a non-zero
-        // GeometryIndex() in the cluster path (forced to 0 by the
-        // NVIDIA BaseGeometryIndex driver workaround) and lets cluster
-        // mode match trad mode exactly for multi-material instances.
+        // full refraction.  Shader-table block selection is per TLAS instance,
+        // so mixed-region objects use this unified GlassHit block even though
+        // their material lookup itself uses the per-geometry index.
         UINT firstRegionMatSlot = obj.perRegionMaterialSlot.empty()
             ? obj.instanceID
             : obj.perRegionMaterialSlot[0];
@@ -4964,13 +4949,11 @@ void D3D12RaytracingClusteredGeometry::CreateRaytracingPipelineAndShaderTables()
     // route both regions to GlassHit unconditionally.  GlassHit's
     // Fresnel-Schlick degenerates cleanly on the chrome region (refr=0
     // -> Tw=0, no refraction trace) so chrome still looks chrome, and
-    // the glass region gets full refraction.  This makes the cluster
-    // path (where GeometryIndex() is forced to 0 by the NVIDIA
-    // BaseGeometryIndex driver workaround) render identically to the
-    // traditional path (where GeometryIndex() works) for these
-    // instances -- the cost is one extra Fresnel calc per chrome hit,
-    // imperceptible on a 4090.  See DXR2_BASEGEOMETRYINDEX_DRIVER_WORKAROUND
-    // and the discussion at perRegionMaterialSlot in the sphere 3 setup.
+    // the glass region gets full refraction.  The hit-group table block is
+    // selected per TLAS instance; this conservative GlassHit block keeps one
+    // routing shape for mixed regions while material selection still uses the
+    // canonical GeometryIndex lookup.  Cost:
+    // one extra Fresnel calculation per chrome hit, negligible in practice.
     auto makeTable8 = [&](void* r0, void* r1, void* r2, void* r3,
                           void* r4, void* r5, void* r6, void* r7,
                           ComPtr<ID3D12Resource>& outTable, const wchar_t* name)

@@ -1403,10 +1403,10 @@ void D3D12RaytracingClusteredGeometry::RenderUI()
         drawKeyLine(L"[V]", kbuf);
 
         if (m_vertexMode == VertexMode::Float32_3)
-            swprintf_s(kbuf, L"   cluster precision: %u bits/component   (32-bit float, PositionTruncateBitCount=%u)",
+            swprintf_s(kbuf, L"   vertex precision: %u bits/component   (32-bit float, PositionTruncateBitCount=%u)",
                        32u - m_positionTruncateBits, m_positionTruncateBits);
         else
-            swprintf_s(kbuf, L"   cluster precision: %u bits/component   (shared exponent)",
+            swprintf_s(kbuf, L"   vertex precision: %u bits/component   (shared exponent)",
                        m_compressedBitsPerComponent);
         drawKeyLine(L"[ ]", kbuf);
     }

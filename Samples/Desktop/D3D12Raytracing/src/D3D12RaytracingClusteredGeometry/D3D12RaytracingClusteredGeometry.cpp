@@ -2996,14 +2996,13 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     //    so animation can squash/stretch within [1/envelope, envelope] without
     //    leaving the cluster's pre-built BVH bounds.
     //
-    //    INVARIANT: kEnvelopeScale MUST stay above (1 + kAnimWobbleAmp) -- the
-    //    template's per-cluster AABB and (for a future COMPRESSED1
-    //    instantiation path) the Compressed1TemplateHeader quantization range
-    //    are both seeded from these hint positions.  If the animation worst-
-    //    case scale (1 + amp) overflows kEnvelopeScale, FLOAT32_3 per-frame
-    //    INSTANTIATE will clip against InstantiationBoundingBoxLimit and
-    //    COMPRESSED1 INSTANTIATE will saturate at the header's max
-    //    representable value -- both silently corrupt geometry.  The
+    //    INVARIANT: kEnvelopeScale MUST stay above (1 + kAnimWobbleAmp).
+    //    FLOAT32_3 templates use the hint vertices to describe their expected
+    //    deformation envelope.  COMPRESSED1 templates independently derive a
+    //    shared exponent below from the same worst-case animation amplitude.
+    //    If that amplitude changes without updating this mirrored constant,
+    //    the hints and the locked COMPRESSED1 range can both become invalid.
+    //    The
     //    HLSL-side wobble amplitude lives in AnimateBall.hlsl::kWobbleAmp and
     //    is mirrored here ONLY for this assert.  Keep the two in sync.
     // ------------------------------------------------------------------
@@ -3044,6 +3043,65 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
         obj.maxVertsPerCluster = std::max(obj.maxVertsPerCluster, (UINT)src.positions.size());
         obj.maxTrisPerCluster  = std::max(obj.maxTrisPerCluster,  (UINT)(src.indices.size() / 3));
     }
+    // The template's stored vertex format follows the sample's [V] mode.
+    // Source and hint vertices remain FLOAT32_3; INSTANTIATE converts them to
+    // the template's VertexInstantiationFormat.  COMPRESSED1 locks one shared
+    // exponent and the selected bit count into every template header.  The
+    // exponent must cover the largest possible per-cluster component span
+    // across the full radial-animation range, not merely the rest pose.
+    const bool useCompressedTemplate = (m_vertexMode == VertexMode::Compressed1);
+    UINT compressedTemplateHeaderField0 = 0;
+    if (useCompressedTemplate)
+    {
+        constexpr float kMinAnimatedScale = 1.0f - kAnimWobbleAmp;
+        constexpr float kMaxAnimatedScale = 1.0f + kAnimWobbleAmp;
+        float maxAnimatedExtent = 0.0f;
+        for (const auto& cluster : obj.mesh.clusters)
+        {
+            float mn[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX };
+            float mx[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX };
+            for (const auto& p : cluster.positions)
+            {
+                const float value[3] = { p.x, p.y, p.z };
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    const float a = value[axis] * kMinAnimatedScale;
+                    const float b = value[axis] * kMaxAnimatedScale;
+                    mn[axis] = std::min(mn[axis], std::min(a, b));
+                    mx[axis] = std::max(mx[axis], std::max(a, b));
+                }
+            }
+            for (int axis = 0; axis < 3; ++axis)
+                maxAnimatedExtent = std::max(maxAnimatedExtent, mx[axis] - mn[axis]);
+        }
+
+        const UINT bitsPerComponent = m_compressedBitsPerComponent;
+        const double maxDelta = double((1ull << bitsPerComponent) - 1ull);
+        const double minUnit = double(maxAnimatedExtent) / maxDelta;
+        int templateSharedExponent = (minUnit > 0.0)
+            ? (int)std::ceil(std::log2(minUnit)) + 127
+            : 1;
+        templateSharedExponent = std::clamp(templateSharedExponent, 1, 232);
+
+        D3D12_VERTEX_FORMAT_COMPRESSED1_TEMPLATE_HEADER header = {};
+        ENCODE_D3D12_COMPRESSED1_TEMPLATE(
+            header, (UINT)templateSharedExponent,
+            bitsPerComponent - 1u, bitsPerComponent - 1u, bitsPerComponent - 1u);
+        compressedTemplateHeaderField0 = header.field0;
+
+        SampleLog::LogF(
+            L"[animated template format] COMPRESSED1 %u bits/component; shared exponent (biased)=%d, unit=%.6f, header=0x%08X\n",
+            bitsPerComponent, templateSharedExponent,
+            std::ldexp(1.0f, templateSharedExponent - 127),
+            compressedTemplateHeaderField0);
+    }
+    else
+    {
+        SampleLog::LogF(
+            L"[animated template format] FLOAT32_3; PositionTruncateBitCount=%u\n",
+            m_positionTruncateBits);
+    }
+
     SampleLog::LogF(L"\n[animated] sphere mesh: %u clusters, %u verts, %u tris (envelope x%.2f)\n",
                     obj.clusterCount, obj.totalVertexCount,
                     obj.mesh.totalTriangles, kEnvelopeScale);
@@ -3180,11 +3238,15 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
             UINT baseLo, baseHi;
             UINT count;
             UINT posTruncBits;
+            UINT useCompressed;
+            UINT compressedHeader;
         } cb;
-        cb.baseLo       = (UINT)(templateInputBaseGPUVA & 0xFFFFFFFFu);
-        cb.baseHi       = (UINT)(templateInputBaseGPUVA >> 32);
-        cb.count        = obj.clusterCount;
-        cb.posTruncBits = m_positionTruncateBits;
+        cb.baseLo           = (UINT)(templateInputBaseGPUVA & 0xFFFFFFFFu);
+        cb.baseHi           = (UINT)(templateInputBaseGPUVA >> 32);
+        cb.count            = obj.clusterCount;
+        cb.posTruncBits     = m_positionTruncateBits;
+        cb.useCompressed    = useCompressedTemplate ? 1u : 0u;
+        cb.compressedHeader = compressedTemplateHeaderField0;
         cmdList->SetComputeRoot32BitConstants(0, sizeof(cb) / 4, &cb, 0);
         cmdList->SetComputeRootShaderResourceView(1, obj.templateMetaBuffer->GetGPUVirtualAddress());
         cmdList->SetComputeRootUnorderedAccessView(2, obj.templateArgsBuffer->GetGPUVirtualAddress());
@@ -3211,7 +3273,9 @@ void D3D12RaytracingClusteredGeometry::BuildAnimatedObjectSetup()
     tplDesc.Flags                     = BuildFlagModeRtas() | D3D12_RTAS_OPERATION_FLAG_ALLOW_DATA_ACCESS;
     tplDesc.Mode                      = D3D12_RTAS_OPERATION_MODE_IMPLICIT_DESTINATIONS;
     tplDesc.VertexHintFormat          = D3D12_VERTEX_FORMAT_FLOAT32_3;
-    tplDesc.VertexInstantiationFormat = D3D12_VERTEX_FORMAT_FLOAT32_3;
+    tplDesc.VertexInstantiationFormat = useCompressedTemplate
+        ? D3D12_VERTEX_FORMAT_COMPRESSED1
+        : D3D12_VERTEX_FORMAT_FLOAT32_3;
     tplDesc.IndexFormat               = D3D12_INDEX_FORMAT_UINT8;
     tplDesc.GeometryIndexAndFlagsIndexFormat = D3D12_INDEX_FORMAT_NONE;
     tplDesc.OpacityMicromapIndexFormat       = D3D12_INDEX_FORMAT_NONE;
@@ -5224,12 +5288,12 @@ void D3D12RaytracingClusteredGeometry::CreateFillClasTriArgsPipeline()
                     (size_t)ARRAYSIZE(g_pFillClasFromTrianglesArgs));
 }
 
-// FillClusterTemplateArgs: b0 (4 dwords) + t0 (meta) + u0 (out args).
+// FillClusterTemplateArgs: b0 (6 dwords) + t0 (meta) + u0 (out args).
 void D3D12RaytracingClusteredGeometry::CreateFillTemplateArgsPipeline()
 {
     auto device = m_deviceResources->GetD3DDevice();
     CD3DX12_ROOT_PARAMETER rp[3] = {};
-    rp[0].InitAsConstants(4, /*shaderReg*/0);                  // b0
+    rp[0].InitAsConstants(6, /*shaderReg*/0);                  // b0
     rp[1].InitAsShaderResourceView(/*shaderReg*/0);            // t0 = meta
     rp[2].InitAsUnorderedAccessView(/*shaderReg*/0);           // u0 = argsOut
     BuildArgsFillPipeline(device, rp, _countof(rp),

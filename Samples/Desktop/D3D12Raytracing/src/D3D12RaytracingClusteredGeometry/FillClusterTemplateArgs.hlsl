@@ -11,17 +11,19 @@
 // D3D12_RTAS_OPERATION_BUILD_CLUSTER_TEMPLATES_FROM_TRIANGLES_ARGS array
 // used during BUILD_CLUSTER_TEMPLATES for the animated showpiece ball.
 //
-// Layout (88 bytes per cluster):
+// Layout (88 bytes per cluster, pre-v0.30 contract):
 //   bytes  0..79  -- D3D12_RTAS_OPERATION_BUILD_CLAS_FROM_TRIANGLES_ARGS
 //                    (same shape as the static path; see FillClasFromTrianglesArgs.hlsl)
-//   bytes 80..87  -- u64 InstantiationBoundingBoxLimit (we always pass 0 --
-//                    driver derives the AABB from the hint vertex AABB)
+//   bytes 80..87  -- format-specific union:
+//                    FLOAT32_3  = u64 InstantiationBoundingBoxLimit (0 here)
+//                    COMPRESSED1 = {u32 template header, u32 zero padding}
 //
 // Per-cluster metadata is simpler than the static path:
 //   - ClusterID is implicit (= dispatch thread index)
 //   - opaqueFlag is always 0 (no per-material opacity wiring for the
 //     animated ball -- it's controlled per-instance by the TLAS desc)
-//   - VertexBufferStride is always sizeof(float3)=12 (FLOAT32_3 always)
+//   - VertexBufferStride is always sizeof(float3)=12 because hint input is
+//     FLOAT32_3 even when instantiated CLAS positions are stored as COMPRESSED1
 //   - IndexBufferStride is always 1 (uint8 indices)
 //
 // So per-cluster input is just {triCount, vertCount, vbOff, ibOff}
@@ -34,7 +36,9 @@ cbuffer Constants : register(b0)
     uint g_baseGpuVaLo;
     uint g_baseGpuVaHi;
     uint g_clusterCount;
-    uint g_positionTruncateBits;   // 0..23
+    uint g_positionTruncateBits;       // 0..23; ignored for COMPRESSED1
+    uint g_useCompressedTemplate;      // 0 = FLOAT32_3, 1 = COMPRESSED1
+    uint g_compressedTemplateHeader;   // packed exponent + x/y/z bit counts
 };
 
 ByteAddressBuffer   g_meta    : register(t0);  // 16 B/cluster
@@ -76,13 +80,22 @@ void main(uint3 tid : SV_DispatchThreadID)
     g_argsOut.Store (baseByte + 16, 0u);                                    // OpacityMicromapBaseLocation
     g_argsOut.Store (baseByte + 20, pack16(12u, 1u));                       // VBStride=12, IBStride=1
     g_argsOut.Store (baseByte + 24, pack16(0u, 0u));                        // OMM IB Stride / GeomIdxStride
-    g_argsOut.Store (baseByte + 28, pack16(g_positionTruncateBits, 0u));    // PosTruncBits/Pad
+    const uint posTruncBits = (g_useCompressedTemplate != 0u) ? 0u : g_positionTruncateBits;
+    g_argsOut.Store (baseByte + 28, pack16(posTruncBits, 0u));              // PosTruncBits/Pad
     g_argsOut.Store2(baseByte + 32, vbGva);                                 // VertexBuffer
     g_argsOut.Store2(baseByte + 40, ibGva);                                 // IndexBuffer
     g_argsOut.Store2(baseByte + 48, uint2(0, 0));                           // GeometryIndexAndFlagsArray
     g_argsOut.Store2(baseByte + 56, uint2(0, 0));                           // GeometryIndexAndFlagsIndexBuffer
     g_argsOut.Store2(baseByte + 64, uint2(0, 0));                           // OpacityMicromapArray
     g_argsOut.Store2(baseByte + 72, uint2(0, 0));                           // OpacityMicromapIndexBuffer
-    // --- InstantiationBoundingBoxLimit (8 bytes) --------------------------
-    g_argsOut.Store2(baseByte + 80, uint2(0, 0));                           // = 0 -> driver derives from hint
+    // --- Pre-v0.30 format-specific union (8 bytes) ------------------------
+    if (g_useCompressedTemplate != 0u)
+    {
+        g_argsOut.Store (baseByte + 80, g_compressedTemplateHeader);        // COMPRESSED1 header
+        g_argsOut.Store (baseByte + 84, 0u);                                // union padding
+    }
+    else
+    {
+        g_argsOut.Store2(baseByte + 80, uint2(0, 0));                       // null instantiation AABB
+    }
 }

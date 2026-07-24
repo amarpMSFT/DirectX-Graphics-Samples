@@ -474,8 +474,9 @@ void D3D12RaytracingClusteredGeometry::OnKeyDown(UINT8 key)
     //                    decrements; ']' increments.  16 is the per-axis
     //                    cap in the D3D12 COMPRESSED1 encoding; 1 is the
     //                    minimum (0 would divide-by-zero in our encoder).
-    //   Either change triggers a full static-AS rebuild (CLAS is re-encoded
-    //   in the COMPRESSED1 case via EncodeCompressedClusters inside Rebuild).
+    //   Either change triggers a full clustered-AS rebuild. Static CLAS are
+    //   re-encoded in COMPRESSED1 mode, and the animated templates are rebuilt
+    //   with a matching stored format and precision header.
     else if (key == VK_OEM_4 || key == VK_OEM_6)
     {
         const bool wantLess = (key == VK_OEM_4);

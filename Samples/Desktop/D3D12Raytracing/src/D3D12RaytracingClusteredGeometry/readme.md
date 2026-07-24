@@ -83,7 +83,7 @@ On-screen overlay (right column) lists the active value for each toggle.
 |          | variant as radius grows, so the back rings stay cheap.                                  |
 | `,` `.`  | Bounce slider — reflection + refraction depth (held +2 apart, range 0..5).              |
 | `[` `]`  | Vertex precision slider — fewer / more position bits (`FLOAT32_3` truncate-bits or      |
-|          | `COMPRESSED1` bits/component). Triggers full static rebuild on change.                  |
+|          | `COMPRESSED1` bits/component). Rebuilds static CLAS and animated templates together.    |
 
 ### Headless / scripted runs
 
@@ -194,10 +194,12 @@ into your own renderer are concentrated in one place.
 
 ## Things to note
 
-- The static clustered scene can use either `FLOAT32_3` or **COMPRESSED1** via
-  the `[V]` toggle or `--vertex-format`. The animated template path uses
-  `FLOAT32_3` positions because per-frame requantization would obscure the
-  templates story.
+- The static clustered scene and animated templates use the format selected
+  by `[V]` or `--vertex-format`. Animated source vertices remain `FLOAT32_3`;
+  template instantiation converts them to the selected stored format. In
+  **COMPRESSED1** mode, each template locks the active bits/component and a
+  shared exponent sized for the full animation envelope, so `[ ]` visibly and
+  consistently changes both static CLAS and template-instantiated CLAS.
 - Cluster size statistics are read back via the
   `D3D12_RTAS_OPERATION_MODE_GET_SIZES` mode and via `ResultSizeArray` on
   implicit-destination builds.

@@ -575,7 +575,8 @@ private:
     // '[' / ']' keys cycle it in COMPRESSED1 mode (the same keys cycle
     // m_positionTruncateBits when the active mode is FLOAT32_3).  Each
     // change triggers RebuildStaticAccelerationStructures (re-encodes the
-    // per-cluster compressed blobs first, then rebuilds CLAS/BLAS/TLAS).
+    // static compressed blobs and rebuilds animated templates with the same
+    // stored format/precision, then rebuilds CLAS/BLAS/TLAS).
     UINT                                 m_compressedBitsPerComponent = 12;
     const wchar_t*                       ClasAllocModeName() const
     {
@@ -1330,10 +1331,10 @@ private:
     // RebuildStaticAccelerationStructures whenever the user cycles
     // m_compressedBitsPerComponent via the '[' / ']' keys in COMPRESSED1 mode.
     void EncodeCompressedClusters();
-    // Tear down the static-object CLAS/BLAS/TLAS and rebuild with the current
-    // m_vertexMode + m_clasAllocMode.  Animated object's per-frame state is
-    // left alone (independent CLAS pipeline).  Drives the runtime 'v' and 'a'
-    // keyboard toggles in OnKeyDown.
+    // Tear down CLAS/BLAS/TLAS state and rebuild with the current
+    // m_vertexMode + m_clasAllocMode.  When enabled, the animated object's
+    // templates and per-frame CLAS/BLAS resources are recreated too, so [V]
+    // and [ ] apply one format/precision choice consistently across the scene.
     void RebuildStaticAccelerationStructures(const wchar_t* reason);
     // Regenerate the [N] workload-scaling clones: truncates m_objects to
     // m_sourceObjectCount, then appends ExtraInstancesCount() deep-copied
